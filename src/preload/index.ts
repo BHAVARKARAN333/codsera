@@ -95,6 +95,15 @@ const api: IElectronAPI = {
   },
   nvidiaListModels: (request) => {
     return ipcRenderer.invoke(IPC_CHANNELS.NVIDIA_LIST_MODELS, request)
+  },
+  saveWorkspaceIndex: (workspaceRoot: string, data: unknown) => {
+    return ipcRenderer.invoke(IPC_CHANNELS.SAVE_WORKSPACE_INDEX, workspaceRoot, data)
+  },
+  loadWorkspaceIndex: (workspaceRoot: string) => {
+    return ipcRenderer.invoke(IPC_CHANNELS.LOAD_WORKSPACE_INDEX, workspaceRoot)
+  },
+  clearWorkspaceIndex: (workspaceRoot: string) => {
+    return ipcRenderer.invoke(IPC_CHANNELS.CLEAR_WORKSPACE_INDEX, workspaceRoot)
   }
 }
 

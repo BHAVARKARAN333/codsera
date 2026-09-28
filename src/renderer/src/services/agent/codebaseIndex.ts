@@ -29,6 +29,7 @@ export interface FileIndexEntry {
   isConfigFile: boolean
   contentHash: string
   fileSize: number
+  mtimeMs?: number
   lastIndexed: number
 }
 
@@ -76,6 +77,27 @@ const CONFIG_FILE_NAMES = new Set([
   '.prettierrc'
 ])
 
+export const PACKAGE_JSON_TECHNOLOGIES = new Set([
+  'React',
+  'Electron',
+  'Vite',
+  'Monaco Editor',
+  'Tailwind CSS',
+  'Jest',
+  'Vitest',
+  'Lucide Icons'
+])
+
+export const INDEX_SCHEMA_VERSION = 1
+
+export interface SerializedWorkspaceIndex {
+  version: number
+  workspaceRoot: string
+  savedAt: number
+  detectedTechnologies: string[]
+  entries: FileIndexEntry[]
+}
+
 export class CodebaseIndex {
   private entries: Map<string, FileIndexEntry> = new Map() // normalizedPath -> FileIndexEntry
   private workspaceRoot: string | null = null
@@ -111,12 +133,117 @@ export class CodebaseIndex {
   }
 
   /**
+   * Serializes index metadata and detected technologies for persistent storage.
+   */
+  serialize(): SerializedWorkspaceIndex {
+    return {
+      version: INDEX_SCHEMA_VERSION,
+      workspaceRoot: this.workspaceRoot || '',
+      savedAt: Date.now(),
+      detectedTechnologies: Array.from(this.detectedTechnologies).sort(),
+      entries: Array.from(this.entries.values())
+    }
+  }
+
+  /**
+   * Deserializes and validates a serialized workspace index payload.
+   * Returns true if successfully restored, false if rejected or malformed.
+   */
+  deserialize(payload: unknown, expectedWorkspaceRoot?: string): boolean {
+    if (!payload || typeof payload !== 'object') {
+      if (this.debug) console.debug('[CodebaseIndex] Deserialize rejected: payload is not an object')
+      return false
+    }
+
+    const data = payload as Partial<SerializedWorkspaceIndex>
+
+    if (data.version !== INDEX_SCHEMA_VERSION) {
+      if (this.debug) {
+        console.debug(
+          `[CodebaseIndex] Deserialize rejected: schema version mismatch (${data.version} !== ${INDEX_SCHEMA_VERSION})`
+        )
+      }
+      return false
+    }
+
+    if (typeof data.workspaceRoot !== 'string' || !data.workspaceRoot.trim()) {
+      if (this.debug) console.debug('[CodebaseIndex] Deserialize rejected: invalid workspaceRoot')
+      return false
+    }
+
+    if (expectedWorkspaceRoot) {
+      const normExpected = expectedWorkspaceRoot.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+      const normActual = data.workspaceRoot.replace(/\\/g, '/').replace(/\/+$/, '').toLowerCase()
+      if (normExpected !== normActual) {
+        if (this.debug) {
+          console.debug(
+            `[CodebaseIndex] Deserialize rejected: workspace identity mismatch ("${normActual}" !== "${normExpected}")`
+          )
+        }
+        return false
+      }
+    }
+
+    if (!Array.isArray(data.entries) || !Array.isArray(data.detectedTechnologies)) {
+      if (this.debug) {
+        console.debug(
+          '[CodebaseIndex] Deserialize rejected: entries or detectedTechnologies is not an array'
+        )
+      }
+      return false
+    }
+
+    // Validate entries
+    const validatedEntries: Array<{ key: string; entry: FileIndexEntry }> = []
+    for (const item of data.entries) {
+      if (!item || typeof item !== 'object') return false
+      const e = item as Partial<FileIndexEntry>
+      if (typeof e.normalizedPath !== 'string' || !e.normalizedPath.trim()) return false
+      if (e.normalizedPath.startsWith('..') || e.normalizedPath.includes('/../')) return false
+      if (typeof e.fileType !== 'string' || typeof e.extension !== 'string') return false
+      if (
+        !Array.isArray(e.imports) ||
+        !Array.isArray(e.resolvedDependencies) ||
+        !Array.isArray(e.exports)
+      ) {
+        return false
+      }
+      if (typeof e.contentHash !== 'string' || typeof e.fileSize !== 'number') return false
+      if (e.mtimeMs !== undefined && typeof e.mtimeMs !== 'number') return false
+
+      const normPath = this.normalizePath(e.normalizedPath)
+      const key = this.normalizeKey(normPath)
+      validatedEntries.push({ key, entry: e as FileIndexEntry })
+    }
+
+    // Validation passed: atomic state update
+    this.clear()
+    this.workspaceRoot = data.workspaceRoot
+    for (const tech of data.detectedTechnologies) {
+      if (typeof tech === 'string' && tech.trim()) {
+        this.detectedTechnologies.add(tech)
+      }
+    }
+    for (const { key, entry } of validatedEntries) {
+      this.entries.set(key, entry)
+    }
+
+    if (this.debug) {
+      console.debug(
+        `[CodebaseIndex] Successfully restored ${this.entries.size} entries from persistent storage`
+      )
+    }
+    return true
+  }
+
+  /**
    * Builds index for the workspace from candidate file list and file reader.
    */
   async buildIndex(
     workspaceRoot: string,
     filePaths: string[],
-    fileReader: (path: string) => Promise<string | null>
+    fileReader: (path: string) => Promise<string | null>,
+    fileMetadataMap?: Map<string, { size?: number; mtimeMs?: number }>
   ): Promise<void> {
     this.clear()
     this.workspaceRoot = workspaceRoot
@@ -131,7 +258,8 @@ export class CodebaseIndex {
 
       const content = await fileReader(relPath)
       if (content !== null) {
-        this.indexFile(relPath, content, normalizedPaths)
+        const meta = fileMetadataMap?.get(relPath)
+        this.indexFile(relPath, content, normalizedPaths, meta?.mtimeMs, meta?.size)
       }
     }
 
@@ -145,7 +273,13 @@ export class CodebaseIndex {
   /**
    * Indexes a single file and updates metadata.
    */
-  indexFile(filePath: string, content: string, allWorkspaceFiles: string[]): FileIndexEntry {
+  indexFile(
+    filePath: string,
+    content: string,
+    allWorkspaceFiles: string[],
+    mtimeMs?: number,
+    fileSize?: number
+  ): FileIndexEntry {
     const normPath = this.normalizePath(filePath)
     const key = this.normalizeKey(filePath)
     const ext = normPath.split('.').pop()?.toLowerCase() || ''
@@ -212,36 +346,7 @@ export class CodebaseIndex {
 
     // Technology detection from actual package.json evidence (Zero hallucination)
     if (baseNameLower === 'package.json') {
-      try {
-        const pkg = JSON.parse(content)
-        const allDeps = {
-          ...(pkg.dependencies || {}),
-          ...(pkg.devDependencies || {})
-        }
-
-        if (allDeps['react']) this.detectedTechnologies.add('React')
-        if (allDeps['electron']) this.detectedTechnologies.add('Electron')
-        if (allDeps['typescript'] || this.entries.has('tsconfig.json')) this.detectedTechnologies.add('TypeScript')
-        if (allDeps['vite'] || allDeps['electron-vite']) this.detectedTechnologies.add('Vite')
-        if (allDeps['@monaco-editor/react']) this.detectedTechnologies.add('Monaco Editor')
-        if (allDeps['tailwindcss']) this.detectedTechnologies.add('Tailwind CSS')
-        if (allDeps['jest']) this.detectedTechnologies.add('Jest')
-        if (allDeps['vitest']) this.detectedTechnologies.add('Vitest')
-        if (allDeps['lucide-react']) this.detectedTechnologies.add('Lucide Icons')
-
-        // Check package.json main field for entry point
-        if (pkg.main && typeof pkg.main === 'string') {
-          const mainTarget = this.normalizePath(pkg.main)
-          const mainKey = this.normalizeKey(mainTarget)
-          if (this.entries.has(mainKey)) {
-            const entry = this.entries.get(mainKey)!
-            entry.isEntryPoint = true
-            entry.entryPointConfidence = 'detected'
-          }
-        }
-      } catch {
-        // Invalid JSON, ignore
-      }
+      this.refreshPackageJsonTechnologies(content)
     }
 
     if (ext === 'ts' || ext === 'tsx' || baseNameLower.includes('tsconfig')) {
@@ -263,7 +368,8 @@ export class CodebaseIndex {
       entryPointConfidence,
       isConfigFile: isConfig,
       contentHash: hash,
-      fileSize: content.length,
+      fileSize: fileSize !== undefined ? fileSize : content.length,
+      mtimeMs,
       lastIndexed: Date.now()
     }
 
@@ -274,18 +380,130 @@ export class CodebaseIndex {
   /**
    * Incremental update for a modified or newly created file.
    */
-  updateFile(filePath: string, content: string, allWorkspaceFiles: string[]): FileIndexEntry {
+  updateFile(
+    filePath: string,
+    content: string,
+    allWorkspaceFiles: string[],
+    mtimeMs?: number,
+    fileSize?: number
+  ): FileIndexEntry {
     this.dependencyAnalyzer.invalidateFile(filePath)
-    return this.indexFile(filePath, content, allWorkspaceFiles)
+    return this.indexFile(filePath, content, allWorkspaceFiles, mtimeMs, fileSize)
   }
 
   /**
-   * Removes a deleted file from the index.
+   * Updates only file metadata (e.g. mtimeMs, fileSize) when content hash is verified identical,
+   * avoiding redundant AST re-parsing and dependency re-resolution.
+   */
+  updateFileMetadata(filePath: string, mtimeMs?: number, fileSize?: number): void {
+    const entry = this.findFile(filePath)
+    if (entry) {
+      if (mtimeMs !== undefined) {
+        entry.mtimeMs = mtimeMs
+      }
+      if (fileSize !== undefined) {
+        entry.fileSize = fileSize
+      }
+      entry.lastIndexed = Date.now()
+    }
+  }
+
+  /**
+   * Recalculates detected technologies from package.json content while preserving
+   * technologies detected from other project files (e.g. TypeScript from .ts/.tsx files or tsconfig).
+   */
+  private refreshPackageJsonTechnologies(content: string): void {
+    // 1. Remove all package.json-derived framework/library technologies
+    for (const tech of PACKAGE_JSON_TECHNOLOGIES) {
+      this.detectedTechnologies.delete(tech)
+    }
+
+    try {
+      const pkg = JSON.parse(content)
+      const allDeps = {
+        ...(pkg.dependencies || {}),
+        ...(pkg.devDependencies || {})
+      }
+
+      if (allDeps['react']) this.detectedTechnologies.add('React')
+      if (allDeps['electron']) this.detectedTechnologies.add('Electron')
+      if (allDeps['typescript']) this.detectedTechnologies.add('TypeScript')
+      if (allDeps['vite'] || allDeps['electron-vite']) this.detectedTechnologies.add('Vite')
+      if (allDeps['@monaco-editor/react']) this.detectedTechnologies.add('Monaco Editor')
+      if (allDeps['tailwindcss']) this.detectedTechnologies.add('Tailwind CSS')
+      if (allDeps['jest']) this.detectedTechnologies.add('Jest')
+      if (allDeps['vitest']) this.detectedTechnologies.add('Vitest')
+      if (allDeps['lucide-react']) this.detectedTechnologies.add('Lucide Icons')
+
+      // Check package.json main field for entry point
+      if (pkg.main && typeof pkg.main === 'string') {
+        const mainTarget = this.normalizePath(pkg.main)
+        const mainKey = this.normalizeKey(mainTarget)
+        if (this.entries.has(mainKey)) {
+          const entry = this.entries.get(mainKey)!
+          entry.isEntryPoint = true
+          entry.entryPointConfidence = 'detected'
+        }
+      }
+    } catch {
+      // Invalid JSON, ignore
+    }
+
+    // 2. Ensure TypeScript remains detected if tsconfig.json or .ts/.tsx files exist
+    if (!this.detectedTechnologies.has('TypeScript')) {
+      for (const entry of this.entries.values()) {
+        if (
+          entry.extension === 'ts' ||
+          entry.extension === 'tsx' ||
+          entry.normalizedPath.toLowerCase().includes('tsconfig')
+        ) {
+          this.detectedTechnologies.add('TypeScript')
+          break
+        }
+      }
+    }
+  }
+
+  /**
+   * Removes a deleted file from the index and cleans up references in remaining entries.
    */
   removeFile(filePath: string): boolean {
     const key = this.normalizeKey(filePath)
+    const normPath = this.normalizePath(filePath)
     this.dependencyAnalyzer.invalidateFile(filePath)
-    return this.entries.delete(key)
+
+    // Clean up references in remaining entries
+    for (const entry of this.entries.values()) {
+      if (entry.resolvedDependencies && entry.resolvedDependencies.length > 0) {
+        entry.resolvedDependencies = entry.resolvedDependencies.filter(
+          (dep) => this.normalizeKey(dep) !== key && dep !== normPath
+        )
+      }
+    }
+
+    const removed = this.entries.delete(key)
+
+    if (normPath.toLowerCase() === 'package.json') {
+      for (const tech of PACKAGE_JSON_TECHNOLOGIES) {
+        this.detectedTechnologies.delete(tech)
+      }
+      let hasTs = false
+      for (const entry of this.entries.values()) {
+        if (
+          entry.extension === 'ts' ||
+          entry.extension === 'tsx' ||
+          entry.normalizedPath.toLowerCase().includes('tsconfig')
+        ) {
+          hasTs = true
+          break
+        }
+      }
+      if (!hasTs) {
+        this.detectedTechnologies.delete('TypeScript')
+      }
+    }
+
+    return removed
   }
 
   /**

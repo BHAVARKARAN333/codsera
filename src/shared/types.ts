@@ -3,6 +3,8 @@ export interface FileEntry {
   path: string
   isDirectory: boolean
   children?: FileEntry[]
+  size?: number
+  mtimeMs?: number
 }
 
 export interface ReadFileResult {
@@ -238,6 +240,32 @@ export interface IElectronAPI {
   nvidiaListModels: (
     request?: NvidiaListModelsRequest
   ) => Promise<NvidiaListModelsResponse>
+  saveWorkspaceIndex: (
+    workspaceRoot: string,
+    data: unknown
+  ) => Promise<SaveWorkspaceIndexResult>
+  loadWorkspaceIndex: (
+    workspaceRoot: string
+  ) => Promise<LoadWorkspaceIndexResult>
+  clearWorkspaceIndex: (
+    workspaceRoot: string
+  ) => Promise<ClearWorkspaceIndexResult>
+}
+
+export interface SaveWorkspaceIndexResult {
+  success: boolean
+  error?: string
+}
+
+export interface LoadWorkspaceIndexResult {
+  success: boolean
+  data?: unknown
+  error?: string
+}
+
+export interface ClearWorkspaceIndexResult {
+  success: boolean
+  error?: string
 }
 
 export const IPC_CHANNELS = {
@@ -253,6 +281,9 @@ export const IPC_CHANNELS = {
   WATCH_WORKSPACE: 'fs:watchWorkspace',
   UNWATCH_WORKSPACE: 'fs:unwatchWorkspace',
   ON_WORKSPACE_FILE_CHANGED: 'fs:onWorkspaceFileChanged',
+  SAVE_WORKSPACE_INDEX: 'index:save',
+  LOAD_WORKSPACE_INDEX: 'index:load',
+  CLEAR_WORKSPACE_INDEX: 'index:clear',
   RUN_COMMAND: 'command:run',
   STOP_COMMAND: 'command:stop',
   GIT_STATUS: 'git:status',

@@ -3,7 +3,7 @@ import {
   WorkspaceFileChangeEvent,
   WorkspaceFileChangeType
 } from '../../../../shared/types'
-import { ContextCache, ContextCacheStats } from './contextCache'
+import { ContextCache, ContextCacheStats, computeContentHash } from './contextCache'
 import { ContextBudgetManager, DroppedContextFile } from './contextBudgetManager'
 import { ContextDeduplicator } from './contextDeduplicator'
 import {
@@ -139,6 +139,59 @@ const COMMON_STOP_WORDS = new Set([
   'find'
 ])
 
+/**
+ * Safely extracts relative workspace path from an entry path, respecting OS platform casing
+ * and enforcing strict path boundaries so sibling directories (e.g. C:/project-other)
+ * are never mistaken for children of C:/project.
+ *
+ * Returns normalized relative path (e.g. "src/index.ts") or "" if fullPath equals workspaceRoot.
+ * Returns null if fullPath is an absolute path that is outside workspaceRoot.
+ */
+export function toRelativeWorkspacePath(fullPath: string, workspaceRoot: string): string | null {
+  const normEntry = fullPath.replace(/\\/g, '/')
+  const normRoot = workspaceRoot.replace(/\\/g, '/').replace(/\/+$/, '')
+
+  if (!normRoot) {
+    const clean = normEntry.replace(/^\/+/, '')
+    return clean || null
+  }
+
+  const isWindows =
+    (typeof process !== 'undefined' && process.platform === 'win32') ||
+    (typeof navigator !== 'undefined' && /win/i.test(navigator.userAgent || navigator.platform || ''))
+
+  const rootPrefix = normRoot + '/'
+
+  if (isWindows) {
+    const entryLower = normEntry.toLowerCase()
+    const rootLower = normRoot.toLowerCase()
+    const prefixLower = rootPrefix.toLowerCase()
+
+    if (entryLower === rootLower) {
+      return ''
+    }
+    if (entryLower.startsWith(prefixLower)) {
+      return normEntry.slice(rootPrefix.length).replace(/^\/+/, '')
+    }
+  } else {
+    if (normEntry === normRoot) {
+      return ''
+    }
+    if (normEntry.startsWith(rootPrefix)) {
+      return normEntry.slice(rootPrefix.length).replace(/^\/+/, '')
+    }
+  }
+
+  // Check if fullPath was an absolute path that does not belong to workspaceRoot
+  const isAbsolute = /^[a-zA-Z]:[\\/]/.test(fullPath) || fullPath.startsWith('/') || fullPath.startsWith('\\')
+  if (isAbsolute) {
+    return null
+  }
+
+  // It was already a relative path
+  return normEntry.replace(/^\/+/, '')
+}
+
 export class SmartContextEngine {
   private config: Required<SmartContextEngineConfig>
   private cache: ContextCache
@@ -212,7 +265,13 @@ export class SmartContextEngine {
 
   private activeIndexingSession = 0
   private indexedWorkspaceRoot: string | null = null
+  private restoredWorkspaceRoot: string | null = null
+  private isIndexRestored = false
+  private isIndexFresh = false
   private isIndexing = false
+  private isReconciling = false
+  private queuedWatcherEventsDuringRestore: WorkspaceFileChangeEvent[] = []
+  private saveIndexDebounceTimer: ReturnType<typeof setTimeout> | null = null
   private pendingEvents: Map<
     string,
     { event: WorkspaceFileChangeEvent; timer: ReturnType<typeof setTimeout> }
@@ -223,6 +282,14 @@ export class SmartContextEngine {
    * Clears in-memory file read cache, deduplication state, dependency analysis graph, and codebase index.
    */
   clearCache(): void {
+    this.activeIndexingSession++
+    this.isIndexing = false
+    if (this.saveIndexDebounceTimer) {
+      clearTimeout(this.saveIndexDebounceTimer)
+      this.saveIndexDebounceTimer = null
+    }
+    this.isReconciling = false
+    this.queuedWatcherEventsDuringRestore = []
     for (const item of this.pendingEvents.values()) {
       clearTimeout(item.timer)
     }
@@ -233,6 +300,9 @@ export class SmartContextEngine {
     this.dependencyAnalyzer.clearCache()
     this.codebaseIndex.clear()
     this.indexedWorkspaceRoot = null
+    this.restoredWorkspaceRoot = null
+    this.isIndexRestored = false
+    this.isIndexFresh = false
   }
 
   /**
@@ -273,11 +343,21 @@ export class SmartContextEngine {
       this.clearCache()
     }
 
-    // If already indexed for this exact workspace, avoid redundant full rebuild
+    // If already indexed fresh for this exact workspace, avoid redundant full rebuild
     if (this.indexedWorkspaceRoot === normalizedRoot) {
       if (this.config.debug) {
         console.debug(
           `[SmartContextEngine] Workspace "${normalizedRoot}" is already indexed. Skipping redundant rebuild.`
+        )
+      }
+      return
+    }
+
+    // If already restored from storage and matches current workspace, avoid duplicate restoration
+    if (this.restoredWorkspaceRoot === normalizedRoot) {
+      if (this.config.debug) {
+        console.debug(
+          `[SmartContextEngine] Workspace "${normalizedRoot}" is already restored from persistent index.`
         )
       }
       return
@@ -295,19 +375,114 @@ export class SmartContextEngine {
         return
       }
 
-      // Read tree
+      // 1. Attempt to restore persistent index from disk before running full build
+      let restored = false
+      if (window.electronAPI.loadWorkspaceIndex) {
+        try {
+          const loadRes = await window.electronAPI.loadWorkspaceIndex(normalizedRoot)
+          if (sessionId !== this.activeIndexingSession) return
+
+          if (loadRes.success && loadRes.data) {
+            const ok = this.codebaseIndex.deserialize(loadRes.data, normalizedRoot)
+            if (ok && sessionId === this.activeIndexingSession) {
+              restored = true
+              this.restoredWorkspaceRoot = normalizedRoot
+              this.isIndexRestored = true
+              this.isIndexFresh = false // Restored, but not yet verified as fresh
+              if (this.config.debug) {
+                console.debug(
+                  `[SmartContextEngine] Restored persistent index for "${normalizedRoot}" (${this.codebaseIndex.getAllFilePaths().length} files).`
+                )
+              }
+            }
+          }
+        } catch (loadErr) {
+          if (this.config.debug) {
+            console.debug(
+              '[SmartContextEngine] Persistent index load failed, falling back to full build:',
+              loadErr
+            )
+          }
+        }
+      }
+
+      // If successfully restored from disk, reconcile with current disk state
+      if (restored) {
+        let reconciliationSucceeded = false
+        this.isReconciling = true
+        this.queuedWatcherEventsDuringRestore = []
+
+        try {
+          reconciliationSucceeded = await this.reconcileRestoredIndex(normalizedRoot, sessionId)
+        } catch (recErr) {
+          if (this.config.debug) {
+            console.debug('[SmartContextEngine] Error during reconciliation:', recErr)
+          }
+          reconciliationSucceeded = false
+        } finally {
+          this.isReconciling = false
+        }
+
+        if (sessionId !== this.activeIndexingSession) return
+
+        if (reconciliationSucceeded) {
+          this.indexedWorkspaceRoot = normalizedRoot
+          this.isIndexFresh = true
+          this.isIndexRestored = true
+          if (this.config.debug) {
+            console.debug(
+              `[SmartContextEngine] Offline reconciliation completed successfully for "${normalizedRoot}".`
+            )
+          }
+
+          // Replay queued watcher events that arrived during reconciliation
+          await this.replayQueuedWatcherEvents(sessionId)
+          return
+        }
+
+        // If reconciliation failed, fall back to full build
+        if (this.config.debug) {
+          console.debug(
+            `[SmartContextEngine] Reconciliation failed; falling back to full build for "${normalizedRoot}".`
+          )
+        }
+        this.restoredWorkspaceRoot = null
+        this.isIndexRestored = false
+        this.isIndexFresh = false
+      }
+
+      // 2. Fall back to existing full indexing behavior if index is missing, incompatible, or reconciliation failed
       const treeRes = await window.electronAPI.readTree(normalizedRoot)
       if (sessionId !== this.activeIndexingSession) {
         // Workspace was switched while reading tree; discard result
+        this.queuedWatcherEventsDuringRestore = []
         return
       }
 
-      const treeEntries = treeRes.success && treeRes.tree ? treeRes.tree : []
+      if (!treeRes.success || !Array.isArray(treeRes.tree)) {
+        if (this.config.debug) {
+          console.debug(
+            `[SmartContextEngine] Failed to read workspace tree for "${normalizedRoot}": ${treeRes.error || 'Unknown error'}`
+          )
+        }
+        // Failure path: clear any queued events from the failed restore/reconciliation session
+        this.queuedWatcherEventsDuringRestore = []
+        return
+      }
+
+      const treeEntries = treeRes.tree
       const filePaths = this.extractRelativePaths(treeEntries, normalizedRoot)
+      const fileMetadataMap = this.extractFileMetadataMap(treeEntries, normalizedRoot)
 
       if (filePaths.length === 0) {
+        // Only mark index fresh if readTree explicitly succeeded and confirmed the tree has no indexable files
         if (sessionId === this.activeIndexingSession) {
           this.indexedWorkspaceRoot = normalizedRoot
+          this.isIndexFresh = true
+          this.isIndexRestored = false
+          await this.replayQueuedWatcherEvents(sessionId)
+        } else {
+          this.queuedWatcherEventsDuringRestore = []
         }
         return
       }
@@ -329,19 +504,39 @@ export class SmartContextEngine {
         return null
       }
 
-      // Build codebase index
-      await this.codebaseIndex.buildIndex(normalizedRoot, filePaths, fileReader)
+      // Build codebase index with metadata map for future fast-paths
+      await this.codebaseIndex.buildIndex(normalizedRoot, filePaths, fileReader, fileMetadataMap)
 
       // Only mark as successfully indexed if session is still current
       if (sessionId === this.activeIndexingSession) {
         this.indexedWorkspaceRoot = normalizedRoot
+        this.restoredWorkspaceRoot = null
+        this.isIndexFresh = true
+        this.isIndexRestored = false
         if (this.config.debug) {
           console.debug(
             `[SmartContextEngine] Background workspace indexing completed for "${normalizedRoot}".`
           )
         }
+
+        // Save index after successful full build
+        if (window.electronAPI.saveWorkspaceIndex) {
+          window.electronAPI
+            .saveWorkspaceIndex(normalizedRoot, this.codebaseIndex.serialize())
+            .catch((err) => {
+              if (this.config.debug) {
+                console.debug('[SmartContextEngine] Failed to save persistent workspace index:', err)
+              }
+            })
+        }
+
+        // Replay any queued watcher events from the reconciliation/build period so no file events are lost
+        await this.replayQueuedWatcherEvents(sessionId)
+      } else {
+        this.queuedWatcherEventsDuringRestore = []
       }
     } catch (err: unknown) {
+      this.queuedWatcherEventsDuringRestore = []
       // Safe error recovery: never throw or block UI
       if (this.config.debug) {
         console.debug(`[SmartContextEngine] Non-fatal error during workspace indexing:`, err)
@@ -353,18 +548,272 @@ export class SmartContextEngine {
     }
   }
 
+  /**
+   * Safely reconciles a restored persistent index against current disk state.
+   * Returns true on success, or false if reconciliation failed (triggering fallback to full build).
+   */
+  private async reconcileRestoredIndex(
+    normalizedRoot: string,
+    sessionId: number
+  ): Promise<boolean> {
+    if (typeof window === 'undefined' || !window.electronAPI) {
+      return false
+    }
+
+    // 1. Read current workspace tree and metadata from disk
+    const treeRes = await window.electronAPI.readTree(normalizedRoot)
+    if (sessionId !== this.activeIndexingSession) return false
+    if (!treeRes.success || !treeRes.tree) {
+      return false
+    }
+
+    const diskFileMap = this.extractFileMetadataMap(treeRes.tree, normalizedRoot)
+    const diskPaths = Array.from(diskFileMap.keys())
+    const diskPathSet = new Set(diskPaths.map((p) => p.toLowerCase()))
+
+    const indexedPaths = this.codebaseIndex.getAllFilePaths()
+    const indexedPathSet = new Set(indexedPaths.map((p) => p.toLowerCase()))
+
+    let indexChanged = false
+
+    // 2. Identify & remove deleted files (files in index that no longer exist on disk)
+    for (const indexedPath of indexedPaths) {
+      if (sessionId !== this.activeIndexingSession) return false
+      const lower = indexedPath.toLowerCase()
+      if (!diskPathSet.has(lower)) {
+        this.codebaseIndex.removeFile(indexedPath)
+        this.cache.invalidate(indexedPath)
+        this.deduplicator.invalidateFile(indexedPath)
+        this.dependencyAnalyzer.invalidateFile(indexedPath)
+        indexChanged = true
+        if (this.config.debug) {
+          console.debug(
+            `[SmartContextEngine] Reconcile: removed deleted file "${indexedPath}" from index`
+          )
+        }
+      }
+    }
+
+    // 3. Identify & index newly created files (files on disk not present in index)
+    for (const diskPath of diskPaths) {
+      if (sessionId !== this.activeIndexingSession) return false
+      const lower = diskPath.toLowerCase()
+      if (!indexedPathSet.has(lower)) {
+        try {
+          const res = await window.electronAPI.readWorkspaceFile(normalizedRoot, diskPath)
+          if (sessionId !== this.activeIndexingSession) return false
+
+          if (res.success && typeof res.content === 'string') {
+            const meta = diskFileMap.get(diskPath)
+            this.cache.set(diskPath, res.content)
+            this.codebaseIndex.indexFile(
+              diskPath,
+              res.content,
+              diskPaths,
+              meta?.mtimeMs,
+              meta?.size ?? res.content.length
+            )
+            indexChanged = true
+            if (this.config.debug) {
+              console.debug(
+                `[SmartContextEngine] Reconcile: added new file "${diskPath}" to index`
+              )
+            }
+          }
+        } catch (err) {
+          if (this.config.debug) {
+            console.debug(`[SmartContextEngine] Failed reading new file "${diskPath}":`, err)
+          }
+        }
+      }
+    }
+
+    // 4. Verify freshness for common files
+    for (const relPath of diskPaths) {
+      if (sessionId !== this.activeIndexingSession) return false
+      const lower = relPath.toLowerCase()
+      if (!indexedPathSet.has(lower)) {
+        // Handled above as new file
+        continue
+      }
+
+      const existingEntry = this.codebaseIndex.findFile(relPath)
+      if (!existingEntry) continue
+
+      const diskMeta = diskFileMap.get(relPath)
+
+      // Fast-path heuristic: If both size and mtimeMs exist and match exactly, file is unchanged.
+      const hasFastMeta =
+        diskMeta &&
+        typeof diskMeta.size === 'number' &&
+        typeof diskMeta.mtimeMs === 'number' &&
+        typeof existingEntry.mtimeMs === 'number'
+
+      const isFastMatch =
+        hasFastMeta &&
+        diskMeta.size === existingEntry.fileSize &&
+        diskMeta.mtimeMs === existingEntry.mtimeMs
+
+      if (isFastMatch) {
+        // Zero file-read overhead: file is verified fresh via metadata fast-path
+        continue
+      }
+
+      // Metadata changed or unavailable: read file to verify content hash
+      try {
+        const res = await window.electronAPI.readWorkspaceFile(normalizedRoot, relPath)
+        if (sessionId !== this.activeIndexingSession) return false
+
+        if (!res.success || typeof res.content !== 'string') {
+          // File failed to read: remove from index
+          this.codebaseIndex.removeFile(relPath)
+          this.cache.invalidate(relPath)
+          this.deduplicator.invalidateFile(relPath)
+          this.dependencyAnalyzer.invalidateFile(relPath)
+          indexChanged = true
+          continue
+        }
+
+        const currentHash = computeContentHash(res.content)
+        if (currentHash === existingEntry.contentHash) {
+          // Content hash is identical: update mtimeMs and fileSize without reparsing AST
+          this.codebaseIndex.updateFileMetadata(
+            relPath,
+            diskMeta?.mtimeMs,
+            diskMeta?.size ?? res.content.length
+          )
+          this.cache.set(relPath, res.content)
+          indexChanged = true
+        } else {
+          // Content hash changed: full incremental AST re-parse and dependency update
+          this.cache.set(relPath, res.content)
+          this.deduplicator.invalidateFile(relPath)
+          this.dependencyAnalyzer.invalidateFile(relPath)
+          this.codebaseIndex.updateFile(
+            relPath,
+            res.content,
+            diskPaths,
+            diskMeta?.mtimeMs,
+            diskMeta?.size ?? res.content.length
+          )
+          indexChanged = true
+          if (this.config.debug) {
+            console.debug(
+              `[SmartContextEngine] Reconcile: updated modified file "${relPath}" in index`
+            )
+          }
+        }
+      } catch (err) {
+        if (this.config.debug) {
+          console.debug(
+            `[SmartContextEngine] Error verifying freshness for "${relPath}":`,
+            err
+          )
+        }
+      }
+    }
+
+    // 5. If index changed during reconciliation, persist updated index
+    if (indexChanged && window.electronAPI.saveWorkspaceIndex) {
+      try {
+        await window.electronAPI.saveWorkspaceIndex(
+          normalizedRoot,
+          this.codebaseIndex.serialize()
+        )
+      } catch (err) {
+        if (this.config.debug) {
+          console.debug('[SmartContextEngine] Error saving reconciled index:', err)
+        }
+      }
+    }
+
+    return true
+  }
+
+  /**
+   * Replays watcher events that were queued while offline reconciliation was in progress.
+   */
+  private async replayQueuedWatcherEvents(sessionId: number): Promise<void> {
+    const queued = [...this.queuedWatcherEventsDuringRestore]
+    this.queuedWatcherEventsDuringRestore = []
+
+    for (const event of queued) {
+      if (sessionId !== this.activeIndexingSession) return
+      await this.handleFileEvent(event)
+    }
+  }
+
+  /**
+   * Schedules a debounced persistent save of the codebase index (1s debounce window).
+   */
+  scheduleSaveWorkspaceIndex(workspaceRoot: string): void {
+    if (typeof window === 'undefined' || !window.electronAPI?.saveWorkspaceIndex) {
+      return
+    }
+
+    const normalizedRoot = workspaceRoot.replace(/\\/g, '/').replace(/\/+$/, '')
+
+    if (this.saveIndexDebounceTimer) {
+      clearTimeout(this.saveIndexDebounceTimer)
+    }
+
+    this.saveIndexDebounceTimer = setTimeout(async () => {
+      this.saveIndexDebounceTimer = null
+      if (this.currentWorkspaceRoot !== normalizedRoot) {
+        return
+      }
+
+      try {
+        await window.electronAPI.saveWorkspaceIndex(
+          normalizedRoot,
+          this.codebaseIndex.serialize()
+        )
+        if (this.config.debug) {
+          console.debug(
+            `[SmartContextEngine] Debounced save of persistent index completed for "${normalizedRoot}".`
+          )
+        }
+      } catch (err) {
+        if (this.config.debug) {
+          console.debug('[SmartContextEngine] Failed debounced save of persistent index:', err)
+        }
+      }
+    }, 1000)
+  }
+
   isWorkspaceIndexed(workspaceRoot?: string | null): boolean {
     if (workspaceRoot) {
       const norm = workspaceRoot.replace(/\\/g, '/').replace(/\/+$/, '')
-      return this.indexedWorkspaceRoot === norm
+      return this.indexedWorkspaceRoot === norm || this.restoredWorkspaceRoot === norm
     }
-    return this.indexedWorkspaceRoot !== null
+    return this.indexedWorkspaceRoot !== null || this.restoredWorkspaceRoot !== null
   }
 
-  getIndexingStatus(): { isIndexing: boolean; indexedWorkspaceRoot: string | null } {
+  isWorkspaceIndexFresh(): boolean {
+    return this.isIndexFresh
+  }
+
+  isWorkspaceIndexRestored(): boolean {
+    return this.isIndexRestored
+  }
+
+  isWorkspaceIndexReconciling(): boolean {
+    return this.isReconciling
+  }
+
+  getIndexingStatus(): {
+    isIndexing: boolean
+    indexedWorkspaceRoot: string | null
+    isRestored: boolean
+    isFresh: boolean
+    isReconciling: boolean
+  } {
     return {
       isIndexing: this.isIndexing,
-      indexedWorkspaceRoot: this.indexedWorkspaceRoot
+      indexedWorkspaceRoot: this.indexedWorkspaceRoot,
+      isRestored: this.isIndexRestored,
+      isFresh: this.isIndexFresh,
+      isReconciling: this.isReconciling
     }
   }
 
@@ -385,18 +834,19 @@ export class SmartContextEngine {
     this.deduplicator.invalidateFile(relativePath)
     this.dependencyAnalyzer.invalidateFile(relativePath)
     this.codebaseIndex.invalidateFile(relativePath)
+    if (this.currentWorkspaceRoot) {
+      this.scheduleSaveWorkspaceIndex(this.currentWorkspaceRoot)
+    }
   }
 
   /**
    * Handles editor save event explicitly.
    */
   handleFileSave(filePath: string, content: string): void {
-    const normPath = filePath.replace(/\\/g, '/')
-    let relPath = normPath
-    if (this.currentWorkspaceRoot && normPath.toLowerCase().startsWith(this.currentWorkspaceRoot.toLowerCase())) {
-      relPath = normPath.slice(this.currentWorkspaceRoot.length).replace(/^[/\\]+/, '')
-    }
-    const cleanRel = relPath.replace(/\\/g, '/').replace(/^\/+/, '')
+    const cleanRel = this.currentWorkspaceRoot
+      ? toRelativeWorkspacePath(filePath, this.currentWorkspaceRoot)
+      : filePath.replace(/\\/g, '/').replace(/^\/+/, '')
+
     if (!cleanRel || cleanRel.startsWith('..') || cleanRel.includes('/../')) return
 
     this.recordSelfModified(cleanRel)
@@ -407,6 +857,9 @@ export class SmartContextEngine {
       allPaths.push(cleanRel)
     }
     this.codebaseIndex.updateFile(cleanRel, content, allPaths)
+    if (this.currentWorkspaceRoot) {
+      this.scheduleSaveWorkspaceIndex(this.currentWorkspaceRoot)
+    }
   }
 
   /**
@@ -437,6 +890,17 @@ export class SmartContextEngine {
       if (this.config.debug) {
         console.debug(`[SmartContextEngine] Rejected path traversal event for "${event.relativePath}"`)
       }
+      return
+    }
+
+    // If currently reconciling restored index, queue the event for replay after reconciliation finishes
+    if (this.isReconciling) {
+      if (this.config.debug) {
+        console.debug(
+          `[SmartContextEngine] Queued watcher event during reconciliation: "${cleanRel}" (${event.eventType})`
+        )
+      }
+      this.queuedWatcherEventsDuringRestore.push({ ...event, relativePath: cleanRel })
       return
     }
 
@@ -490,6 +954,7 @@ export class SmartContextEngine {
       this.deduplicator.invalidateFile(relativePath)
       this.dependencyAnalyzer.invalidateFile(relativePath)
       this.codebaseIndex.removeFile(relativePath)
+      this.scheduleSaveWorkspaceIndex(normalizedRoot)
       return
     }
 
@@ -510,6 +975,7 @@ export class SmartContextEngine {
           }
           this.cache.set(relativePath, res.content)
           this.codebaseIndex.updateFile(relativePath, res.content, allPaths)
+          this.scheduleSaveWorkspaceIndex(normalizedRoot)
           if (this.config.debug) {
             console.debug(
               `[SmartContextEngine] Updated index for file: "${relativePath}" (${eventType})`
@@ -518,6 +984,7 @@ export class SmartContextEngine {
         } else {
           // File could not be read or was removed
           this.codebaseIndex.removeFile(relativePath)
+          this.scheduleSaveWorkspaceIndex(normalizedRoot)
         }
       } catch (err) {
         if (this.config.debug) {
@@ -647,15 +1114,16 @@ export class SmartContextEngine {
     if (currentDepth > maxDepth || !entries) return []
     const paths: string[] = []
 
-    const normalizedRoot = rootPath.replace(/\\/g, '/').replace(/\/+$/, '')
-
     for (const entry of entries) {
       if (IGNORED_DIRS.has(entry.name)) continue
 
-      const normalizedEntryPath = entry.path.replace(/\\/g, '/')
-      let relPath = normalizedEntryPath.startsWith(normalizedRoot)
-        ? normalizedEntryPath.slice(normalizedRoot.length).replace(/^\/+/, '')
-        : normalizedEntryPath.replace(/^\/+/, '')
+      const relPath = toRelativeWorkspacePath(entry.path, rootPath)
+      if (!relPath) {
+        if (entry.isDirectory && entry.children && entry.children.length > 0) {
+          paths.push(...this.extractRelativePaths(entry.children, rootPath, maxDepth, currentDepth + 1))
+        }
+        continue
+      }
 
       if (entry.isDirectory) {
         if (entry.children && entry.children.length > 0) {
@@ -670,6 +1138,60 @@ export class SmartContextEngine {
     }
 
     return paths
+  }
+
+  /**
+   * Recursively extracts a map of normalized relative paths to file metadata (size, mtimeMs).
+   */
+  extractFileMetadataMap(
+    entries: FileEntry[],
+    rootPath: string,
+    maxDepth = 6,
+    currentDepth = 0
+  ): Map<string, { size?: number; mtimeMs?: number }> {
+    if (currentDepth > maxDepth || !entries) return new Map()
+    const map = new Map<string, { size?: number; mtimeMs?: number }>()
+
+    for (const entry of entries) {
+      if (IGNORED_DIRS.has(entry.name)) continue
+
+      const relPath = toRelativeWorkspacePath(entry.path, rootPath)
+      if (!relPath) {
+        if (entry.isDirectory && entry.children && entry.children.length > 0) {
+          const subMap = this.extractFileMetadataMap(
+            entry.children,
+            rootPath,
+            maxDepth,
+            currentDepth + 1
+          )
+          for (const [k, v] of subMap.entries()) {
+            map.set(k, v)
+          }
+        }
+        continue
+      }
+
+      if (entry.isDirectory) {
+        if (entry.children && entry.children.length > 0) {
+          const subMap = this.extractFileMetadataMap(
+            entry.children,
+            rootPath,
+            maxDepth,
+            currentDepth + 1
+          )
+          for (const [k, v] of subMap.entries()) {
+            map.set(k, v)
+          }
+        }
+      } else {
+        const ext = entry.name.split('.').pop()?.toLowerCase() || ''
+        if (!BINARY_AND_ASSET_EXTS.has(ext)) {
+          map.set(relPath, { size: entry.size, mtimeMs: entry.mtimeMs })
+        }
+      }
+    }
+
+    return map
   }
 
   /**

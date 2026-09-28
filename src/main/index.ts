@@ -2,6 +2,7 @@ import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron'
 import { join } from 'path'
 import * as fs from 'fs/promises'
 import * as path from 'path'
+import * as crypto from 'crypto'
 import { watch, FSWatcher } from 'fs'
 import { spawn, ChildProcess, exec } from 'child_process'
 import {
@@ -21,6 +22,9 @@ import {
   AppSettings,
   WorkspaceFileChangeEvent,
   WorkspaceFileChangeType,
+  SaveWorkspaceIndexResult,
+  LoadWorkspaceIndexResult,
+  ClearWorkspaceIndexResult,
   NvidiaChatCompletionRequest,
   NvidiaChatCompletionResponse,
   NvidiaListModelsRequest,
@@ -157,6 +161,152 @@ function startWorkspaceWatcher(workspaceRoot: string): { success: boolean; error
   }
 }
 
+function getWorkspaceIndexDirPath(): string {
+  return path.join(app.getPath('userData'), 'workspace-indexes')
+}
+
+function getWorkspaceIndexFilePath(workspaceRoot: string): string {
+  const normalized = path.resolve(workspaceRoot).replace(/\\/g, '/').toLowerCase()
+  const hash = crypto.createHash('sha256').update(normalized).digest('hex')
+  return path.join(getWorkspaceIndexDirPath(), `${hash}.json`)
+}
+
+// Queue of pending writes per storage file path to serialize concurrent operations
+const saveQueueMap: Map<string, Promise<void>> = new Map()
+
+async function safeWriteWorkspaceIndex(
+  workspaceRoot: string,
+  data: unknown
+): Promise<SaveWorkspaceIndexResult> {
+  try {
+    if (!workspaceRoot || typeof workspaceRoot !== 'string' || !workspaceRoot.trim()) {
+      return { success: false, error: 'Invalid workspace path.' }
+    }
+    if (!data || typeof data !== 'object') {
+      return { success: false, error: 'Invalid index payload.' }
+    }
+
+    // Verify payload workspace identity matches the requested workspace
+    const payloadRoot = (data as { workspaceRoot?: string }).workspaceRoot
+    if (typeof payloadRoot !== 'string' || !payloadRoot.trim()) {
+      return { success: false, error: 'Payload missing workspaceRoot identity.' }
+    }
+    const normRequested = path.resolve(workspaceRoot).replace(/\\/g, '/').toLowerCase()
+    const normPayload = path.resolve(payloadRoot).replace(/\\/g, '/').toLowerCase()
+    if (normRequested !== normPayload) {
+      return {
+        success: false,
+        error: `Workspace identity mismatch: requested "${normRequested}", payload was "${normPayload}".`
+      }
+    }
+
+    const filePath = getWorkspaceIndexFilePath(workspaceRoot)
+    const dirPath = getWorkspaceIndexDirPath()
+    const tempPath = `${filePath}.${Date.now()}.${Math.random().toString(36).slice(2)}.tmp`
+
+    // Serialize concurrent writes using promise chain per file
+    const currentQueue = saveQueueMap.get(filePath) || Promise.resolve()
+    const writeOperation = currentQueue
+      .then(async () => {
+        await fs.mkdir(dirPath, { recursive: true })
+        const jsonContent = JSON.stringify(data)
+        await fs.writeFile(tempPath, jsonContent, 'utf-8')
+        await fs.rename(tempPath, filePath)
+      })
+      .catch(async (err) => {
+        try {
+          await fs.unlink(tempPath)
+        } catch {}
+        throw err
+      })
+
+    saveQueueMap.set(filePath, writeOperation.catch(() => {}))
+    await writeOperation
+
+    return { success: true }
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err)
+    console.error(`[IndexStorage] Failed to save workspace index for "${workspaceRoot}":`, message)
+    return { success: false, error: message }
+  }
+}
+
+async function safeLoadWorkspaceIndex(
+  workspaceRoot: string
+): Promise<LoadWorkspaceIndexResult> {
+  try {
+    if (!workspaceRoot || typeof workspaceRoot !== 'string' || !workspaceRoot.trim()) {
+      return { success: false, error: 'Invalid workspace path.' }
+    }
+
+    const filePath = getWorkspaceIndexFilePath(workspaceRoot)
+
+    // Wait for any in-flight write in the queue to finish first
+    const pendingWrite = saveQueueMap.get(filePath)
+    if (pendingWrite) {
+      await pendingWrite
+    }
+
+    let fileContent: string
+    try {
+      fileContent = await fs.readFile(filePath, 'utf-8')
+    } catch {
+      return { success: false, error: 'Index file not found.' }
+    }
+
+    let parsed: unknown
+    try {
+      parsed = JSON.parse(fileContent)
+    } catch {
+      // Corrupted file: remove it so future operations recover cleanly
+      try {
+        await fs.unlink(filePath)
+      } catch {}
+      return { success: false, error: 'Corrupted index file discarded.' }
+    }
+
+    if (!parsed || typeof parsed !== 'object') {
+      return { success: false, error: 'Malformed index payload.' }
+    }
+
+    const payload = parsed as { workspaceRoot?: string; version?: number }
+    const normRequested = path.resolve(workspaceRoot).replace(/\\/g, '/').toLowerCase()
+    const normPayload = payload.workspaceRoot
+      ? path.resolve(payload.workspaceRoot).replace(/\\/g, '/').toLowerCase()
+      : null
+
+    if (normPayload !== normRequested) {
+      return {
+        success: false,
+        error: `Workspace identity mismatch in stored index: "${normPayload}" !== "${normRequested}".`
+      }
+    }
+
+    return { success: true, data: parsed }
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err)
+    return { success: false, error: message }
+  }
+}
+
+async function safeClearWorkspaceIndex(
+  workspaceRoot: string
+): Promise<ClearWorkspaceIndexResult> {
+  try {
+    if (!workspaceRoot || typeof workspaceRoot !== 'string' || !workspaceRoot.trim()) {
+      return { success: false, error: 'Invalid workspace path.' }
+    }
+    const filePath = getWorkspaceIndexFilePath(workspaceRoot)
+    try {
+      await fs.unlink(filePath)
+    } catch {}
+    return { success: true }
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err)
+    return { success: false, error: message }
+  }
+}
+
 async function readDirectoryTree(dirPath: string, maxDepth = 4, currentDepth = 0): Promise<FileEntry[]> {
   if (currentDepth > maxDepth) {
     return []
@@ -182,10 +332,21 @@ async function readDirectoryTree(dirPath: string, maxDepth = 4, currentDepth = 0
           children
         })
       } else if (dirent.isFile()) {
+        let size: number | undefined
+        let mtimeMs: number | undefined
+        try {
+          const stat = await fs.stat(fullPath)
+          size = stat.size
+          mtimeMs = stat.mtimeMs
+        } catch {
+          // Graceful fallback if stat fails for a file
+        }
         entries.push({
           name: dirent.name,
           path: fullPath,
-          isDirectory: false
+          isDirectory: false,
+          size,
+          mtimeMs
         })
       }
     }
@@ -739,6 +900,30 @@ function registerIpcHandlers(): void {
     async (): Promise<{ success: boolean }> => {
       stopWorkspaceWatcher()
       return { success: true }
+    }
+  )
+
+  // Handle saving persistent workspace index
+  ipcMain.handle(
+    IPC_CHANNELS.SAVE_WORKSPACE_INDEX,
+    async (_event, workspaceRoot: string, data: unknown): Promise<SaveWorkspaceIndexResult> => {
+      return safeWriteWorkspaceIndex(workspaceRoot, data)
+    }
+  )
+
+  // Handle loading persistent workspace index
+  ipcMain.handle(
+    IPC_CHANNELS.LOAD_WORKSPACE_INDEX,
+    async (_event, workspaceRoot: string): Promise<LoadWorkspaceIndexResult> => {
+      return safeLoadWorkspaceIndex(workspaceRoot)
+    }
+  )
+
+  // Handle clearing persistent workspace index
+  ipcMain.handle(
+    IPC_CHANNELS.CLEAR_WORKSPACE_INDEX,
+    async (_event, workspaceRoot: string): Promise<ClearWorkspaceIndexResult> => {
+      return safeClearWorkspaceIndex(workspaceRoot)
     }
   )
 
