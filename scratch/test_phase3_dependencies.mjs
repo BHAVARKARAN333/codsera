@@ -25,6 +25,11 @@ class DependencyAnalyzer {
     }
 
     this.fileCache = new Map()
+    this.workspaceFileLookup = new Map()
+    this.cachedFilesRef = null
+    this.cachedFilesLength = 0
+    this.cachedFirstFile = undefined
+    this.cachedLastFile = undefined
     this.compiledAliases = []
     this.setPathAliases(pathAliases, baseUrl)
   }
@@ -98,11 +103,81 @@ class DependencyAnalyzer {
 
   clearCache() {
     this.fileCache.clear()
+    this.workspaceFileLookup = new Map()
+    this.cachedFilesRef = null
+    this.cachedFilesLength = 0
+    this.cachedFirstFile = undefined
+    this.cachedLastFile = undefined
   }
 
   invalidateFile(filePath) {
     const key = this.normalizeKey(filePath)
     this.fileCache.delete(key)
+    if (this.workspaceFileLookup.has(key)) {
+      this.workspaceFileLookup.delete(key)
+      this.cachedFilesRef = null
+      this.cachedFilesLength = 0
+      this.cachedFirstFile = undefined
+      this.cachedLastFile = undefined
+    }
+  }
+
+  setWorkspaceFiles(allWorkspaceFiles) {
+    if (!allWorkspaceFiles || allWorkspaceFiles.length === 0) {
+      this.invalidateWorkspaceFiles()
+      return
+    }
+    this.ensureWorkspaceFileLookup(allWorkspaceFiles)
+  }
+
+  invalidateWorkspaceFiles() {
+    this.workspaceFileLookup = new Map()
+    this.cachedFilesRef = null
+    this.cachedFilesLength = 0
+    this.cachedFirstFile = undefined
+    this.cachedLastFile = undefined
+  }
+
+  getWorkspaceFilesCount() {
+    return this.workspaceFileLookup.size
+  }
+
+  isWorkspaceFilesCached(allWorkspaceFiles) {
+    if (!allWorkspaceFiles) return false
+    return (
+      this.cachedFilesRef === allWorkspaceFiles &&
+      this.cachedFilesLength === allWorkspaceFiles.length &&
+      (allWorkspaceFiles.length === 0 ||
+        (this.cachedFirstFile === allWorkspaceFiles[0] &&
+          this.cachedLastFile === allWorkspaceFiles[allWorkspaceFiles.length - 1]))
+    )
+  }
+
+  ensureWorkspaceFileLookup(allWorkspaceFiles) {
+    if (!allWorkspaceFiles || allWorkspaceFiles.length === 0) {
+      return this.workspaceFileLookup
+    }
+
+    if (
+      this.cachedFilesRef === allWorkspaceFiles &&
+      this.cachedFilesLength === allWorkspaceFiles.length &&
+      this.cachedFirstFile === allWorkspaceFiles[0] &&
+      this.cachedLastFile === allWorkspaceFiles[allWorkspaceFiles.length - 1]
+    ) {
+      return this.workspaceFileLookup
+    }
+
+    const map = new Map()
+    for (const f of allWorkspaceFiles) {
+      map.set(this.normalizeKey(f), this.normalizePath(f))
+    }
+    this.workspaceFileLookup = map
+    this.cachedFilesRef = allWorkspaceFiles
+    this.cachedFilesLength = allWorkspaceFiles.length
+    this.cachedFirstFile = allWorkspaceFiles[0]
+    this.cachedLastFile = allWorkspaceFiles[allWorkspaceFiles.length - 1]
+
+    return this.workspaceFileLookup
   }
 
   matchAliasPattern(specifier, alias) {
@@ -152,11 +227,8 @@ class DependencyAnalyzer {
     return false
   }
 
-  resolveImportPath(fromFilePath, importSpecifier, allWorkspaceFiles) {
-    const fileLookup = new Map()
-    for (const f of allWorkspaceFiles) {
-      fileLookup.set(this.normalizeKey(f), this.normalizePath(f))
-    }
+  resolveImportPath(fromFilePath, importSpecifier, allWorkspaceFiles = []) {
+    const fileLookup = this.ensureWorkspaceFileLookup(allWorkspaceFiles)
 
     const tryFindCandidate = (candidateBase) => {
       if (
@@ -228,6 +300,8 @@ class DependencyAnalyzer {
   }
 
   analyzeFileContent(filePath, content, allWorkspaceFiles = []) {
+    this.ensureWorkspaceFileLookup(allWorkspaceFiles)
+
     const key = this.normalizeKey(filePath)
     const normalizedPath = this.normalizePath(filePath)
 
@@ -677,6 +751,26 @@ class DependencyAnalyzer {
   }
 }
 
+class CodebaseIndex {
+  constructor(dependencyAnalyzer) {
+    this.entries = new Map()
+    this.detectedTechnologies = new Set()
+    this.workspaceRoot = null
+    this.dependencyAnalyzer = dependencyAnalyzer || new DependencyAnalyzer()
+  }
+
+  getDependencyAnalyzer() {
+    return this.dependencyAnalyzer
+  }
+
+  clear() {
+    this.entries.clear()
+    this.detectedTechnologies.clear()
+    this.workspaceRoot = null
+    this.dependencyAnalyzer.clearCache()
+  }
+}
+
 async function runPhase3Tests() {
   console.log('====================================================')
   console.log('PHASE 3: DEPENDENCY-AWARE CODE UNDERSTANDING TESTS')
@@ -1103,6 +1197,198 @@ import { Button } from '@monaco-editor/react';
   assert.strictEqual(singleRes.primaryGraph.path, 'src/utils/math.ts')
   assert(singleRes.primaryGraph.likelyTests.length > 0)
   console.log('✓ PASS: Single-file dependency analysis behavior remains completely compatible.')
+
+  // Test V: Workspace file lookup map caching, reuse, invalidation, and benchmark
+  console.log('\n[Test V] Workspace file lookup map caching, reuse, invalidation, and benchmark')
+  const optAnalyzer = new DependencyAnalyzer({
+    pathAliases: {
+      '@/*': ['src/*'],
+      '@shared/*': ['src/shared/*']
+    }
+  })
+
+  // 1. Initial lookup build and reuse check
+  assert.strictEqual(optAnalyzer.getWorkspaceFilesCount(), 0, 'Initial lookup map must be empty')
+  assert.strictEqual(optAnalyzer.isWorkspaceFilesCached(workspaceFiles), false, 'Must not be cached yet')
+
+  const res1 = optAnalyzer.resolveImportPath('src/components/Calculator.tsx', '../utils/math', workspaceFiles)
+  assert.strictEqual(res1, 'src/utils/math.ts', 'Relative import must resolve correctly')
+  assert.strictEqual(optAnalyzer.isWorkspaceFilesCached(workspaceFiles), true, 'Lookup map must now be cached')
+  assert.strictEqual(optAnalyzer.getWorkspaceFilesCount(), workspaceFiles.length, 'Lookup map size must match workspace files')
+
+  // Calling again with same array must reuse cached map
+  const res2 = optAnalyzer.resolveImportPath('src/components/Calculator.tsx', '@/shared/types', workspaceFiles)
+  assert.strictEqual(res2, 'src/shared/types.ts', 'Alias import must resolve correctly')
+  assert.strictEqual(optAnalyzer.isWorkspaceFilesCached(workspaceFiles), true, 'Lookup map must remain cached')
+
+  // 2. Refresh on file add (new array with new file)
+  const updatedWorkspaceFiles = [...workspaceFiles, 'src/services/newFeature.ts']
+  assert.strictEqual(optAnalyzer.isWorkspaceFilesCached(updatedWorkspaceFiles), false, 'Updated array must not be cached yet')
+  const resNew = optAnalyzer.resolveImportPath('src/components/Calculator.tsx', '../services/newFeature', updatedWorkspaceFiles)
+  assert.strictEqual(resNew, 'src/services/newFeature.ts', 'Newly added file must resolve successfully')
+  assert.strictEqual(optAnalyzer.isWorkspaceFilesCached(updatedWorkspaceFiles), true, 'Updated lookup map must now be cached')
+  assert.strictEqual(optAnalyzer.getWorkspaceFilesCount(), updatedWorkspaceFiles.length, 'Size must reflect added file')
+
+  // 3. Invalidation on file removal (invalidateFile)
+  optAnalyzer.invalidateFile('src/services/newFeature.ts')
+  assert.strictEqual(optAnalyzer.isWorkspaceFilesCached(updatedWorkspaceFiles), false, 'Cached ref must be reset on invalidateFile')
+  // Should not resolve now because entry was deleted from lookup
+  const resDeleted = optAnalyzer.resolveImportPath('src/components/Calculator.tsx', '../services/newFeature', [])
+  assert.strictEqual(resDeleted, null, 'Deleted/invalidated file must not resolve')
+
+  // 4. Workspace switch / clearCache()
+  optAnalyzer.clearCache()
+  assert.strictEqual(optAnalyzer.getWorkspaceFilesCount(), 0, 'clearCache must empty lookup map')
+  assert.strictEqual(optAnalyzer.isWorkspaceFilesCached(workspaceFiles), false, 'clearCache must reset cached reference')
+
+  // 5. Resolution parity checks (relative, alias, extensionless, index)
+  optAnalyzer.setWorkspaceFiles([
+    'src/index.ts',
+    'src/components/Button/index.tsx',
+    'src/utils/format.js',
+    'src/shared/types.ts'
+  ])
+  assert.strictEqual(
+    optAnalyzer.resolveImportPath('src/index.ts', './components/Button'),
+    'src/components/Button/index.tsx',
+    'Index resolution must work with cached lookup'
+  )
+  assert.strictEqual(
+    optAnalyzer.resolveImportPath('src/index.ts', './utils/format'),
+    'src/utils/format.js',
+    'Extensionless resolution must work with cached lookup'
+  )
+  assert.strictEqual(
+    optAnalyzer.resolveImportPath('src/index.ts', '@/shared/types'),
+    'src/shared/types.ts',
+    'Path alias resolution must work with cached lookup'
+  )
+
+  // 6. Performance benchmark: 1,000 files x 15 imports
+  const benchmarkFiles = Array.from({ length: 1000 }, (_, i) => `src/modules/module_${i}.ts`)
+  const importsToResolve = Array.from({ length: 15 }, (_, i) => `./module_${(i * 37) % 1000}`)
+
+  // Uncached simulation (rebuilding map per import, matching previous implementation)
+  const t0Uncached = performance.now()
+  let uncachedResolved = 0
+  for (let f = 0; f < 1000; f++) {
+    for (const imp of importsToResolve) {
+      const map = new Map()
+      for (const file of benchmarkFiles) {
+        map.set(file.toLowerCase(), file)
+      }
+      if (map.has(`src/modules/${imp.slice(2)}.ts`.toLowerCase())) {
+        uncachedResolved++
+      }
+    }
+  }
+  const tUncachedMs = performance.now() - t0Uncached
+
+  // Cached implementation (reusing lookup map)
+  const benchAnalyzer = new DependencyAnalyzer()
+  const t0Cached = performance.now()
+  let cachedResolved = 0
+  for (let f = 0; f < 1000; f++) {
+    const fromFile = benchmarkFiles[f]
+    for (const imp of importsToResolve) {
+      const res = benchAnalyzer.resolveImportPath(fromFile, imp, benchmarkFiles)
+      if (res) cachedResolved++
+    }
+  }
+  const tCachedMs = performance.now() - t0Cached
+
+  console.log(`[Benchmark] 1,000 files x 15 imports (15,000 import resolutions):`)
+  console.log(`  Uncached (rebuilding Map per import): ${tUncachedMs.toFixed(1)} ms`)
+  console.log(`  Cached (reusing workspaceFileLookup): ${tCachedMs.toFixed(1)} ms`)
+  console.log(`  Speedup: ${(tUncachedMs / Math.max(tCachedMs, 0.01)).toFixed(1)}x faster`)
+
+  assert.strictEqual(cachedResolved, 15000, 'All 15,000 imports must resolve successfully')
+  assert(tCachedMs < tUncachedMs / 5, 'Cached resolution must be at least 5x faster than uncached')
+  console.log('✓ PASS: Workspace file lookup caching, invalidation, parity, and performance benchmark confirmed.')
+
+  // Test W: Cache Invalidation Edge Cases (setWorkspaceFiles([]), CodebaseIndex.clear, invalidateWorkspaceFiles, uncached invalidateFile)
+  console.log('\n[Test W] Cache invalidation edge cases and CodebaseIndex.clear integration')
+
+  const edgeAnalyzer = new DependencyAnalyzer({
+    pathAliases: { '@/*': ['src/*'] }
+  })
+
+  // 1. Populating the lookup, then calling setWorkspaceFiles([]) and verifying old paths are no longer resolved
+  edgeAnalyzer.setWorkspaceFiles(['src/utils/math.ts', 'src/components/Button.tsx'])
+  assert.strictEqual(edgeAnalyzer.getWorkspaceFilesCount(), 2, 'Must have 2 files indexed')
+  assert.strictEqual(
+    edgeAnalyzer.resolveImportPath('src/App.tsx', './utils/math'),
+    'src/utils/math.ts',
+    'Must resolve before clearing'
+  )
+
+  edgeAnalyzer.setWorkspaceFiles([])
+  assert.strictEqual(edgeAnalyzer.getWorkspaceFilesCount(), 0, 'setWorkspaceFiles([]) must empty the lookup map')
+  assert.strictEqual(
+    edgeAnalyzer.resolveImportPath('src/App.tsx', './utils/math'),
+    null,
+    'Old paths must no longer resolve after setWorkspaceFiles([])'
+  )
+  console.log('✓ PASS: setWorkspaceFiles([]) successfully emptied lookup and prevented resolving old paths.')
+
+  // 2. Calling CodebaseIndex.clear() and verifying analyzer lookup state is cleared
+  const cbIndex = new CodebaseIndex(edgeAnalyzer)
+  edgeAnalyzer.setWorkspaceFiles(['src/main.ts', 'src/helper.ts'])
+  assert.strictEqual(edgeAnalyzer.getWorkspaceFilesCount(), 2, 'Must have 2 files indexed')
+
+  cbIndex.clear()
+  assert.strictEqual(edgeAnalyzer.getWorkspaceFilesCount(), 0, 'CodebaseIndex.clear() must clear analyzer lookup cache')
+  assert.strictEqual(
+    edgeAnalyzer.resolveImportPath('src/main.ts', './helper'),
+    null,
+    'Paths must not resolve after CodebaseIndex.clear()'
+  )
+  console.log('✓ PASS: CodebaseIndex.clear() cleared associated DependencyAnalyzer lookup cache.')
+
+  // 3. invalidateWorkspaceFiles()
+  edgeAnalyzer.setWorkspaceFiles(['src/alpha.ts', 'src/beta.ts'])
+  assert.strictEqual(edgeAnalyzer.getWorkspaceFilesCount(), 2)
+  edgeAnalyzer.invalidateWorkspaceFiles()
+  assert.strictEqual(edgeAnalyzer.getWorkspaceFilesCount(), 0, 'invalidateWorkspaceFiles() must clear lookup map')
+  assert.strictEqual(edgeAnalyzer.isWorkspaceFilesCached(['src/alpha.ts']), false, 'Cached ref must be reset')
+  console.log('✓ PASS: invalidateWorkspaceFiles() cleared lookup map and reset reference.')
+
+  // 4. invalidateFile() for a path that is not cached
+  edgeAnalyzer.setWorkspaceFiles(['src/alpha.ts', 'src/beta.ts'])
+  const initialCount = edgeAnalyzer.getWorkspaceFilesCount()
+  assert.strictEqual(initialCount, 2)
+  // Invalidate a file that does not exist in workspaceFileLookup
+  edgeAnalyzer.invalidateFile('src/nonexistent.ts')
+  assert.strictEqual(
+    edgeAnalyzer.getWorkspaceFilesCount(),
+    2,
+    'Invalidating uncached file must not mutate existing lookup entries'
+  )
+  assert.strictEqual(
+    edgeAnalyzer.resolveImportPath('src/index.ts', './alpha'),
+    'src/alpha.ts',
+    'Remaining cached files must still resolve normally'
+  )
+  console.log('✓ PASS: invalidateFile() for uncached path executed safely without corrupting cache.')
+
+  // 5. Existing cache reuse and import resolution behavior
+  const cachedFiles = ['src/components/Header.tsx', 'src/components/Footer.tsx', 'src/utils/dom.ts']
+  edgeAnalyzer.setWorkspaceFiles(cachedFiles)
+  assert.strictEqual(edgeAnalyzer.isWorkspaceFilesCached(cachedFiles), true, 'Must report cached')
+  assert.strictEqual(
+    edgeAnalyzer.resolveImportPath('src/App.tsx', './components/Header', cachedFiles),
+    'src/components/Header.tsx'
+  )
+  assert.strictEqual(
+    edgeAnalyzer.resolveImportPath('src/App.tsx', './components/Footer', cachedFiles),
+    'src/components/Footer.tsx'
+  )
+  assert.strictEqual(
+    edgeAnalyzer.resolveImportPath('src/App.tsx', './utils/dom', cachedFiles),
+    'src/utils/dom.ts'
+  )
+  assert.strictEqual(edgeAnalyzer.isWorkspaceFilesCached(cachedFiles), true, 'Must remain cached')
+  console.log('✓ PASS: Existing cache reuse and import resolution behavior verified.')
 
   console.log('\n====================================================')
   console.log('ALL PHASE 3 DEPENDENCY-AWARE TESTS PASSED! ✓')

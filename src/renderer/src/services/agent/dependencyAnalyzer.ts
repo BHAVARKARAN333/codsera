@@ -76,6 +76,11 @@ const EXTENSIONS_TO_TRY = ['.ts', '.tsx', '.js', '.jsx', '.d.ts', '.mjs', '.cjs'
 
 export class DependencyAnalyzer {
   private fileCache: Map<string, FileDependencyInfo> = new Map() // normalizedPath -> FileDependencyInfo
+  private workspaceFileLookup: Map<string, string> = new Map() // normalizedKey -> normalizedPath
+  private cachedFilesRef: string[] | null = null
+  private cachedFilesLength = 0
+  private cachedFirstFile: string | undefined = undefined
+  private cachedLastFile: string | undefined = undefined
   private config: Required<DependencyAnalyzerConfig>
   private compiledAliases: CompiledAlias[] = []
   private baseUrl = '.'
@@ -189,6 +194,11 @@ export class DependencyAnalyzer {
 
   clearCache(): void {
     this.fileCache.clear()
+    this.workspaceFileLookup = new Map()
+    this.cachedFilesRef = null
+    this.cachedFilesLength = 0
+    this.cachedFirstFile = undefined
+    this.cachedLastFile = undefined
     if (this.config.debug) {
       console.debug('[DependencyAnalyzer] Cache cleared')
     }
@@ -197,9 +207,96 @@ export class DependencyAnalyzer {
   invalidateFile(filePath: string): void {
     const key = this.normalizeKey(filePath)
     const existed = this.fileCache.delete(key)
+    if (this.workspaceFileLookup.has(key)) {
+      this.workspaceFileLookup.delete(key)
+      this.cachedFilesRef = null
+      this.cachedFilesLength = 0
+      this.cachedFirstFile = undefined
+      this.cachedLastFile = undefined
+    }
     if (this.config.debug && existed) {
       console.debug(`[DependencyAnalyzer] Invalidated: ${key}`)
     }
+  }
+
+  /**
+   * Sets and pre-indexes the workspace file lookup map.
+   * If an empty array is provided, invalidates and empties the lookup cache.
+   */
+  setWorkspaceFiles(allWorkspaceFiles: string[]): void {
+    if (!allWorkspaceFiles || allWorkspaceFiles.length === 0) {
+      this.invalidateWorkspaceFiles()
+      return
+    }
+    this.ensureWorkspaceFileLookup(allWorkspaceFiles)
+  }
+
+  /**
+   * Invalidates the cached workspace file lookup map.
+   */
+  invalidateWorkspaceFiles(): void {
+    this.workspaceFileLookup = new Map()
+    this.cachedFilesRef = null
+    this.cachedFilesLength = 0
+    this.cachedFirstFile = undefined
+    this.cachedLastFile = undefined
+  }
+
+  /**
+   * Returns the count of files currently indexed in the lookup map.
+   */
+  getWorkspaceFilesCount(): number {
+    return this.workspaceFileLookup.size
+  }
+
+  /**
+   * Returns true if the given files array matches the active cached lookup map.
+   */
+  isWorkspaceFilesCached(allWorkspaceFiles?: string[]): boolean {
+    if (!allWorkspaceFiles) return false
+    return (
+      this.cachedFilesRef === allWorkspaceFiles &&
+      this.cachedFilesLength === allWorkspaceFiles.length &&
+      (allWorkspaceFiles.length === 0 ||
+        (this.cachedFirstFile === allWorkspaceFiles[0] &&
+          this.cachedLastFile === allWorkspaceFiles[allWorkspaceFiles.length - 1]))
+    )
+  }
+
+  /**
+   * Ensures the normalized workspace file lookup map is built and up-to-date.
+   * Reuses the existing map if the file list reference, length, and boundary items are unchanged.
+   *
+   * Note on Immutability-by-Reference:
+   * To maintain O(1) resolution without an O(N) element scan on every lookup, arrays passed to
+   * this method are assumed to be immutable by reference. If workspace files are modified, callers
+   * must pass a new array instance or call `invalidateWorkspaceFiles()` / `setWorkspaceFiles()`.
+   */
+  private ensureWorkspaceFileLookup(allWorkspaceFiles?: string[]): Map<string, string> {
+    if (!allWorkspaceFiles || allWorkspaceFiles.length === 0) {
+      return this.workspaceFileLookup
+    }
+
+    if (
+      this.cachedFilesRef === allWorkspaceFiles &&
+      this.cachedFilesLength === allWorkspaceFiles.length &&
+      this.cachedFirstFile === allWorkspaceFiles[0] &&
+      this.cachedLastFile === allWorkspaceFiles[allWorkspaceFiles.length - 1]
+    ) {
+      return this.workspaceFileLookup
+    }
+
+    const map = new Map<string, string>()
+    for (const f of allWorkspaceFiles) {
+      map.set(this.normalizeKey(f), this.normalizePath(f))
+    }
+    this.workspaceFileLookup = map
+    this.cachedFilesRef = allWorkspaceFiles
+    this.cachedFilesLength = allWorkspaceFiles.length
+    this.cachedFirstFile = allWorkspaceFiles[0]
+    this.cachedLastFile = allWorkspaceFiles[allWorkspaceFiles.length - 1]
+
+    return this.workspaceFileLookup
   }
 
   /**
@@ -264,12 +361,9 @@ export class DependencyAnalyzer {
   resolveImportPath(
     fromFilePath: string,
     importSpecifier: string,
-    allWorkspaceFiles: string[]
+    allWorkspaceFiles: string[] = []
   ): string | null {
-    const fileLookup = new Map<string, string>()
-    for (const f of allWorkspaceFiles) {
-      fileLookup.set(this.normalizeKey(f), this.normalizePath(f))
-    }
+    const fileLookup = this.ensureWorkspaceFileLookup(allWorkspaceFiles)
 
     const tryFindCandidate = (candidateBase: string): string | null => {
       // Path containment / security check: reject if attempts traversal above root
@@ -356,6 +450,8 @@ export class DependencyAnalyzer {
     content: string,
     allWorkspaceFiles: string[] = []
   ): FileDependencyInfo {
+    this.ensureWorkspaceFileLookup(allWorkspaceFiles)
+
     const key = this.normalizeKey(filePath)
     const normalizedPath = this.normalizePath(filePath)
 

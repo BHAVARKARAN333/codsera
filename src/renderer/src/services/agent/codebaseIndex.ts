@@ -123,10 +123,15 @@ export class CodebaseIndex {
     return this.normalizePath(filePath).toLowerCase()
   }
 
+  getDependencyAnalyzer(): DependencyAnalyzer {
+    return this.dependencyAnalyzer
+  }
+
   clear(): void {
     this.entries.clear()
     this.detectedTechnologies.clear()
     this.workspaceRoot = null
+    this.dependencyAnalyzer.clearCache()
     if (this.debug) {
       console.debug('[CodebaseIndex] Index cleared')
     }

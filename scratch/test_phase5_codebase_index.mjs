@@ -30,6 +30,14 @@ const CONFIG_FILE_NAMES = new Set([
 ])
 
 class DependencyAnalyzer {
+  constructor() {
+    this.cacheCleared = false
+  }
+
+  clearCache() {
+    this.cacheCleared = true
+  }
+
   normalizePath(filePath) {
     return filePath.replace(/\\/g, '/').replace(/^\/+/, '')
   }
@@ -216,6 +224,9 @@ class CodebaseIndex {
     this.entries.clear()
     this.detectedTechnologies.clear()
     this.workspaceRoot = null
+    if (this.dependencyAnalyzer && typeof this.dependencyAnalyzer.clearCache === 'function') {
+      this.dependencyAnalyzer.clearCache()
+    }
   }
 
   async buildIndex(workspaceRoot, filePaths, fileReader) {
@@ -598,7 +609,12 @@ async function runPhase5Tests() {
   index.clear()
   assert.strictEqual(index.entries.size, 0)
   assert.strictEqual(index.detectedTechnologies.size, 0)
-  console.log('✓ PASS: Workspace reset cleared index state.')
+  assert.strictEqual(
+    index.dependencyAnalyzer.cacheCleared,
+    true,
+    'CodebaseIndex.clear() must reset associated DependencyAnalyzer cache'
+  )
+  console.log('✓ PASS: Workspace reset cleared index state and associated DependencyAnalyzer cache.')
 
   // Test 17: Path traversal rejected
   console.log('\n[Test 17] Path traversal rejection')
