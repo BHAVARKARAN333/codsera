@@ -1,4 +1,8 @@
-import { FileEntry } from '../../../../shared/types'
+import {
+  FileEntry,
+  WorkspaceFileChangeEvent,
+  WorkspaceFileChangeType
+} from '../../../../shared/types'
 import { ContextCache, ContextCacheStats } from './contextCache'
 import { ContextBudgetManager, DroppedContextFile } from './contextBudgetManager'
 import { ContextDeduplicator } from './contextDeduplicator'
@@ -34,6 +38,7 @@ export interface SmartContextResult {
   formattedContext: string
   cacheStats?: ContextCacheStats
   dependencyGraph?: DependencyGraphNode | null
+  dependencyGraphs?: DependencyGraphNode[]
   symbolReferences?: SymbolReference[]
   projectSummary?: ProjectSummary | null
 }
@@ -205,39 +210,321 @@ export class SmartContextEngine {
     return this.codebaseIndex
   }
 
+  private activeIndexingSession = 0
+  private indexedWorkspaceRoot: string | null = null
+  private isIndexing = false
+  private pendingEvents: Map<
+    string,
+    { event: WorkspaceFileChangeEvent; timer: ReturnType<typeof setTimeout> }
+  > = new Map()
+  private recentlyModifiedBySelf: Map<string, number> = new Map()
+
   /**
    * Clears in-memory file read cache, deduplication state, dependency analysis graph, and codebase index.
    */
   clearCache(): void {
+    for (const item of this.pendingEvents.values()) {
+      clearTimeout(item.timer)
+    }
+    this.pendingEvents.clear()
+    this.recentlyModifiedBySelf.clear()
     this.cache.clear()
     this.deduplicator.reset()
     this.dependencyAnalyzer.clearCache()
     this.codebaseIndex.clear()
+    this.indexedWorkspaceRoot = null
   }
 
   /**
    * Handles workspace switch (clears cache if workspace changed).
    */
   onWorkspaceChange(newWorkspaceRoot: string | null): void {
-    if (this.currentWorkspaceRoot !== newWorkspaceRoot) {
+    const normalizedNew = newWorkspaceRoot
+      ? newWorkspaceRoot.replace(/\\/g, '/').replace(/\/+$/, '')
+      : null
+    if (this.currentWorkspaceRoot !== normalizedNew) {
       if (this.config.debug) {
         console.debug(
-          `[SmartContextEngine] Workspace changed from "${this.currentWorkspaceRoot}" to "${newWorkspaceRoot}". Clearing cache.`
+          `[SmartContextEngine] Workspace changed from "${this.currentWorkspaceRoot}" to "${normalizedNew}". Clearing cache.`
         )
       }
-      this.currentWorkspaceRoot = newWorkspaceRoot
+      this.currentWorkspaceRoot = normalizedNew
       this.clearCache()
     }
+  }
+
+  /**
+   * Initializes or updates the workspace index when a workspace is opened or switched.
+   * Prevents duplicate builds for the same workspace and eliminates race conditions
+   * when workspaces are switched rapidly.
+   */
+  async initializeWorkspaceIndex(workspaceRoot: string | null): Promise<void> {
+    if (!workspaceRoot) {
+      this.currentWorkspaceRoot = null
+      this.clearCache()
+      return
+    }
+
+    const normalizedRoot = workspaceRoot.replace(/\\/g, '/').replace(/\/+$/, '')
+
+    // If workspace changed, clear prior cache immediately
+    if (this.currentWorkspaceRoot !== normalizedRoot) {
+      this.currentWorkspaceRoot = normalizedRoot
+      this.clearCache()
+    }
+
+    // If already indexed for this exact workspace, avoid redundant full rebuild
+    if (this.indexedWorkspaceRoot === normalizedRoot) {
+      if (this.config.debug) {
+        console.debug(
+          `[SmartContextEngine] Workspace "${normalizedRoot}" is already indexed. Skipping redundant rebuild.`
+        )
+      }
+      return
+    }
+
+    // Increment session ID to cancel/ignore any in-flight indexing from previous workspace
+    const sessionId = ++this.activeIndexingSession
+    this.isIndexing = true
+
+    try {
+      if (typeof window === 'undefined' || !window.electronAPI) {
+        if (this.config.debug) {
+          console.debug('[SmartContextEngine] Electron API unavailable for workspace indexing.')
+        }
+        return
+      }
+
+      // Read tree
+      const treeRes = await window.electronAPI.readTree(normalizedRoot)
+      if (sessionId !== this.activeIndexingSession) {
+        // Workspace was switched while reading tree; discard result
+        return
+      }
+
+      const treeEntries = treeRes.success && treeRes.tree ? treeRes.tree : []
+      const filePaths = this.extractRelativePaths(treeEntries, normalizedRoot)
+
+      if (filePaths.length === 0) {
+        if (sessionId === this.activeIndexingSession) {
+          this.indexedWorkspaceRoot = normalizedRoot
+        }
+        return
+      }
+
+      // Safe file reader through Electron API and ContextCache
+      const fileReader = async (relPath: string): Promise<string | null> => {
+        if (sessionId !== this.activeIndexingSession) return null
+
+        const cached = this.cache.get(relPath)
+        if (cached) return cached.content
+
+        const res = await window.electronAPI.readWorkspaceFile(normalizedRoot, relPath)
+        if (sessionId !== this.activeIndexingSession) return null
+
+        if (res.success && typeof res.content === 'string') {
+          this.cache.set(relPath, res.content)
+          return res.content
+        }
+        return null
+      }
+
+      // Build codebase index
+      await this.codebaseIndex.buildIndex(normalizedRoot, filePaths, fileReader)
+
+      // Only mark as successfully indexed if session is still current
+      if (sessionId === this.activeIndexingSession) {
+        this.indexedWorkspaceRoot = normalizedRoot
+        if (this.config.debug) {
+          console.debug(
+            `[SmartContextEngine] Background workspace indexing completed for "${normalizedRoot}".`
+          )
+        }
+      }
+    } catch (err: unknown) {
+      // Safe error recovery: never throw or block UI
+      if (this.config.debug) {
+        console.debug(`[SmartContextEngine] Non-fatal error during workspace indexing:`, err)
+      }
+    } finally {
+      if (sessionId === this.activeIndexingSession) {
+        this.isIndexing = false
+      }
+    }
+  }
+
+  isWorkspaceIndexed(workspaceRoot?: string | null): boolean {
+    if (workspaceRoot) {
+      const norm = workspaceRoot.replace(/\\/g, '/').replace(/\/+$/, '')
+      return this.indexedWorkspaceRoot === norm
+    }
+    return this.indexedWorkspaceRoot !== null
+  }
+
+  getIndexingStatus(): { isIndexing: boolean; indexedWorkspaceRoot: string | null } {
+    return {
+      isIndexing: this.isIndexing,
+      indexedWorkspaceRoot: this.indexedWorkspaceRoot
+    }
+  }
+
+  /**
+   * Records a file recently modified by AI tools or direct editor actions to avoid duplicate redundant re-indexing loops.
+   */
+  recordSelfModified(relativePath: string): void {
+    const norm = relativePath.replace(/\\/g, '/').replace(/^\/+/, '').toLowerCase()
+    this.recentlyModifiedBySelf.set(norm, Date.now())
   }
 
   /**
    * Invalidates a specific file in the cache, deduplicator, dependency analyzer, and codebase index.
    */
   invalidateFile(relativePath: string): void {
+    this.recordSelfModified(relativePath)
     this.cache.invalidate(relativePath)
     this.deduplicator.invalidateFile(relativePath)
     this.dependencyAnalyzer.invalidateFile(relativePath)
     this.codebaseIndex.invalidateFile(relativePath)
+  }
+
+  /**
+   * Handles editor save event explicitly.
+   */
+  handleFileSave(filePath: string, content: string): void {
+    const normPath = filePath.replace(/\\/g, '/')
+    let relPath = normPath
+    if (this.currentWorkspaceRoot && normPath.toLowerCase().startsWith(this.currentWorkspaceRoot.toLowerCase())) {
+      relPath = normPath.slice(this.currentWorkspaceRoot.length).replace(/^[/\\]+/, '')
+    }
+    const cleanRel = relPath.replace(/\\/g, '/').replace(/^\/+/, '')
+    if (!cleanRel || cleanRel.startsWith('..') || cleanRel.includes('/../')) return
+
+    this.recordSelfModified(cleanRel)
+    this.cache.set(cleanRel, content)
+    this.deduplicator.invalidateFile(cleanRel)
+    const allPaths = this.codebaseIndex.getAllFilePaths()
+    if (!allPaths.includes(cleanRel)) {
+      allPaths.push(cleanRel)
+    }
+    this.codebaseIndex.updateFile(cleanRel, content, allPaths)
+  }
+
+  /**
+   * Handles incoming file change events from the workspace filesystem watcher with debouncing and boundary validation.
+   */
+  async handleFileEvent(event: WorkspaceFileChangeEvent): Promise<void> {
+    if (!event || !event.relativePath || !event.workspaceRoot) return
+
+    const normalizedEventRoot = event.workspaceRoot.replace(/\\/g, '/').replace(/\/+$/, '')
+    const activeRoot = this.currentWorkspaceRoot
+      ? this.currentWorkspaceRoot.replace(/\\/g, '/').replace(/\/+$/, '')
+      : null
+
+    // Ignore events from past or unselected workspaces
+    if (!activeRoot || normalizedEventRoot.toLowerCase() !== activeRoot.toLowerCase()) {
+      if (this.config.debug) {
+        console.debug(
+          `[SmartContextEngine] Ignoring watcher event from inactive workspace "${event.workspaceRoot}"`
+        )
+      }
+      return
+    }
+
+    const cleanRel = event.relativePath.replace(/\\/g, '/').replace(/^\/+/, '')
+
+    // Security: reject paths attempting traversal outside the workspace
+    if (cleanRel.startsWith('..') || cleanRel.includes('/../')) {
+      if (this.config.debug) {
+        console.debug(`[SmartContextEngine] Rejected path traversal event for "${event.relativePath}"`)
+      }
+      return
+    }
+
+    const key = cleanRel.toLowerCase()
+
+    // Coalesce / Debounce rapid repeated events (100ms debounce window)
+    const existing = this.pendingEvents.get(key)
+    if (existing) {
+      clearTimeout(existing.timer)
+    }
+
+    const timer = setTimeout(async () => {
+      this.pendingEvents.delete(key)
+      await this.processDebouncedFileEvent(event.workspaceRoot, cleanRel, event.eventType)
+    }, 100)
+
+    this.pendingEvents.set(key, { event, timer })
+  }
+
+  /**
+   * Processes a debounced file event.
+   */
+  private async processDebouncedFileEvent(
+    workspaceRoot: string,
+    relativePath: string,
+    eventType: WorkspaceFileChangeType
+  ): Promise<void> {
+    const normalizedRoot = workspaceRoot.replace(/\\/g, '/').replace(/\/+$/, '')
+    if (this.currentWorkspaceRoot !== normalizedRoot) {
+      return
+    }
+
+    const key = relativePath.toLowerCase()
+
+    // Check if this was recently modified by self (AI tool or save) to avoid redundant duplicate indexing loops
+    const lastSelfModified = this.recentlyModifiedBySelf.get(key)
+    if (lastSelfModified && Date.now() - lastSelfModified < 1500) {
+      // Still ensure cache is invalidated
+      this.cache.invalidate(relativePath)
+      this.deduplicator.invalidateFile(relativePath)
+      return
+    }
+
+    if (eventType === 'unlink') {
+      if (this.config.debug) {
+        console.debug(
+          `[SmartContextEngine] File unlinked: "${relativePath}". Removing from cache & index.`
+        )
+      }
+      this.cache.invalidate(relativePath)
+      this.deduplicator.invalidateFile(relativePath)
+      this.dependencyAnalyzer.invalidateFile(relativePath)
+      this.codebaseIndex.removeFile(relativePath)
+      return
+    }
+
+    // For 'change' or 'add'
+    this.cache.invalidate(relativePath)
+    this.deduplicator.invalidateFile(relativePath)
+    this.dependencyAnalyzer.invalidateFile(relativePath)
+
+    if (typeof window !== 'undefined' && window.electronAPI) {
+      try {
+        const res = await window.electronAPI.readWorkspaceFile(normalizedRoot, relativePath)
+        if (this.currentWorkspaceRoot !== normalizedRoot) return
+
+        if (res.success && typeof res.content === 'string') {
+          const allPaths = this.codebaseIndex.getAllFilePaths()
+          if (!allPaths.includes(relativePath)) {
+            allPaths.push(relativePath)
+          }
+          this.cache.set(relativePath, res.content)
+          this.codebaseIndex.updateFile(relativePath, res.content, allPaths)
+          if (this.config.debug) {
+            console.debug(
+              `[SmartContextEngine] Updated index for file: "${relativePath}" (${eventType})`
+            )
+          }
+        } else {
+          // File could not be read or was removed
+          this.codebaseIndex.removeFile(relativePath)
+        }
+      } catch (err) {
+        if (this.config.debug) {
+          console.debug(`[SmartContextEngine] Failed to read updated file "${relativePath}":`, err)
+        }
+      }
+    }
   }
 
   /**
@@ -696,7 +983,8 @@ export class SmartContextEngine {
 
       // Dependency Analysis & Change Impact Preview (Phase 3 & 5)
       let dependencyGraph: DependencyGraphNode | null = null
-      let symbolReferences: SymbolReference[] = []
+      const dependencyGraphs: DependencyGraphNode[] = []
+      const symbolReferences: SymbolReference[] = []
       let projectSummary: ProjectSummary | null = null
 
       const promptLower = prompt.toLowerCase()
@@ -709,28 +997,60 @@ export class SmartContextEngine {
         promptLower.includes('entry points')
 
       if (readFiles.length > 0) {
-        const primary = readFiles[0]
-        const ext = primary.path.split('.').pop()?.toLowerCase() || ''
+        const filesWithContent = readFiles.map((rf) => ({
+          path: rf.path,
+          content: rf.content
+        }))
 
-        if (['ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs'].includes(ext)) {
-          const filesWithContent = readFiles.map((rf) => ({
-            path: rf.path,
-            content: rf.content
-          }))
+        const seenTargetPaths = new Set<string>()
 
-          dependencyGraph = this.dependencyAnalyzer.buildGraphNode(
-            primary.path,
-            primary.content,
-            filesWithContent,
-            filePaths
-          )
+        // 1. Analyze dependencies for ALL auto-read code files
+        for (const rf of readFiles) {
+          const ext = rf.path.split('.').pop()?.toLowerCase() || ''
+          if (!['ts', 'tsx', 'js', 'jsx', 'mjs', 'cjs'].includes(ext)) {
+            continue
+          }
 
-          // If prompt contains potential function or symbol identifier
-          const symbolTokens = this.tokenize(prompt).filter((t) => t.length >= 3)
-          for (const sym of symbolTokens) {
-            const refs = this.dependencyAnalyzer.findSymbolReferences(sym, filesWithContent)
-            if (refs.length > 0) {
-              symbolReferences.push(...refs)
+          const normTarget = rf.path.replace(/\\/g, '/').toLowerCase()
+          if (seenTargetPaths.has(normTarget)) {
+            continue
+          }
+          seenTargetPaths.add(normTarget)
+
+          try {
+            const node = this.dependencyAnalyzer.buildGraphNode(
+              rf.path,
+              rf.content,
+              filesWithContent,
+              filePaths
+            )
+            if (node) {
+              dependencyGraphs.push(node)
+            }
+          } catch (nodeErr) {
+            if (this.config.debug) {
+              console.debug(
+                `[SmartContextEngine] Failed to build dependency graph for ${rf.path}:`,
+                nodeErr
+              )
+            }
+          }
+        }
+
+        // Primary node for backwards compatibility
+        dependencyGraph = dependencyGraphs.length > 0 ? dependencyGraphs[0] : null
+
+        // 2. Find symbol references across filesWithContent (deduplicated)
+        const symbolTokens = this.tokenize(prompt).filter((t) => t.length >= 3)
+        const seenSymbolRefs = new Set<string>()
+
+        for (const sym of symbolTokens) {
+          const refs = this.dependencyAnalyzer.findSymbolReferences(sym, filesWithContent)
+          for (const ref of refs) {
+            const refKey = `${ref.file.toLowerCase()}:${ref.line}:${ref.snippet.trim()}`
+            if (!seenSymbolRefs.has(refKey)) {
+              seenSymbolRefs.add(refKey)
+              symbolReferences.push(ref)
             }
           }
         }
@@ -752,24 +1072,69 @@ export class SmartContextEngine {
 
         formattedContext = `[Smart Project Context Engine - Relevant Workspace Files]:\n${summaryLines.join('\n')}\n\n${fileContentsBlocks.join('\n\n')}`
 
-        if (dependencyGraph) {
-          const deps = dependencyGraph.directDependencies.length > 0
-            ? dependencyGraph.directDependencies.join(', ')
-            : 'None identified'
-          const importers = dependencyGraph.directImporters.length > 0
-            ? dependencyGraph.directImporters.join(', ')
-            : 'None directly detected'
-          const tests = dependencyGraph.likelyTests.length > 0
-            ? dependencyGraph.likelyTests.join(', ')
-            : 'None inferred'
-          const indirect = dependencyGraph.indirectImporters.length > 0
-            ? dependencyGraph.indirectImporters.join(', ')
-            : 'None inferred'
-          const affected = dependencyGraph.potentiallyAffected.length > 0
-            ? dependencyGraph.potentiallyAffected.join(', ')
-            : 'None identified'
+        if (dependencyGraphs.length === 1) {
+          const g = dependencyGraphs[0]
+          const deps =
+            g.directDependencies.length > 0
+              ? g.directDependencies.join(', ')
+              : 'None identified'
+          const importers =
+            g.directImporters.length > 0
+              ? g.directImporters.join(', ')
+              : 'None directly detected'
+          const tests =
+            g.likelyTests.length > 0 ? g.likelyTests.join(', ') : 'None inferred'
+          const indirect =
+            g.indirectImporters.length > 0
+              ? g.indirectImporters.join(', ')
+              : 'None inferred'
+          const affected =
+            g.potentiallyAffected.length > 0
+              ? g.potentiallyAffected.join(', ')
+              : 'None identified'
 
-          formattedContext += `\n\n[Dependency Graph & Impact Analysis]:\n- Primary Target: ${dependencyGraph.path}\n- Direct Dependencies [Directly Detected]: ${deps}\n- Direct Importers [Directly Detected]: ${importers}\n- Related Test Files [Inferred from naming conventions]: ${tests}\n- Potential Indirect Impact [Inferred downstream consumers]: ${indirect}\n- Combined Affected Files: ${affected}\n- Note: package.json is excluded from code change impact unless package metadata itself is modified.`
+          formattedContext += `\n\n[Dependency Graph & Impact Analysis]:\n- Primary Target: ${g.path}\n- Direct Dependencies [Directly Detected]: ${deps}\n- Direct Importers [Directly Detected]: ${importers}\n- Related Test Files [Inferred from naming conventions]: ${tests}\n- Potential Indirect Impact [Inferred downstream consumers]: ${indirect}\n- Combined Affected Files: ${affected}\n- Note: package.json is excluded from code change impact unless package metadata itself is modified.`
+        } else if (dependencyGraphs.length > 1) {
+          const sections = dependencyGraphs.map((g) => {
+            const deps =
+              g.directDependencies.length > 0
+                ? g.directDependencies.join(', ')
+                : 'None identified'
+            const importers =
+              g.directImporters.length > 0
+                ? g.directImporters.join(', ')
+                : 'None directly detected'
+            const tests =
+              g.likelyTests.length > 0 ? g.likelyTests.join(', ') : 'None inferred'
+            const indirect =
+              g.indirectImporters.length > 0
+                ? g.indirectImporters.join(', ')
+                : 'None inferred'
+            const affected =
+              g.potentiallyAffected.length > 0
+                ? g.potentiallyAffected.join(', ')
+                : 'None identified'
+
+            return `- Target: ${g.path}\n  * Direct Dependencies [Directly Detected]: ${deps}\n  * Direct Importers [Directly Detected]: ${importers}\n  * Related Test Files [Inferred from naming conventions]: ${tests}\n  * Potential Indirect Impact [Inferred downstream consumers]: ${indirect}\n  * Affected Files: ${affected}`
+          })
+
+          const combinedAffectedSet = new Set<string>()
+          for (const g of dependencyGraphs) {
+            for (const aff of g.potentiallyAffected) {
+              combinedAffectedSet.add(aff)
+            }
+          }
+          // Remove selected read files themselves from affected set
+          for (const rf of readFiles) {
+            combinedAffectedSet.delete(rf.path)
+          }
+
+          const combinedAffected =
+            combinedAffectedSet.size > 0
+              ? Array.from(combinedAffectedSet).sort().join(', ')
+              : 'None identified'
+
+          formattedContext += `\n\n[Dependency Graph & Impact Analysis]:\n${sections.join('\n\n')}\n\n- Combined Affected Files Across All Targets: ${combinedAffected}\n- Note: package.json is excluded from code change impact unless package metadata itself is modified.`
         }
 
         if (symbolReferences.length > 0) {
@@ -780,15 +1145,20 @@ export class SmartContextEngine {
         }
 
         if (projectSummary) {
-          const techStr = projectSummary.detectedTechnologies.length > 0
-            ? projectSummary.detectedTechnologies.join(', ')
-            : 'None detected from configuration files'
-          const entryStr = projectSummary.detectedEntryPoints.length > 0
-            ? projectSummary.detectedEntryPoints.map((e) => `${e.path} (${e.confidence}: ${e.reason})`).join(', ')
-            : 'None detected'
-          const configStr = projectSummary.configFiles.length > 0
-            ? projectSummary.configFiles.join(', ')
-            : 'None detected'
+          const techStr =
+            projectSummary.detectedTechnologies.length > 0
+              ? projectSummary.detectedTechnologies.join(', ')
+              : 'None detected from configuration files'
+          const entryStr =
+            projectSummary.detectedEntryPoints.length > 0
+              ? projectSummary.detectedEntryPoints
+                  .map((e) => `${e.path} (${e.confidence}: ${e.reason})`)
+                  .join(', ')
+              : 'None detected'
+          const configStr =
+            projectSummary.configFiles.length > 0
+              ? projectSummary.configFiles.join(', ')
+              : 'None detected'
           const runtimeStr = projectSummary.runtimePlatform || 'Node.js Application'
           const testEnvStr = projectSummary.testEnvironment || 'None Detected'
 
@@ -805,6 +1175,7 @@ export class SmartContextEngine {
         formattedContext,
         cacheStats: this.cache.getStats(),
         dependencyGraph,
+        dependencyGraphs,
         symbolReferences,
         projectSummary
       }

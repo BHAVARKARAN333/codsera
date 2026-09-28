@@ -149,6 +149,10 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
     orchestrator.registerTool(new GitLogTool())
     orchestratorRef.current = orchestrator
 
+    if (workspaceRoot) {
+      orchestrator.getSmartContextEngine().initializeWorkspaceIndex(workspaceRoot).catch(() => {})
+    }
+
     // Load persisted settings from secure Electron storage
     window.electronAPI
       .getSettings()
@@ -200,6 +204,31 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
       .catch((err) => {
         console.error('Failed to load settings:', err)
       })
+  }, [])
+
+  // Trigger workspace indexing whenever workspaceRoot opens or switches
+  useEffect(() => {
+    if (orchestratorRef.current && workspaceRoot) {
+      orchestratorRef.current
+        .getSmartContextEngine()
+        .initializeWorkspaceIndex(workspaceRoot)
+        .catch(() => {})
+    }
+  }, [workspaceRoot])
+
+  // Listen for real-time filesystem changes (edits, creations, deletions) in workspace
+  useEffect(() => {
+    if (typeof window === 'undefined' || !window.electronAPI?.onWorkspaceFileChanged) return
+
+    const unsubscribe = window.electronAPI.onWorkspaceFileChanged((event) => {
+      if (orchestratorRef.current) {
+        orchestratorRef.current.getSmartContextEngine().handleFileEvent(event).catch(() => {})
+      }
+    })
+
+    return () => {
+      unsubscribe()
+    }
   }, [])
 
   useEffect(() => {

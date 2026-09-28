@@ -2,6 +2,7 @@ import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron'
 import { join } from 'path'
 import * as fs from 'fs/promises'
 import * as path from 'path'
+import { watch, FSWatcher } from 'fs'
 import { spawn, ChildProcess, exec } from 'child_process'
 import {
   FileEntry,
@@ -18,6 +19,8 @@ import {
   GitLogResult,
   GitCommitInfo,
   AppSettings,
+  WorkspaceFileChangeEvent,
+  WorkspaceFileChangeType,
   NvidiaChatCompletionRequest,
   NvidiaChatCompletionResponse,
   NvidiaListModelsRequest,
@@ -28,6 +31,131 @@ import { validateCommandSafety } from '../shared/commandValidator'
 
 // Ignore common non-essential folders to keep explorer performant and clean
 const IGNORED_FOLDERS = new Set(['.git', 'node_modules', 'dist', 'out', '.vscode', '.idea'])
+
+const WATCHER_IGNORED_DIRS = new Set([
+  '.git',
+  'node_modules',
+  'dist',
+  'out',
+  '.vscode',
+  '.idea',
+  '.cache',
+  'coverage',
+  '.parcel-cache'
+])
+
+let currentWatcher: FSWatcher | null = null
+let watchedWorkspaceRoot: string | null = null
+
+function stopWorkspaceWatcher(): void {
+  if (currentWatcher) {
+    try {
+      currentWatcher.close()
+    } catch (err) {
+      console.error('[Watcher] Error closing watcher:', err)
+    }
+    currentWatcher = null
+    watchedWorkspaceRoot = null
+  }
+}
+
+function startWorkspaceWatcher(workspaceRoot: string): { success: boolean; error?: string } {
+  try {
+    if (!workspaceRoot || typeof workspaceRoot !== 'string') {
+      return { success: false, error: 'Invalid workspace path.' }
+    }
+
+    const normalizedRoot = path.resolve(workspaceRoot)
+
+    // If already watching this exact root, return success
+    if (currentWatcher && watchedWorkspaceRoot === normalizedRoot) {
+      return { success: true }
+    }
+
+    // Stop any existing watcher before starting a new one
+    stopWorkspaceWatcher()
+
+    // Create recursive watcher on workspace root
+    const watcher = watch(normalizedRoot, { recursive: true }, async (eventType, filename) => {
+      try {
+        if (!filename) return
+
+        // Normalize path and clean separators
+        const rawFilename = filename.toString()
+        const normalizedRel = rawFilename.replace(/\\/g, '/').replace(/^\/+/, '')
+
+        // Check path traversal or outside workspace
+        const targetAbs = path.resolve(normalizedRoot, normalizedRel)
+        const rel = path.relative(normalizedRoot, targetAbs)
+        if (rel.startsWith('..') || path.isAbsolute(rel)) {
+          return // Path outside workspace
+        }
+
+        // Filter out ignored folders
+        const parts = rel.split(path.sep)
+        if (parts.some((part) => WATCHER_IGNORED_DIRS.has(part))) {
+          return
+        }
+
+        // Filter out temporary build cache files
+        const lowerRel = rel.toLowerCase()
+        if (
+          lowerRel.endsWith('.tsbuildinfo') ||
+          lowerRel.endsWith('.tmp') ||
+          lowerRel.endsWith('~')
+        ) {
+          return
+        }
+
+        // Determine event type
+        let changeType: WorkspaceFileChangeType = 'change'
+        try {
+          const stat = await fs.stat(targetAbs)
+          if (stat.isDirectory()) {
+            // We ignore directory events, focus on file events
+            return
+          }
+          if (eventType === 'rename') {
+            changeType = 'add'
+          } else {
+            changeType = 'change'
+          }
+        } catch {
+          // If stat fails, file was deleted
+          changeType = 'unlink'
+        }
+
+        const payload: WorkspaceFileChangeEvent = {
+          workspaceRoot: normalizedRoot.replace(/\\/g, '/'),
+          relativePath: rel.replace(/\\/g, '/'),
+          eventType: changeType
+        }
+
+        // Broadcast to all open BrowserWindows
+        for (const win of BrowserWindow.getAllWindows()) {
+          if (!win.isDestroyed()) {
+            win.webContents.send(IPC_CHANNELS.ON_WORKSPACE_FILE_CHANGED, payload)
+          }
+        }
+      } catch (err) {
+        console.error('[Watcher] Error handling filesystem event:', err)
+      }
+    })
+
+    watcher.on('error', (err) => {
+      console.error('[Watcher] Filesystem watcher error:', err)
+    })
+
+    currentWatcher = watcher
+    watchedWorkspaceRoot = normalizedRoot
+
+    return { success: true }
+  } catch (err: unknown) {
+    const message = err instanceof Error ? err.message : String(err)
+    console.error(`[Watcher] Failed to start watcher on "${workspaceRoot}":`, message)
+    return { success: false, error: message }
+  }
+}
 
 async function readDirectoryTree(dirPath: string, maxDepth = 4, currentDepth = 0): Promise<FileEntry[]> {
   if (currentDepth > maxDepth) {
@@ -594,6 +722,23 @@ function registerIpcHandlers(): void {
         const message = err instanceof Error ? err.message : String(err)
         return { success: false, error: message }
       }
+    }
+  )
+
+  // Handle starting workspace filesystem watcher
+  ipcMain.handle(
+    IPC_CHANNELS.WATCH_WORKSPACE,
+    async (_event, rootPath: string): Promise<{ success: boolean; error?: string }> => {
+      return startWorkspaceWatcher(rootPath)
+    }
+  )
+
+  // Handle stopping workspace filesystem watcher
+  ipcMain.handle(
+    IPC_CHANNELS.UNWATCH_WORKSPACE,
+    async (): Promise<{ success: boolean }> => {
+      stopWorkspaceWatcher()
+      return { success: true }
     }
   )
 

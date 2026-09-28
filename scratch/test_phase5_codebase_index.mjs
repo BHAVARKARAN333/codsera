@@ -606,6 +606,192 @@ async function runPhase5Tests() {
   assert.strictEqual(index.findFile('../../secret.txt'), null)
   console.log('✓ PASS: Path traversal rejected.')
 
+  // ==========================================
+  // Workspace Lifecycle & Race Condition Tests
+  // ==========================================
+
+  class MockSmartContextEngine {
+    constructor() {
+      this.activeIndexingSession = 0
+      this.currentWorkspaceRoot = null
+      this.indexedWorkspaceRoot = null
+      this.isIndexing = false
+      this.codebaseIndex = new CodebaseIndex()
+      this.buildCount = 0
+    }
+
+    clearCache() {
+      this.codebaseIndex.clear()
+      this.indexedWorkspaceRoot = null
+    }
+
+    onWorkspaceChange(newWorkspaceRoot) {
+      const normalizedNew = newWorkspaceRoot
+        ? newWorkspaceRoot.replace(/\\/g, '/').replace(/\/+$/, '')
+        : null
+      if (this.currentWorkspaceRoot !== normalizedNew) {
+        this.currentWorkspaceRoot = normalizedNew
+        this.clearCache()
+      }
+    }
+
+    async initializeWorkspaceIndex(workspaceRoot, fileTreeProvider, fileContentProvider) {
+      if (!workspaceRoot) {
+        this.currentWorkspaceRoot = null
+        this.clearCache()
+        return
+      }
+
+      const normalizedRoot = workspaceRoot.replace(/\\/g, '/').replace(/\/+$/, '')
+
+      if (this.currentWorkspaceRoot !== normalizedRoot) {
+        this.currentWorkspaceRoot = normalizedRoot
+        this.clearCache()
+      }
+
+      if (this.indexedWorkspaceRoot === normalizedRoot) {
+        return
+      }
+
+      const sessionId = ++this.activeIndexingSession
+      this.isIndexing = true
+
+      try {
+        const filePaths = await fileTreeProvider(normalizedRoot)
+        if (sessionId !== this.activeIndexingSession) {
+          return
+        }
+
+        if (filePaths.length === 0) {
+          if (sessionId === this.activeIndexingSession) {
+            this.indexedWorkspaceRoot = normalizedRoot
+          }
+          return
+        }
+
+        const fileReader = async (relPath) => {
+          if (sessionId !== this.activeIndexingSession) return null
+          return await fileContentProvider(normalizedRoot, relPath)
+        }
+
+        this.buildCount++
+        await this.codebaseIndex.buildIndex(normalizedRoot, filePaths, fileReader)
+
+        if (sessionId === this.activeIndexingSession) {
+          this.indexedWorkspaceRoot = normalizedRoot
+        }
+      } catch (err) {
+        // Safe non-fatal error recovery
+      } finally {
+        if (sessionId === this.activeIndexingSession) {
+          this.isIndexing = false
+        }
+      }
+    }
+
+    isWorkspaceIndexed(workspaceRoot) {
+      if (workspaceRoot) {
+        const norm = workspaceRoot.replace(/\\/g, '/').replace(/\/+$/, '')
+        return this.indexedWorkspaceRoot === norm
+      }
+      return this.indexedWorkspaceRoot !== null
+    }
+
+    getIndexingStatus() {
+      return {
+        isIndexing: this.isIndexing,
+        indexedWorkspaceRoot: this.indexedWorkspaceRoot
+      }
+    }
+  }
+
+  // Test 18: Index build starts when workspace opens
+  console.log('\n[Test 18] Index build on workspace open')
+  const engine = new MockSmartContextEngine()
+  const ws1Files = new Map([
+    ['src/index.ts', 'export const main = 1;'],
+    ['src/helper.ts', 'import { main } from "./index";']
+  ])
+  const tree1 = async () => Array.from(ws1Files.keys())
+  const content1 = async (_root, rel) => ws1Files.get(rel) || null
+
+  await engine.initializeWorkspaceIndex('C:/projects/app1', tree1, content1)
+  assert.strictEqual(engine.isWorkspaceIndexed('C:/projects/app1'), true)
+  assert.strictEqual(engine.codebaseIndex.entries.size, 2)
+  console.log('✓ PASS: Index built successfully on workspace open.')
+
+  // Test 19: Workspace switch triggers indexing for new workspace
+  console.log('\n[Test 19] Workspace switch triggers indexing for new workspace')
+  const ws2Files = new Map([
+    ['src/app2.ts', 'export const app2 = 2;']
+  ])
+  const tree2 = async () => Array.from(ws2Files.keys())
+  const content2 = async (_root, rel) => ws2Files.get(rel) || null
+
+  await engine.initializeWorkspaceIndex('C:/projects/app2', tree2, content2)
+  assert.strictEqual(engine.isWorkspaceIndexed('C:/projects/app2'), true)
+  assert.strictEqual(engine.isWorkspaceIndexed('C:/projects/app1'), false)
+  assert.strictEqual(engine.codebaseIndex.entries.size, 1)
+  assert.notStrictEqual(engine.codebaseIndex.findFile('src/app2.ts'), null)
+  assert.strictEqual(engine.codebaseIndex.findFile('src/index.ts'), null)
+  console.log('✓ PASS: Switching workspace replaced index with new workspace entries.')
+
+  // Test 20: Reopening same workspace avoids redundant rebuild
+  console.log('\n[Test 20] Redundant rebuild avoidance')
+  const priorBuildCount = engine.buildCount
+  await engine.initializeWorkspaceIndex('C:/projects/app2', tree2, content2)
+  assert.strictEqual(engine.buildCount, priorBuildCount, 'Build count must not increment for same workspace')
+  console.log('✓ PASS: Same workspace did not trigger duplicate rebuild.')
+
+  // Test 21: Delayed result from old workspace cannot overwrite active workspace
+  console.log('\n[Test 21] Workspace switch race condition protection')
+  const raceEngine = new MockSmartContextEngine()
+  
+  // Workspace A is slow (50ms delay)
+  const slowTreeA = async () => {
+    await new Promise((r) => setTimeout(r, 50))
+    return ['src/slowA.ts']
+  }
+  const slowContentA = async (_root, rel) => {
+    await new Promise((r) => setTimeout(r, 20))
+    return 'export const slowA = true;'
+  }
+
+  // Workspace B is fast (5ms delay)
+  const fastTreeB = async () => {
+    await new Promise((r) => setTimeout(r, 5))
+    return ['src/fastB.ts']
+  }
+  const fastContentB = async (_root, rel) => {
+    return 'export const fastB = true;'
+  }
+
+  // Launch A then immediately switch to B
+  const pA = raceEngine.initializeWorkspaceIndex('C:/projects/workspaceA', slowTreeA, slowContentA)
+  const pB = raceEngine.initializeWorkspaceIndex('C:/projects/workspaceB', fastTreeB, fastContentB)
+
+  await Promise.all([pA, pB])
+
+  // Active workspace must be Workspace B, and its index must contain fastB.ts, NOT slowA.ts
+  assert.strictEqual(raceEngine.isWorkspaceIndexed('C:/projects/workspaceB'), true)
+  assert.strictEqual(raceEngine.isWorkspaceIndexed('C:/projects/workspaceA'), false)
+  assert.notStrictEqual(raceEngine.codebaseIndex.findFile('src/fastB.ts'), null)
+  assert.strictEqual(raceEngine.codebaseIndex.findFile('src/slowA.ts'), null)
+  console.log('✓ PASS: Out-of-order delayed indexing from previous workspace was safely ignored.')
+
+  // Test 22: Safe error recovery during indexing failure
+  console.log('\n[Test 22] Safe error recovery on indexing failure')
+  const failingEngine = new MockSmartContextEngine()
+  const failingTree = async () => {
+    throw new Error('EACCES: permission denied')
+  }
+  
+  // Must resolve safely without unhandled exception
+  await failingEngine.initializeWorkspaceIndex('C:/projects/forbidden', failingTree, async () => null)
+  assert.strictEqual(failingEngine.isWorkspaceIndexed('C:/projects/forbidden'), false)
+  assert.strictEqual(failingEngine.getIndexingStatus().isIndexing, false)
+  console.log('✓ PASS: Indexing failure was safely caught and did not crash or leave dirty indexing state.')
+
   console.log('\n===========================================================')
   console.log('ALL PHASE 5 CODEBASE INDEX TESTS PASSED! ✓')
   console.log('===========================================================')

@@ -106,6 +106,18 @@ export const App: React.FC = () => {
     })
   }, [])
 
+  // Start workspace filesystem watcher whenever workspace opens or switches
+  React.useEffect(() => {
+    if (rootPath) {
+      window.electronAPI.watchWorkspace(rootPath).catch(() => {})
+    } else {
+      window.electronAPI.unwatchWorkspace().catch(() => {})
+    }
+    return () => {
+      window.electronAPI.unwatchWorkspace().catch(() => {})
+    }
+  }, [rootPath])
+
   // Refresh directory tree
   const handleRefreshTree = async () => {
     if (!rootPath) return

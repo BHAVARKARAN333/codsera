@@ -48,6 +48,24 @@ const api: IElectronAPI = {
   listFiles: (rootPath, options) => {
     return ipcRenderer.invoke(IPC_CHANNELS.LIST_FILES, rootPath, options)
   },
+  watchWorkspace: (rootPath: string) => {
+    return ipcRenderer.invoke(IPC_CHANNELS.WATCH_WORKSPACE, rootPath)
+  },
+  unwatchWorkspace: () => {
+    return ipcRenderer.invoke(IPC_CHANNELS.UNWATCH_WORKSPACE)
+  },
+  onWorkspaceFileChanged: (callback) => {
+    const listener = (
+      _event: Electron.IpcRendererEvent,
+      data: import('../shared/types').WorkspaceFileChangeEvent
+    ) => {
+      callback(data)
+    }
+    ipcRenderer.on(IPC_CHANNELS.ON_WORKSPACE_FILE_CHANGED, listener)
+    return () => {
+      ipcRenderer.removeListener(IPC_CHANNELS.ON_WORKSPACE_FILE_CHANGED, listener)
+    }
+  },
   runCommand: (command: string, cwd?: string, timeoutMs?: number): Promise<RunCommandResult> => {
     return ipcRenderer.invoke(IPC_CHANNELS.RUN_COMMAND, command, cwd, timeoutMs)
   },

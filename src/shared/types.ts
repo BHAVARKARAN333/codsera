@@ -190,6 +190,14 @@ export interface NvidiaListModelsResponse {
   isNetworkError?: boolean
 }
 
+export type WorkspaceFileChangeType = 'add' | 'change' | 'unlink'
+
+export interface WorkspaceFileChangeEvent {
+  workspaceRoot: string
+  relativePath: string
+  eventType: WorkspaceFileChangeType
+}
+
 export interface IElectronAPI {
   openDirectory: () => Promise<OpenDirectoryResult>
   readTree: (rootPath: string) => Promise<OpenDirectoryResult>
@@ -209,6 +217,9 @@ export interface IElectronAPI {
   ) => Promise<EditWorkspaceFileResult>
   writeFile: (filePath: string, content: string) => Promise<WriteFileResult>
   listFiles: (rootPath: string, options?: ListFilesOptions) => Promise<ListFilesResult>
+  watchWorkspace: (rootPath: string) => Promise<{ success: boolean; error?: string }>
+  unwatchWorkspace: () => Promise<{ success: boolean }>
+  onWorkspaceFileChanged: (callback: (event: WorkspaceFileChangeEvent) => void) => () => void
   runCommand: (
     command: string,
     cwd?: string,
@@ -239,6 +250,9 @@ export const IPC_CHANNELS = {
   EDIT_WORKSPACE_FILE: 'fs:editWorkspaceFile',
   WRITE_FILE: 'fs:writeFile',
   LIST_FILES: 'fs:listFiles',
+  WATCH_WORKSPACE: 'fs:watchWorkspace',
+  UNWATCH_WORKSPACE: 'fs:unwatchWorkspace',
+  ON_WORKSPACE_FILE_CHANGED: 'fs:onWorkspaceFileChanged',
   RUN_COMMAND: 'command:run',
   STOP_COMMAND: 'command:stop',
   GIT_STATUS: 'git:status',

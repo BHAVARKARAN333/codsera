@@ -298,6 +298,13 @@ export class CodebaseIndex {
   }
 
   /**
+   * Returns all currently indexed file relative paths.
+   */
+  getAllFilePaths(): string[] {
+    return Array.from(this.entries.values()).map((e) => e.normalizedPath)
+  }
+
+  /**
    * Query API: Finds file entry by path.
    */
   findFile(filePath: string): FileIndexEntry | null {
