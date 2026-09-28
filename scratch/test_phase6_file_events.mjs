@@ -212,26 +212,60 @@ class ContextCache {
   }
 }
 
+function coalesceEventTypes(prevType, newType) {
+  if (prevType === 'add') {
+    if (newType === 'unlink') return 'unlink'
+    return 'add' // 'add' + 'change' => 'add'
+  }
+  if (prevType === 'change') {
+    if (newType === 'unlink') return 'unlink'
+    return 'change' // 'change' + 'add' / 'change' + 'change' => 'change'
+  }
+  if (prevType === 'unlink') {
+    if (newType === 'add' || newType === 'change') return 'change' // unlinked then recreated => 'change'
+    return 'unlink'
+  }
+  return newType
+}
+
 class FullSmartContextEngine {
-  constructor() {
+  constructor(config = {}) {
     this.cache = new ContextCache()
     this.depAnalyzer = new DependencyAnalyzer()
     this.codebaseIndex = new CodebaseIndex(this.depAnalyzer)
     this.currentWorkspaceRoot = null
-    this.pendingEvents = new Map()
+    this.pendingEventBatch = new Map()
+    this.watcherBatchTimer = null
+    this.isProcessingEventBatch = false
+    this.batchResolvers = []
     this.recentlyModifiedBySelf = new Map()
     this.readWorkspaceFileMock = null
+    this.saveIndexCallCount = 0
+    this.config = {
+      watcherBatchDebounceMs: 20,
+      ...config
+    }
   }
 
   clearCache() {
-    for (const item of this.pendingEvents.values()) {
-      clearTimeout(item.timer)
+    if (this.watcherBatchTimer) {
+      clearTimeout(this.watcherBatchTimer)
+      this.watcherBatchTimer = null
     }
-    this.pendingEvents.clear()
+    this.pendingEventBatch.clear()
+    this.isProcessingEventBatch = false
+    const resolvers = [...this.batchResolvers]
+    this.batchResolvers = []
+    resolvers.forEach((r) => r())
+
     this.recentlyModifiedBySelf.clear()
     this.cache.clear()
     this.depAnalyzer.clearCache()
     this.codebaseIndex.clear()
+  }
+
+  getPendingEventBatchCount() {
+    return this.pendingEventBatch.size
   }
 
   onWorkspaceChange(newWorkspaceRoot) {
@@ -254,6 +288,9 @@ class FullSmartContextEngine {
     this.cache.invalidate(relativePath)
     this.depAnalyzer.invalidateFile(relativePath)
     this.codebaseIndex.invalidateFile(relativePath)
+    if (this.currentWorkspaceRoot) {
+      this.scheduleSaveWorkspaceIndex(this.currentWorkspaceRoot)
+    }
   }
 
   handleFileSave(filePath, content) {
@@ -272,9 +309,16 @@ class FullSmartContextEngine {
       allPaths.push(cleanRel)
     }
     this.codebaseIndex.updateFile(cleanRel, content, allPaths)
+    if (this.currentWorkspaceRoot) {
+      this.scheduleSaveWorkspaceIndex(this.currentWorkspaceRoot)
+    }
   }
 
-  async handleFileEvent(event, debounceMs = 20) {
+  scheduleSaveWorkspaceIndex(_workspaceRoot) {
+    this.saveIndexCallCount++
+  }
+
+  async handleFileEvent(event, overrideDebounceMs) {
     if (!event || !event.relativePath || !event.workspaceRoot) return
 
     const normalizedEventRoot = event.workspaceRoot.replace(/\\/g, '/').replace(/\/+$/, '')
@@ -294,63 +338,129 @@ class FullSmartContextEngine {
 
     const key = cleanRel.toLowerCase()
 
-    const existing = this.pendingEvents.get(key)
+    const existing = this.pendingEventBatch.get(key)
     if (existing) {
-      clearTimeout(existing.timer)
-      if (existing.resolve) existing.resolve()
+      const mergedType = coalesceEventTypes(existing.eventType, event.eventType)
+      this.pendingEventBatch.set(key, {
+        workspaceRoot: event.workspaceRoot,
+        relativePath: cleanRel,
+        eventType: mergedType
+      })
+    } else {
+      this.pendingEventBatch.set(key, {
+        workspaceRoot: event.workspaceRoot,
+        relativePath: cleanRel,
+        eventType: event.eventType
+      })
+    }
+
+    const debounceMs = overrideDebounceMs ?? this.config.watcherBatchDebounceMs
+
+    if (this.watcherBatchTimer) {
+      clearTimeout(this.watcherBatchTimer)
     }
 
     return new Promise((resolve) => {
-      const timer = setTimeout(async () => {
-        this.pendingEvents.delete(key)
-        await this.processDebouncedFileEvent(event.workspaceRoot, cleanRel, event.eventType)
-        resolve()
+      this.batchResolvers.push(resolve)
+      this.watcherBatchTimer = setTimeout(async () => {
+        this.watcherBatchTimer = null
+        await this.processPendingEventBatch()
       }, debounceMs)
-
-      this.pendingEvents.set(key, { event, timer, resolve })
     })
   }
 
-  async processDebouncedFileEvent(workspaceRoot, relativePath, eventType) {
-    const normalizedRoot = workspaceRoot.replace(/\\/g, '/').replace(/\/+$/, '')
-    if (this.currentWorkspaceRoot !== normalizedRoot) {
+  async processPendingEventBatch() {
+    if (this.isProcessingEventBatch) {
       return
     }
 
-    const key = relativePath.toLowerCase()
-    const lastSelfModified = this.recentlyModifiedBySelf.get(key)
-    if (lastSelfModified && Date.now() - lastSelfModified < 1500) {
-      this.cache.invalidate(relativePath)
+    if (this.pendingEventBatch.size === 0) {
+      const resolvers = [...this.batchResolvers]
+      this.batchResolvers = []
+      resolvers.forEach((r) => r())
       return
     }
 
-    if (eventType === 'unlink') {
-      this.cache.invalidate(relativePath)
-      this.depAnalyzer.invalidateFile(relativePath)
-      this.codebaseIndex.removeFile(relativePath)
+    const batchToProcess = new Map(this.pendingEventBatch)
+    this.pendingEventBatch.clear()
+
+    const currentResolvers = [...this.batchResolvers]
+    this.batchResolvers = []
+
+    const activeRoot = this.currentWorkspaceRoot
+    if (!activeRoot) {
+      currentResolvers.forEach((r) => r())
       return
     }
 
-    this.cache.invalidate(relativePath)
-    this.depAnalyzer.invalidateFile(relativePath)
+    this.isProcessingEventBatch = true
+    let indexChanged = false
 
-    if (this.readWorkspaceFileMock) {
-      try {
-        const res = await this.readWorkspaceFileMock(normalizedRoot, relativePath)
-        if (this.currentWorkspaceRoot !== normalizedRoot) return
+    try {
+      let allPaths = this.codebaseIndex.getAllFilePaths()
 
-        if (res.success && typeof res.content === 'string') {
-          const allPaths = this.codebaseIndex.getAllFilePaths()
-          if (!allPaths.includes(relativePath)) {
-            allPaths.push(relativePath)
-          }
-          this.cache.set(relativePath, res.content)
-          this.codebaseIndex.updateFile(relativePath, res.content, allPaths)
-        } else {
-          this.codebaseIndex.removeFile(relativePath)
+      for (const [key, event] of batchToProcess.entries()) {
+        if (this.currentWorkspaceRoot !== activeRoot) return
+
+        const relativePath = event.relativePath
+
+        const lastSelfModified = this.recentlyModifiedBySelf.get(key)
+        if (lastSelfModified && Date.now() - lastSelfModified < 1500) {
+          this.cache.invalidate(relativePath)
+          continue
         }
-      } catch (err) {
-        // Safe non-fatal error recovery
+
+        if (event.eventType === 'unlink') {
+          this.cache.invalidate(relativePath)
+          this.depAnalyzer.invalidateFile(relativePath)
+          const removed = this.codebaseIndex.removeFile(relativePath)
+          if (removed) {
+            allPaths = allPaths.filter((p) => p.toLowerCase() !== key)
+            indexChanged = true
+          }
+          continue
+        }
+
+        this.cache.invalidate(relativePath)
+        this.depAnalyzer.invalidateFile(relativePath)
+
+        if (this.readWorkspaceFileMock) {
+          try {
+            const res = await this.readWorkspaceFileMock(activeRoot, relativePath)
+            if (this.currentWorkspaceRoot !== activeRoot) return
+
+            if (res.success && typeof res.content === 'string') {
+              if (!allPaths.some((p) => p.toLowerCase() === key)) {
+                allPaths.push(relativePath)
+              }
+              this.cache.set(relativePath, res.content)
+              this.codebaseIndex.updateFile(relativePath, res.content, allPaths)
+              indexChanged = true
+            } else {
+              this.codebaseIndex.removeFile(relativePath)
+              allPaths = allPaths.filter((p) => p.toLowerCase() !== key)
+              indexChanged = true
+            }
+          } catch (err) {
+            // Safe non-fatal error recovery
+          }
+        }
+      }
+
+      if (indexChanged && this.currentWorkspaceRoot === activeRoot) {
+        this.scheduleSaveWorkspaceIndex(activeRoot)
+      }
+    } finally {
+      this.isProcessingEventBatch = false
+      currentResolvers.forEach((r) => r())
+
+      if (this.pendingEventBatch.size > 0 && this.currentWorkspaceRoot === activeRoot) {
+        if (!this.watcherBatchTimer) {
+          this.watcherBatchTimer = setTimeout(() => {
+            this.watcherBatchTimer = null
+            this.processPendingEventBatch()
+          }, this.config.watcherBatchDebounceMs)
+        }
       }
     }
   }
@@ -514,6 +624,254 @@ async function runPhase6Tests() {
   assert.strictEqual(engine.cache.get('src/toolCreated.ts'), null)
   assert.strictEqual(engine.codebaseIndex.findFile('src/toolCreated.ts'), null)
   console.log('✓ PASS: Invalidation method clears cache and index as expected.')
+
+  // -------------------------------------------------------------
+  // Test 9: Multi-file batching processes distinct files in 1 batch and schedules 1 save
+  // -------------------------------------------------------------
+  console.log('\n[Test 9] Multi-file batching: multiple distinct files processed in 1 batch')
+  engine.saveIndexCallCount = 0
+  let multiReadCount = 0
+  engine.readWorkspaceFileMock = async (_root, rel) => {
+    multiReadCount++
+    if (filesStore.has(rel)) {
+      return { success: true, content: filesStore.get(rel) }
+    }
+    return { success: false, error: 'File not found' }
+  }
+
+  for (let i = 1; i <= 5; i++) {
+    filesStore.set(`src/batch${i}.ts`, `export const b${i} = ${i};`)
+  }
+
+  const batchPromises = []
+  for (let i = 1; i <= 5; i++) {
+    batchPromises.push(
+      engine.handleFileEvent({
+        workspaceRoot: wsRoot,
+        relativePath: `src/batch${i}.ts`,
+        eventType: 'add'
+      }, 30)
+    )
+  }
+
+  // All 5 should be pending in the current batch
+  assert.strictEqual(engine.getPendingEventBatchCount(), 5)
+  await Promise.all(batchPromises)
+
+  assert.strictEqual(engine.getPendingEventBatchCount(), 0)
+  assert.strictEqual(multiReadCount, 5, `Expected 5 read calls for 5 distinct files, got ${multiReadCount}`)
+  assert.strictEqual(engine.saveIndexCallCount, 1, `Expected exactly 1 scheduleSave call for the whole batch, got ${engine.saveIndexCallCount}`)
+
+  for (let i = 1; i <= 5; i++) {
+    const entry = engine.codebaseIndex.findFile(`src/batch${i}.ts`)
+    assert.notStrictEqual(entry, null, `Expected src/batch${i}.ts to be indexed`)
+  }
+  console.log('✓ PASS: 5 distinct files batched together; 5 reads and exactly 1 persistent save scheduled.')
+
+  // -------------------------------------------------------------
+  // Test 10: Event ordering & coalescing state transitions
+  // -------------------------------------------------------------
+  console.log('\n[Test 10] Event ordering & coalescing state machine')
+  // 10.1 Unit checks for coalesceEventTypes
+  assert.strictEqual(coalesceEventTypes('add', 'change'), 'add')
+  assert.strictEqual(coalesceEventTypes('add', 'unlink'), 'unlink')
+  assert.strictEqual(coalesceEventTypes('change', 'unlink'), 'unlink')
+  assert.strictEqual(coalesceEventTypes('unlink', 'add'), 'change')
+  assert.strictEqual(coalesceEventTypes('unlink', 'change'), 'change')
+  assert.strictEqual(coalesceEventTypes('change', 'change'), 'change')
+  assert.strictEqual(coalesceEventTypes('add', 'add'), 'add')
+  assert.strictEqual(coalesceEventTypes('unlink', 'unlink'), 'unlink')
+
+  // 10.2 Batch behavior: 'add' + 'unlink' results in unlink (0 reads from disk)
+  let ephemeralReads = 0
+  engine.readWorkspaceFileMock = async (_root, rel) => {
+    if (rel === 'src/ephemeral.ts') ephemeralReads++
+    return origReader(_root, rel)
+  }
+  filesStore.set('src/ephemeral.ts', 'export const ephemeral = true;')
+
+  const pAdd = engine.handleFileEvent({
+    workspaceRoot: wsRoot,
+    relativePath: 'src/ephemeral.ts',
+    eventType: 'add'
+  }, 40)
+  const pUnlink = engine.handleFileEvent({
+    workspaceRoot: wsRoot,
+    relativePath: 'src/ephemeral.ts',
+    eventType: 'unlink'
+  }, 40)
+  await Promise.all([pAdd, pUnlink])
+
+  assert.strictEqual(ephemeralReads, 0, 'add+unlink must result in unlink with 0 disk reads')
+  assert.strictEqual(engine.codebaseIndex.findFile('src/ephemeral.ts'), null)
+
+  // 10.3 Batch behavior: 'add' + 'change' results in add (1 read, final content indexed)
+  filesStore.set('src/coalescedAdd.ts', 'export const finalVal = 999;')
+  let coalescedAddReads = 0
+  engine.readWorkspaceFileMock = async (_root, rel) => {
+    if (rel === 'src/coalescedAdd.ts') coalescedAddReads++
+    return origReader(_root, rel)
+  }
+  const ca1 = engine.handleFileEvent({
+    workspaceRoot: wsRoot,
+    relativePath: 'src/coalescedAdd.ts',
+    eventType: 'add'
+  }, 30)
+  const ca2 = engine.handleFileEvent({
+    workspaceRoot: wsRoot,
+    relativePath: 'src/coalescedAdd.ts',
+    eventType: 'change'
+  }, 30)
+  await Promise.all([ca1, ca2])
+
+  assert.strictEqual(coalescedAddReads, 1, 'add+change must result in exactly 1 disk read')
+  const caEntry = engine.codebaseIndex.findFile('src/coalescedAdd.ts')
+  assert.notStrictEqual(caEntry, null)
+  assert.strictEqual(caEntry.exports[0].name, 'finalVal')
+
+  // 10.4 Batch behavior: 'change' + 'unlink' results in unlink (0 reads, removed from index)
+  let changeUnlinkReads = 0
+  engine.readWorkspaceFileMock = async (_root, rel) => {
+    if (rel === 'src/coalescedAdd.ts') changeUnlinkReads++
+    return origReader(_root, rel)
+  }
+  const cu1 = engine.handleFileEvent({
+    workspaceRoot: wsRoot,
+    relativePath: 'src/coalescedAdd.ts',
+    eventType: 'change'
+  }, 30)
+  const cu2 = engine.handleFileEvent({
+    workspaceRoot: wsRoot,
+    relativePath: 'src/coalescedAdd.ts',
+    eventType: 'unlink'
+  }, 30)
+  await Promise.all([cu1, cu2])
+
+  assert.strictEqual(changeUnlinkReads, 0, 'change+unlink must result in 0 disk reads')
+  assert.strictEqual(engine.codebaseIndex.findFile('src/coalescedAdd.ts'), null)
+
+  // 10.5 Batch behavior: 'unlink' + 'add' results in change (1 read, indexed)
+  let unlinkAddReads = 0
+  filesStore.set('src/coalescedAdd.ts', 'export const resurrected = true;')
+  engine.readWorkspaceFileMock = async (_root, rel) => {
+    if (rel === 'src/coalescedAdd.ts') unlinkAddReads++
+    return origReader(_root, rel)
+  }
+  const ua1 = engine.handleFileEvent({
+    workspaceRoot: wsRoot,
+    relativePath: 'src/coalescedAdd.ts',
+    eventType: 'unlink'
+  }, 30)
+  const ua2 = engine.handleFileEvent({
+    workspaceRoot: wsRoot,
+    relativePath: 'src/coalescedAdd.ts',
+    eventType: 'add'
+  }, 30)
+  await Promise.all([ua1, ua2])
+
+  assert.strictEqual(unlinkAddReads, 1, 'unlink+add must result in 1 disk read')
+  const uaEntry = engine.codebaseIndex.findFile('src/coalescedAdd.ts')
+  assert.notStrictEqual(uaEntry, null)
+  assert.strictEqual(uaEntry.exports[0].name, 'resurrected')
+  console.log('✓ PASS: All event coalescing combinations verified correctly.')
+
+  // -------------------------------------------------------------
+  // Test 11: Workspace switching cancels in-flight/pending batch
+  // -------------------------------------------------------------
+  console.log('\n[Test 11] Workspace switching cancels pending batch')
+  let wsSwitchReads = 0
+  engine.readWorkspaceFileMock = async (_root, rel) => {
+    if (rel.startsWith('src/switchWs')) wsSwitchReads++
+    return origReader(_root, rel)
+  }
+  filesStore.set('src/switchWs1.ts', 'export const s1 = 1;')
+  filesStore.set('src/switchWs2.ts', 'export const s2 = 2;')
+
+  const sw1 = engine.handleFileEvent({
+    workspaceRoot: wsRoot,
+    relativePath: 'src/switchWs1.ts',
+    eventType: 'add'
+  }, 50)
+  const sw2 = engine.handleFileEvent({
+    workspaceRoot: wsRoot,
+    relativePath: 'src/switchWs2.ts',
+    eventType: 'add'
+  }, 50)
+
+  assert.strictEqual(engine.getPendingEventBatchCount(), 2)
+
+  // Switch workspace while batch is pending
+  engine.onWorkspaceChange('C:/switched-workspace')
+  assert.strictEqual(engine.getPendingEventBatchCount(), 0)
+
+  // Await the event promises (they should resolve safely via flushed resolvers)
+  await Promise.all([sw1, sw2])
+  // Wait to ensure timer expired
+  await new Promise((r) => setTimeout(r, 60))
+
+  assert.strictEqual(wsSwitchReads, 0, 'No reads should occur for cancelled workspace batch')
+  assert.strictEqual(engine.codebaseIndex.findFile('src/switchWs1.ts'), null)
+  console.log('✓ PASS: Workspace change discarded pending batch without leaking reads or index entries.')
+
+  // Restore workspace
+  engine.onWorkspaceChange(wsRoot)
+
+  // -------------------------------------------------------------
+  // Test 12: Events arriving during active batch processing trigger subsequent batch
+  // -------------------------------------------------------------
+  console.log('\n[Test 12] Events arriving during batch processing trigger subsequent batch')
+  filesStore.set('src/slowFile.ts', 'export const slow = true;')
+  filesStore.set('src/arrivedDuring.ts', 'export const arrivedDuring = true;')
+
+  let slowReadStarted = false
+  let releaseSlowRead = null
+  const slowReadGate = new Promise((r) => { releaseSlowRead = r })
+
+  engine.readWorkspaceFileMock = async (_root, rel) => {
+    if (rel === 'src/slowFile.ts') {
+      slowReadStarted = true
+      await slowReadGate
+      return { success: true, content: filesStore.get('src/slowFile.ts') }
+    }
+    return origReader(_root, rel)
+  }
+
+  // Launch slowFile with short debounce
+  const slowPromise = engine.handleFileEvent({
+    workspaceRoot: wsRoot,
+    relativePath: 'src/slowFile.ts',
+    eventType: 'add'
+  }, 20)
+
+  // Wait for debounce timer to fire and slow read to begin
+  while (!slowReadStarted) {
+    await new Promise((r) => setTimeout(r, 5))
+  }
+  assert.strictEqual(engine.isProcessingEventBatch, true, 'Batch should be actively processing')
+
+  // While processing slowFile, an event arrives for arrivedDuring
+  const duringPromise = engine.handleFileEvent({
+    workspaceRoot: wsRoot,
+    relativePath: 'src/arrivedDuring.ts',
+    eventType: 'add'
+  }, 20)
+
+  assert.strictEqual(engine.getPendingEventBatchCount(), 1, 'Arriving event should be queued in pendingEventBatch')
+
+  // Release the slow read so batch 1 finishes
+  releaseSlowRead()
+  await slowPromise
+
+  // Now batch 2 should be scheduled and executed for arrivedDuring
+  await duringPromise
+
+  assert.notStrictEqual(engine.codebaseIndex.findFile('src/slowFile.ts'), null, 'slowFile should be indexed')
+  assert.notStrictEqual(engine.codebaseIndex.findFile('src/arrivedDuring.ts'), null, 'arrivedDuring should be indexed')
+  assert.strictEqual(engine.getPendingEventBatchCount(), 0)
+  console.log('✓ PASS: Event arriving during batch processing was preserved and processed in subsequent batch.')
+
+  // Restore reader
+  engine.readWorkspaceFileMock = origReader
 
   console.log('\n===========================================================')
   console.log('ALL PHASE 6 FILE WATCHER & EVENT TESTS PASSED! ✓')

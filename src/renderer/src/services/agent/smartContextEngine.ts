@@ -50,7 +50,30 @@ export interface SmartContextEngineConfig {
   maxFileChars?: number
   maxTotalContextChars?: number
   minScoreThreshold?: number
+  watcherBatchDebounceMs?: number
   debug?: boolean
+}
+
+/**
+ * Coalesces consecutive filesystem event types for the same file within a single debounce batch.
+ */
+export function coalesceEventTypes(
+  prevType: WorkspaceFileChangeType,
+  newType: WorkspaceFileChangeType
+): WorkspaceFileChangeType {
+  if (prevType === 'add') {
+    if (newType === 'unlink') return 'unlink'
+    return 'add' // 'add' + 'change' => 'add'
+  }
+  if (prevType === 'change') {
+    if (newType === 'unlink') return 'unlink'
+    return 'change' // 'change' + 'add' / 'change' + 'change' => 'change'
+  }
+  if (prevType === 'unlink') {
+    if (newType === 'add' || newType === 'change') return 'change' // unlinked then recreated => 'change'
+    return 'unlink'
+  }
+  return newType
 }
 
 const BINARY_AND_ASSET_EXTS = new Set([
@@ -208,6 +231,7 @@ export class SmartContextEngine {
     const maxFileChars = config?.maxFileChars ?? 12000
     const maxTotalContextChars = config?.maxTotalContextChars ?? 30000
     const minScoreThreshold = config?.minScoreThreshold ?? 40
+    const watcherBatchDebounceMs = config?.watcherBatchDebounceMs ?? 50
     const debug = config?.debug ?? false
 
     this.config = {
@@ -217,6 +241,7 @@ export class SmartContextEngine {
       maxFileChars,
       maxTotalContextChars,
       minScoreThreshold,
+      watcherBatchDebounceMs,
       debug
     }
 
@@ -272,11 +297,18 @@ export class SmartContextEngine {
   private isReconciling = false
   private queuedWatcherEventsDuringRestore: WorkspaceFileChangeEvent[] = []
   private saveIndexDebounceTimer: ReturnType<typeof setTimeout> | null = null
-  private pendingEvents: Map<
-    string,
-    { event: WorkspaceFileChangeEvent; timer: ReturnType<typeof setTimeout> }
-  > = new Map()
+  private pendingEventBatch: Map<string, WorkspaceFileChangeEvent> = new Map()
+  private watcherBatchTimer: ReturnType<typeof setTimeout> | null = null
+  private isProcessingEventBatch = false
+  private batchResolvers: Array<() => void> = []
   private recentlyModifiedBySelf: Map<string, number> = new Map()
+
+  /**
+   * Returns the count of pending file events in the active batch.
+   */
+  getPendingEventBatchCount(): number {
+    return this.pendingEventBatch.size
+  }
 
   /**
    * Clears in-memory file read cache, deduplication state, dependency analysis graph, and codebase index.
@@ -290,10 +322,15 @@ export class SmartContextEngine {
     }
     this.isReconciling = false
     this.queuedWatcherEventsDuringRestore = []
-    for (const item of this.pendingEvents.values()) {
-      clearTimeout(item.timer)
+    if (this.watcherBatchTimer) {
+      clearTimeout(this.watcherBatchTimer)
+      this.watcherBatchTimer = null
     }
-    this.pendingEvents.clear()
+    this.pendingEventBatch.clear()
+    this.isProcessingEventBatch = false
+    const resolvers = [...this.batchResolvers]
+    this.batchResolvers = []
+    resolvers.forEach((r) => r())
     this.recentlyModifiedBySelf.clear()
     this.cache.clear()
     this.deduplicator.reset()
@@ -737,10 +774,12 @@ export class SmartContextEngine {
     const queued = [...this.queuedWatcherEventsDuringRestore]
     this.queuedWatcherEventsDuringRestore = []
 
+    const promises: Promise<void>[] = []
     for (const event of queued) {
       if (sessionId !== this.activeIndexingSession) return
-      await this.handleFileEvent(event)
+      promises.push(this.handleFileEvent(event))
     }
+    await Promise.all(promises)
   }
 
   /**
@@ -863,9 +902,13 @@ export class SmartContextEngine {
   }
 
   /**
-   * Handles incoming file change events from the workspace filesystem watcher with debouncing and boundary validation.
+   * Handles incoming file change events from the workspace filesystem watcher with debounced batching,
+   * event coalescing, and path boundary validation.
    */
-  async handleFileEvent(event: WorkspaceFileChangeEvent): Promise<void> {
+  async handleFileEvent(
+    event: WorkspaceFileChangeEvent,
+    overrideDebounceMs?: number
+  ): Promise<void> {
     if (!event || !event.relativePath || !event.workspaceRoot) return
 
     const normalizedEventRoot = event.workspaceRoot.replace(/\\/g, '/').replace(/\/+$/, '')
@@ -906,89 +949,158 @@ export class SmartContextEngine {
 
     const key = cleanRel.toLowerCase()
 
-    // Coalesce / Debounce rapid repeated events (100ms debounce window)
-    const existing = this.pendingEvents.get(key)
+    // Coalesce with any existing pending event for this path in current batch
+    const existing = this.pendingEventBatch.get(key)
     if (existing) {
-      clearTimeout(existing.timer)
+      const mergedType = coalesceEventTypes(existing.eventType, event.eventType)
+      this.pendingEventBatch.set(key, {
+        workspaceRoot: event.workspaceRoot,
+        relativePath: cleanRel,
+        eventType: mergedType
+      })
+    } else {
+      this.pendingEventBatch.set(key, {
+        workspaceRoot: event.workspaceRoot,
+        relativePath: cleanRel,
+        eventType: event.eventType
+      })
     }
 
-    const timer = setTimeout(async () => {
-      this.pendingEvents.delete(key)
-      await this.processDebouncedFileEvent(event.workspaceRoot, cleanRel, event.eventType)
-    }, 100)
+    const debounceMs = overrideDebounceMs ?? this.config.watcherBatchDebounceMs
 
-    this.pendingEvents.set(key, { event, timer })
+    if (this.watcherBatchTimer) {
+      clearTimeout(this.watcherBatchTimer)
+    }
+
+    return new Promise<void>((resolve) => {
+      this.batchResolvers.push(resolve)
+      this.watcherBatchTimer = setTimeout(async () => {
+        this.watcherBatchTimer = null
+        await this.processPendingEventBatch()
+      }, debounceMs)
+    })
   }
 
   /**
-   * Processes a debounced file event.
+   * Processes the collected batch of debounced file change events.
+   * Ensures each affected path is processed at most once per batch,
+   * avoiding duplicate reads, parsing, and persistent save operations.
    */
-  private async processDebouncedFileEvent(
-    workspaceRoot: string,
-    relativePath: string,
-    eventType: WorkspaceFileChangeType
-  ): Promise<void> {
-    const normalizedRoot = workspaceRoot.replace(/\\/g, '/').replace(/\/+$/, '')
-    if (this.currentWorkspaceRoot !== normalizedRoot) {
+  private async processPendingEventBatch(): Promise<void> {
+    if (this.isProcessingEventBatch) {
       return
     }
 
-    const key = relativePath.toLowerCase()
-
-    // Check if this was recently modified by self (AI tool or save) to avoid redundant duplicate indexing loops
-    const lastSelfModified = this.recentlyModifiedBySelf.get(key)
-    if (lastSelfModified && Date.now() - lastSelfModified < 1500) {
-      // Still ensure cache is invalidated
-      this.cache.invalidate(relativePath)
-      this.deduplicator.invalidateFile(relativePath)
+    if (this.pendingEventBatch.size === 0) {
+      const resolvers = [...this.batchResolvers]
+      this.batchResolvers = []
+      resolvers.forEach((r) => r())
       return
     }
 
-    if (eventType === 'unlink') {
-      if (this.config.debug) {
-        console.debug(
-          `[SmartContextEngine] File unlinked: "${relativePath}". Removing from cache & index.`
-        )
-      }
-      this.cache.invalidate(relativePath)
-      this.deduplicator.invalidateFile(relativePath)
-      this.dependencyAnalyzer.invalidateFile(relativePath)
-      this.codebaseIndex.removeFile(relativePath)
-      this.scheduleSaveWorkspaceIndex(normalizedRoot)
+    // Atomically detach all pending events for this batch
+    const batchToProcess = new Map(this.pendingEventBatch)
+    this.pendingEventBatch.clear()
+
+    const currentResolvers = [...this.batchResolvers]
+    this.batchResolvers = []
+
+    const activeRoot = this.currentWorkspaceRoot
+    if (!activeRoot) {
+      currentResolvers.forEach((r) => r())
       return
     }
 
-    // For 'change' or 'add'
-    this.cache.invalidate(relativePath)
-    this.deduplicator.invalidateFile(relativePath)
-    this.dependencyAnalyzer.invalidateFile(relativePath)
+    this.isProcessingEventBatch = true
+    let indexChanged = false
 
-    if (typeof window !== 'undefined' && window.electronAPI) {
-      try {
-        const res = await window.electronAPI.readWorkspaceFile(normalizedRoot, relativePath)
-        if (this.currentWorkspaceRoot !== normalizedRoot) return
+    try {
+      let allPaths = this.codebaseIndex.getAllFilePaths()
 
-        if (res.success && typeof res.content === 'string') {
-          const allPaths = this.codebaseIndex.getAllFilePaths()
-          if (!allPaths.includes(relativePath)) {
-            allPaths.push(relativePath)
-          }
-          this.cache.set(relativePath, res.content)
-          this.codebaseIndex.updateFile(relativePath, res.content, allPaths)
-          this.scheduleSaveWorkspaceIndex(normalizedRoot)
+      for (const [key, event] of batchToProcess.entries()) {
+        if (this.currentWorkspaceRoot !== activeRoot) return
+
+        const relativePath = event.relativePath
+
+        // Self-modification protection: check if recently modified by self
+        const lastSelfModified = this.recentlyModifiedBySelf.get(key)
+        if (lastSelfModified && Date.now() - lastSelfModified < 1500) {
+          this.cache.invalidate(relativePath)
+          this.deduplicator.invalidateFile(relativePath)
+          continue
+        }
+
+        if (event.eventType === 'unlink') {
           if (this.config.debug) {
             console.debug(
-              `[SmartContextEngine] Updated index for file: "${relativePath}" (${eventType})`
+              `[SmartContextEngine] Batch: file unlinked "${relativePath}". Removing from cache & index.`
             )
           }
-        } else {
-          // File could not be read or was removed
-          this.codebaseIndex.removeFile(relativePath)
-          this.scheduleSaveWorkspaceIndex(normalizedRoot)
+          this.cache.invalidate(relativePath)
+          this.deduplicator.invalidateFile(relativePath)
+          this.dependencyAnalyzer.invalidateFile(relativePath)
+          const removed = this.codebaseIndex.removeFile(relativePath)
+          if (removed) {
+            allPaths = allPaths.filter((p) => p.toLowerCase() !== key)
+            indexChanged = true
+          }
+          continue
         }
-      } catch (err) {
-        if (this.config.debug) {
-          console.debug(`[SmartContextEngine] Failed to read updated file "${relativePath}":`, err)
+
+        // 'add' or 'change': invalidate first, then read and index once
+        this.cache.invalidate(relativePath)
+        this.deduplicator.invalidateFile(relativePath)
+        this.dependencyAnalyzer.invalidateFile(relativePath)
+
+        if (typeof window !== 'undefined' && window.electronAPI) {
+          try {
+            const res = await window.electronAPI.readWorkspaceFile(activeRoot, relativePath)
+            if (this.currentWorkspaceRoot !== activeRoot) return
+
+            if (res.success && typeof res.content === 'string') {
+              if (!allPaths.some((p) => p.toLowerCase() === key)) {
+                allPaths.push(relativePath)
+              }
+              this.cache.set(relativePath, res.content)
+              this.codebaseIndex.updateFile(relativePath, res.content, allPaths)
+              indexChanged = true
+              if (this.config.debug) {
+                console.debug(
+                  `[SmartContextEngine] Batch: updated index for file: "${relativePath}" (${event.eventType})`
+                )
+              }
+            } else {
+              // File could not be read or was removed
+              this.codebaseIndex.removeFile(relativePath)
+              allPaths = allPaths.filter((p) => p.toLowerCase() !== key)
+              indexChanged = true
+            }
+          } catch (err) {
+            if (this.config.debug) {
+              console.debug(
+                `[SmartContextEngine] Batch: failed reading file "${relativePath}":`,
+                err
+              )
+            }
+          }
+        }
+      }
+
+      // If index changed, schedule exactly ONE persistent index save for the whole batch
+      if (indexChanged && this.currentWorkspaceRoot === activeRoot) {
+        this.scheduleSaveWorkspaceIndex(activeRoot)
+      }
+    } finally {
+      this.isProcessingEventBatch = false
+      currentResolvers.forEach((r) => r())
+
+      // Check if new events arrived while this batch was processing
+      if (this.pendingEventBatch.size > 0 && this.currentWorkspaceRoot === activeRoot) {
+        if (!this.watcherBatchTimer) {
+          this.watcherBatchTimer = setTimeout(() => {
+            this.watcherBatchTimer = null
+            this.processPendingEventBatch()
+          }, this.config.watcherBatchDebounceMs)
         }
       }
     }
