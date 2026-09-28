@@ -90,6 +90,13 @@ export const PACKAGE_JSON_TECHNOLOGIES = new Set([
 
 export const INDEX_SCHEMA_VERSION = 1
 
+/**
+ * Genuine macrotask yield allowing UI rendering, input handling, and event dispatch.
+ */
+export function yieldToMain(): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, 0))
+}
+
 export interface SerializedWorkspaceIndex {
   version: number
   workspaceRoot: string
@@ -103,6 +110,7 @@ export class CodebaseIndex {
   private workspaceRoot: string | null = null
   private dependencyAnalyzer: DependencyAnalyzer
   private detectedTechnologies: Set<string> = new Set()
+  private activeBuildId = 0
   private debug = false
 
   constructor(dependencyAnalyzer?: DependencyAnalyzer, debug = false) {
@@ -128,6 +136,7 @@ export class CodebaseIndex {
   }
 
   clear(): void {
+    this.activeBuildId++
     this.entries.clear()
     this.detectedTechnologies.clear()
     this.workspaceRoot = null
@@ -243,28 +252,73 @@ export class CodebaseIndex {
 
   /**
    * Builds index for the workspace from candidate file list and file reader.
+   * Processes files in bounded chunks, yielding to the event loop between chunks.
+   * Evaluates shouldCancel before/after file reads and chunk yields to support safe aborts.
    */
   async buildIndex(
     workspaceRoot: string,
     filePaths: string[],
     fileReader: (path: string) => Promise<string | null>,
-    fileMetadataMap?: Map<string, { size?: number; mtimeMs?: number }>
-  ): Promise<void> {
+    fileMetadataMap?: Map<string, { size?: number; mtimeMs?: number }>,
+    shouldCancel?: () => boolean,
+    chunkSize = 25
+  ): Promise<boolean> {
     this.clear()
+    const buildId = ++this.activeBuildId
     this.workspaceRoot = workspaceRoot
 
+    const cleanupIfActive = (): void => {
+      if (this.activeBuildId === buildId && this.workspaceRoot === workspaceRoot) {
+        this.clear()
+      }
+    }
+
     const normalizedPaths = filePaths.map((p) => this.normalizePath(p))
+    let processedInChunk = 0
 
     for (const relPath of normalizedPaths) {
+      if (shouldCancel && shouldCancel()) {
+        if (this.debug) {
+          console.debug(`[CodebaseIndex] buildIndex cancelled for "${workspaceRoot}"`)
+        }
+        cleanupIfActive()
+        return false
+      }
+
       // Validate path traversal security
       if (relPath.startsWith('..') || relPath.includes('/../')) {
         continue
       }
 
-      const content = await fileReader(relPath)
+      let content: string | null = null
+      try {
+        content = await fileReader(relPath)
+      } catch (readErr) {
+        if (this.debug) {
+          console.debug(`[CodebaseIndex] Unexpected fileReader exception for "${relPath}":`, readErr)
+        }
+        cleanupIfActive()
+        return false
+      }
+
+      if (shouldCancel && shouldCancel()) {
+        cleanupIfActive()
+        return false
+      }
+
       if (content !== null) {
         const meta = fileMetadataMap?.get(relPath)
         this.indexFile(relPath, content, normalizedPaths, meta?.mtimeMs, meta?.size)
+      }
+
+      processedInChunk++
+      if (processedInChunk >= chunkSize) {
+        processedInChunk = 0
+        await yieldToMain()
+        if (shouldCancel && shouldCancel()) {
+          cleanupIfActive()
+          return false
+        }
       }
     }
 
@@ -273,6 +327,7 @@ export class CodebaseIndex {
         `[CodebaseIndex] Built index for ${this.entries.size} files in "${workspaceRoot}"`
       )
     }
+    return true
   }
 
   /**

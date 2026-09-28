@@ -11,7 +11,7 @@ import {
   DependencyGraphNode,
   SymbolReference
 } from './dependencyAnalyzer'
-import { CodebaseIndex, ProjectSummary } from './codebaseIndex'
+import { CodebaseIndex, ProjectSummary, yieldToMain } from './codebaseIndex'
 
 export interface RankedCandidate {
   path: string
@@ -541,11 +541,18 @@ export class SmartContextEngine {
         return null
       }
 
-      // Build codebase index with metadata map for future fast-paths
-      await this.codebaseIndex.buildIndex(normalizedRoot, filePaths, fileReader, fileMetadataMap)
+      // Build codebase index with metadata map for future fast-paths in bounded chunks
+      const buildOk = await this.codebaseIndex.buildIndex(
+        normalizedRoot,
+        filePaths,
+        fileReader,
+        fileMetadataMap,
+        () => sessionId !== this.activeIndexingSession || this.currentWorkspaceRoot !== normalizedRoot,
+        25
+      )
 
-      // Only mark as successfully indexed if session is still current
-      if (sessionId === this.activeIndexingSession) {
+      // Only mark as successfully indexed if session and workspace root are still current
+      if (buildOk && sessionId === this.activeIndexingSession && this.currentWorkspaceRoot === normalizedRoot) {
         this.indexedWorkspaceRoot = normalizedRoot
         this.restoredWorkspaceRoot = null
         this.isIndexFresh = true
@@ -571,9 +578,15 @@ export class SmartContextEngine {
         await this.replayQueuedWatcherEvents(sessionId)
       } else {
         this.queuedWatcherEventsDuringRestore = []
+        if (sessionId === this.activeIndexingSession && this.currentWorkspaceRoot === normalizedRoot) {
+          this.codebaseIndex.clear()
+        }
       }
     } catch (err: unknown) {
       this.queuedWatcherEventsDuringRestore = []
+      if (sessionId === this.activeIndexingSession && this.currentWorkspaceRoot === normalizedRoot) {
+        this.codebaseIndex.clear()
+      }
       // Safe error recovery: never throw or block UI
       if (this.config.debug) {
         console.debug(`[SmartContextEngine] Non-fatal error during workspace indexing:`, err)
@@ -614,8 +627,9 @@ export class SmartContextEngine {
     let indexChanged = false
 
     // 2. Identify & remove deleted files (files in index that no longer exist on disk)
+    let deletedCount = 0
     for (const indexedPath of indexedPaths) {
-      if (sessionId !== this.activeIndexingSession) return false
+      if (sessionId !== this.activeIndexingSession || this.currentWorkspaceRoot !== normalizedRoot) return false
       const lower = indexedPath.toLowerCase()
       if (!diskPathSet.has(lower)) {
         this.codebaseIndex.removeFile(indexedPath)
@@ -628,17 +642,23 @@ export class SmartContextEngine {
             `[SmartContextEngine] Reconcile: removed deleted file "${indexedPath}" from index`
           )
         }
+        deletedCount++
+        if (deletedCount % 25 === 0) {
+          await yieldToMain()
+          if (sessionId !== this.activeIndexingSession || this.currentWorkspaceRoot !== normalizedRoot) return false
+        }
       }
     }
 
     // 3. Identify & index newly created files (files on disk not present in index)
+    let createdCount = 0
     for (const diskPath of diskPaths) {
-      if (sessionId !== this.activeIndexingSession) return false
+      if (sessionId !== this.activeIndexingSession || this.currentWorkspaceRoot !== normalizedRoot) return false
       const lower = diskPath.toLowerCase()
       if (!indexedPathSet.has(lower)) {
         try {
           const res = await window.electronAPI.readWorkspaceFile(normalizedRoot, diskPath)
-          if (sessionId !== this.activeIndexingSession) return false
+          if (sessionId !== this.activeIndexingSession || this.currentWorkspaceRoot !== normalizedRoot) return false
 
           if (res.success && typeof res.content === 'string') {
             const meta = diskFileMap.get(diskPath)
@@ -662,12 +682,18 @@ export class SmartContextEngine {
             console.debug(`[SmartContextEngine] Failed reading new file "${diskPath}":`, err)
           }
         }
+        createdCount++
+        if (createdCount % 25 === 0) {
+          await yieldToMain()
+          if (sessionId !== this.activeIndexingSession || this.currentWorkspaceRoot !== normalizedRoot) return false
+        }
       }
     }
 
     // 4. Verify freshness for common files
+    let freshnessCheckCount = 0
     for (const relPath of diskPaths) {
-      if (sessionId !== this.activeIndexingSession) return false
+      if (sessionId !== this.activeIndexingSession || this.currentWorkspaceRoot !== normalizedRoot) return false
       const lower = relPath.toLowerCase()
       if (!indexedPathSet.has(lower)) {
         // Handled above as new file
@@ -693,13 +719,18 @@ export class SmartContextEngine {
 
       if (isFastMatch) {
         // Zero file-read overhead: file is verified fresh via metadata fast-path
+        freshnessCheckCount++
+        if (freshnessCheckCount % 50 === 0) {
+          await yieldToMain()
+          if (sessionId !== this.activeIndexingSession || this.currentWorkspaceRoot !== normalizedRoot) return false
+        }
         continue
       }
 
       // Metadata changed or unavailable: read file to verify content hash
       try {
         const res = await window.electronAPI.readWorkspaceFile(normalizedRoot, relPath)
-        if (sessionId !== this.activeIndexingSession) return false
+        if (sessionId !== this.activeIndexingSession || this.currentWorkspaceRoot !== normalizedRoot) return false
 
         if (!res.success || typeof res.content !== 'string') {
           // File failed to read: remove from index
@@ -708,36 +739,35 @@ export class SmartContextEngine {
           this.deduplicator.invalidateFile(relPath)
           this.dependencyAnalyzer.invalidateFile(relPath)
           indexChanged = true
-          continue
-        }
-
-        const currentHash = computeContentHash(res.content)
-        if (currentHash === existingEntry.contentHash) {
-          // Content hash is identical: update mtimeMs and fileSize without reparsing AST
-          this.codebaseIndex.updateFileMetadata(
-            relPath,
-            diskMeta?.mtimeMs,
-            diskMeta?.size ?? res.content.length
-          )
-          this.cache.set(relPath, res.content)
-          indexChanged = true
         } else {
-          // Content hash changed: full incremental AST re-parse and dependency update
-          this.cache.set(relPath, res.content)
-          this.deduplicator.invalidateFile(relPath)
-          this.dependencyAnalyzer.invalidateFile(relPath)
-          this.codebaseIndex.updateFile(
-            relPath,
-            res.content,
-            diskPaths,
-            diskMeta?.mtimeMs,
-            diskMeta?.size ?? res.content.length
-          )
-          indexChanged = true
-          if (this.config.debug) {
-            console.debug(
-              `[SmartContextEngine] Reconcile: updated modified file "${relPath}" in index`
+          const currentHash = computeContentHash(res.content)
+          if (currentHash === existingEntry.contentHash) {
+            // Content hash is identical: update mtimeMs and fileSize without reparsing AST
+            this.codebaseIndex.updateFileMetadata(
+              relPath,
+              diskMeta?.mtimeMs,
+              diskMeta?.size ?? res.content.length
             )
+            this.cache.set(relPath, res.content)
+            indexChanged = true
+          } else {
+            // Content hash changed: full incremental AST re-parse and dependency update
+            this.cache.set(relPath, res.content)
+            this.deduplicator.invalidateFile(relPath)
+            this.dependencyAnalyzer.invalidateFile(relPath)
+            this.codebaseIndex.updateFile(
+              relPath,
+              res.content,
+              diskPaths,
+              diskMeta?.mtimeMs,
+              diskMeta?.size ?? res.content.length
+            )
+            indexChanged = true
+            if (this.config.debug) {
+              console.debug(
+                `[SmartContextEngine] Reconcile: updated modified file "${relPath}" in index`
+              )
+            }
           }
         }
       } catch (err) {
@@ -748,10 +778,21 @@ export class SmartContextEngine {
           )
         }
       }
+
+      freshnessCheckCount++
+      if (freshnessCheckCount % 50 === 0) {
+        await yieldToMain()
+        if (sessionId !== this.activeIndexingSession || this.currentWorkspaceRoot !== normalizedRoot) return false
+      }
     }
 
     // 5. If index changed during reconciliation, persist updated index
-    if (indexChanged && window.electronAPI.saveWorkspaceIndex) {
+    if (
+      indexChanged &&
+      window.electronAPI.saveWorkspaceIndex &&
+      sessionId === this.activeIndexingSession &&
+      this.currentWorkspaceRoot === normalizedRoot
+    ) {
       try {
         await window.electronAPI.saveWorkspaceIndex(
           normalizedRoot,
@@ -764,7 +805,7 @@ export class SmartContextEngine {
       }
     }
 
-    return true
+    return sessionId === this.activeIndexingSession && this.currentWorkspaceRoot === normalizedRoot
   }
 
   /**
