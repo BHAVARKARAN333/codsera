@@ -36,6 +36,36 @@ export interface SmartContextFile {
   charCount: number
   score: number
   isExplicit: boolean
+  source?: 'cache' | 'disk'
+}
+
+export interface SmartContextDiagnosticSnapshot {
+  timestamp: number
+  prompt: string
+  required: boolean
+  reason: string
+  selectedFiles: Array<{
+    path: string
+    score: number
+    matchReason: string
+    isExplicit?: boolean
+  }>
+  readFiles: Array<{
+    path: string
+    score: number
+    charCount: number
+    truncated: boolean
+    isExplicit: boolean
+    source: 'cache' | 'disk'
+  }>
+  droppedFiles: Array<{
+    path: string
+    score: number
+    reason: string
+  }>
+  formattedContextFileList: string[]
+}
+
 export interface SmartContextResult {
   required: boolean
   reason?: string
@@ -340,6 +370,54 @@ export class SmartContextEngine {
   private isProcessingEventBatch = false
   private batchResolvers: Array<() => void> = []
   private recentlyModifiedBySelf: Map<string, number> = new Map()
+  private lastResult: SmartContextResult | null = null
+  private lastDiagnosticSnapshot: SmartContextDiagnosticSnapshot | null = null
+
+  /**
+   * Returns the exact SmartContextResult from the most recent resolveContext() call.
+   */
+  getLastResult(): SmartContextResult | null {
+    return this.lastResult
+  }
+
+  /**
+   * Returns a development-only sanitized diagnostic snapshot of the most recent resolveContext() call,
+   * containing paths, scores, provenance, and intent reasons without exposing file contents or sensitive data.
+   */
+  getLastDiagnostics(): SmartContextDiagnosticSnapshot | null {
+    return this.lastDiagnosticSnapshot
+  }
+
+  private recordLastResult(prompt: string, result: SmartContextResult): void {
+    this.lastResult = result
+    this.lastDiagnosticSnapshot = {
+      timestamp: Date.now(),
+      prompt,
+      required: result.required,
+      reason: result.reason || '',
+      selectedFiles: result.selectedFiles.map((s) => ({
+        path: s.path,
+        score: s.score,
+        matchReason: s.matchReason,
+        isExplicit: s.isExplicit
+      })),
+      readFiles: result.readFiles.map((f) => ({
+        path: f.path,
+        score: f.score,
+        charCount: f.charCount,
+        truncated: f.truncated,
+        isExplicit: f.isExplicit,
+        source: f.source || 'disk'
+      })),
+      droppedFiles: result.droppedFiles.map((d) => ({
+        path: d.path,
+        score: d.score,
+        reason: d.reason
+      })),
+      formattedContextFileList: result.readFiles.map((f) => f.path)
+    }
+  }
+
   /**
    * Returns the count of pending file events in the active batch.
    */
@@ -377,6 +455,8 @@ export class SmartContextEngine {
     this.restoredWorkspaceRoot = null
     this.isIndexRestored = false
     this.isIndexFresh = false
+    this.lastResult = null
+    this.lastDiagnosticSnapshot = null
   }
 
   /**
@@ -1689,6 +1769,192 @@ export class SmartContextEngine {
     return candidates.slice(0, this.config.maxCandidates)
   }
 
+  /**
+   * Detects if the user explicitly requests only one file (e.g. "Explain only the file <path>", "Read only <path>").
+   * When true, returns the target file mention and the resolved candidate file if found in the workspace.
+   */
+  detectExplicitSingleFileRequest(
+    prompt: string,
+    rankedCandidates: RankedCandidate[],
+    filePaths: string[] = []
+  ): {
+    isExplicitSingleFile: boolean
+    targetMention: string | null
+    candidate: RankedCandidate | null
+  } {
+    if (!prompt) {
+      return { isExplicitSingleFile: false, targetMention: null, candidate: null }
+    }
+
+    const trimmed = prompt.trim()
+
+    // 1. Must contain an exclusivity / restriction keyword
+    const hasRestriction = /\b(only|just|solely|exclusively)\b/i.test(trimmed)
+    if (!hasRestriction) {
+      return { isExplicitSingleFile: false, targetMention: null, candidate: null }
+    }
+
+    // 2. Reject multi-file explicit phrasing (e.g. "only the files", "only these files", "both files", "multiple files")
+    if (
+      /\b(?:only|just|solely|exclusively)\s+(?:the\s+|these\s+|those\s+)?files\b/i.test(trimmed) ||
+      /\b(?:both|multiple)\s+files\b/i.test(trimmed) ||
+      /\b(?:only|just)\s+(?:both|multiple)\b/i.test(trimmed)
+    ) {
+      return { isExplicitSingleFile: false, targetMention: null, candidate: null }
+    }
+
+    // 3. Extract target file candidate from explicit single-file intent patterns
+    let targetMention: string | null = null
+
+    // Pattern A: Action + restriction + [the] [file] [:] <path>
+    // e.g. "Explain only the file src/App.tsx", "Read only src/App.tsx", "Inspect only: package.json"
+    const actionFirstMatch = trimmed.match(
+      /\b(?:explain|read|inspect|show|load|open|check|analyze|review|view|fetch|get|examine|audit)\s+(?:only|just|solely|exclusively)(?:\s+the)?(?:\s+file)?(?:\s*:)?\s*[`'"<]?([a-zA-Z0-9_\-./\\]+\.[a-zA-Z0-9]{1,8})[`'">]?/i
+    )
+    if (actionFirstMatch) {
+      targetMention = actionFirstMatch[1]
+    }
+
+    // Pattern B: Restriction + action + [the] [file] [:] <path>
+    // e.g. "Only explain src/App.tsx", "Only read the file package.json", "Just inspect App.tsx"
+    if (!targetMention) {
+      const restrictionFirstMatch = trimmed.match(
+        /\b(?:only|just|solely|exclusively)\s+(?:explain|read|inspect|show|load|open|check|analyze|review|view|fetch|get|examine|audit)(?:\s+the)?(?:\s+file)?(?:\s*:)?\s*[`'"<]?([a-zA-Z0-9_\-./\\]+\.[a-zA-Z0-9]{1,8})[`'">]?/i
+      )
+      if (restrictionFirstMatch) {
+        targetMention = restrictionFirstMatch[1]
+      }
+    }
+
+    // Pattern C: Focus/concentrate + restriction + on/in + [the] [file] [:] <path>
+    // e.g. "Focus only on src/App.tsx", "Focus only on the file package.json"
+    if (!targetMention) {
+      const focusMatch = trimmed.match(
+        /\b(?:focus|concentrate)\s+(?:only|just|solely|exclusively)\s+(?:on|in)(?:\s+the)?(?:\s+file)?(?:\s*:)?\s*[`'"<]?([a-zA-Z0-9_\-./\\]+\.[a-zA-Z0-9]{1,8})[`'">]?/i
+      )
+      if (focusMatch) {
+        targetMention = focusMatch[1]
+      }
+    }
+
+    // Pattern D: Restriction + [the/this] file [:] <path>
+    // e.g. "Only the file src/App.tsx", "Only file: package.json", "Just the file App.tsx"
+    if (!targetMention) {
+      const filePatternMatch = trimmed.match(
+        /\b(?:only|just|solely|exclusively)\s+(?:the|this)?\s*file(?:\s*:)?\s*[`'"<]?([a-zA-Z0-9_\-./\\]+\.[a-zA-Z0-9]{1,8})[`'">]?/i
+      )
+      if (filePatternMatch) {
+        targetMention = filePatternMatch[1]
+      }
+    }
+
+    // Pattern E: Direct "only <path>" / "just <path>" (e.g. "only src/App.tsx", "just package.json")
+    if (!targetMention) {
+      const directMatch = trimmed.match(
+        /(?:^|\b)(?:only|just|solely|exclusively)\s+[`'"<]?([a-zA-Z0-9_\-./\\]+\.[a-zA-Z0-9]{1,8})[`'">]?(?:\s|$|[?,.:!])/i
+      )
+      if (directMatch) {
+        targetMention = directMatch[1]
+      }
+    }
+
+    // Pattern F: Prompt contains single file mention with trailing/parenthetical single-file indicator
+    // e.g. "Explain src/App.tsx (only this file)", "Can you read package.json? Just this file."
+    if (!targetMention) {
+      if (
+        /\b(?:only\s+this\s+file|single\s+file\s+only|only\s+one\s+file|just\s+this\s+file)\b/i.test(
+          trimmed
+        )
+      ) {
+        const fileMentions = trimmed.match(/[a-zA-Z0-9_\-./\\]+\.[a-zA-Z0-9]{1,8}/g) || []
+        if (fileMentions.length === 1) {
+          targetMention = fileMentions[0]
+        }
+      }
+    }
+
+    if (!targetMention) {
+      return { isExplicitSingleFile: false, targetMention: null, candidate: null }
+    }
+
+    // Reject if target mention is immediately followed by conjunction with another file (e.g. "and <file>", ", <file>")
+    const targetIdx = trimmed.toLowerCase().indexOf(targetMention.toLowerCase())
+    if (targetIdx !== -1) {
+      const afterTarget = trimmed.slice(targetIdx + targetMention.length)
+      if (
+        /^[`'">)\]\s]*(?:and|,|or)\s*[`'"<]?[a-zA-Z0-9_\-./\\]+\.[a-zA-Z0-9]{1,8}/i.test(
+          afterTarget
+        )
+      ) {
+        return { isExplicitSingleFile: false, targetMention: null, candidate: null }
+      }
+    }
+
+    // Clean target mention
+    const cleanMention = targetMention
+      .replace(/^[`'"<(\[]+|[`'">)\].,;:]+$/g, '')
+      .replace(/\\/g, '/')
+      .replace(/^\.?\/+/, '')
+      .toLowerCase()
+
+    // Match candidate in rankedCandidates or filePaths
+    let match: RankedCandidate | undefined = rankedCandidates.find((c) => {
+      const candLower = c.path.replace(/\\/g, '/').toLowerCase()
+      return candLower === cleanMention
+    })
+
+    if (!match) {
+      match = rankedCandidates.find((c) => {
+        const candLower = c.path.replace(/\\/g, '/').toLowerCase()
+        return candLower.endsWith(`/${cleanMention}`)
+      })
+    }
+
+    if (!match) {
+      match = rankedCandidates.find((c) => {
+        const candFileName = c.path.split(/[/\\]/).pop()?.toLowerCase() || ''
+        return candFileName === cleanMention
+      })
+    }
+
+    // Fallback: search workspace filePaths if not found in rankedCandidates
+    if (!match && filePaths.length > 0) {
+      const foundPath =
+        filePaths.find((p) => p.replace(/\\/g, '/').toLowerCase() === cleanMention) ||
+        filePaths.find((p) => p.replace(/\\/g, '/').toLowerCase().endsWith(`/${cleanMention}`)) ||
+        filePaths.find(
+          (p) => (p.split(/[/\\]/).pop()?.toLowerCase() || '') === cleanMention
+        )
+
+      if (foundPath) {
+        match = {
+          path: foundPath.replace(/\\/g, '/'),
+          score: 1000,
+          matchReason: `Explicit single-file target ("${cleanMention}")`,
+          isExplicit: true
+        }
+      }
+    }
+
+    const resolvedCandidate: RankedCandidate | null = match
+      ? { ...match, isExplicit: true }
+      : null
+
+    return {
+      isExplicitSingleFile: true,
+      targetMention: cleanMention,
+      candidate: resolvedCandidate
+    }
+  }
+
+  /**
+   * Resolves smart project context:
+   * 1. Checks intent and workspace change.
+   * 2. Ranks candidate files.
+   * 3. Reads files using ContextCache with content hashing and smart refresh.
+   * 4. Allocates budget using ContextBudgetManager.
+   * 5. Deduplicates active context via ContextDeduplicator.
+   */
   async resolveContext(
     prompt: string,
     workspaceRoot: string | null
@@ -1697,7 +1963,7 @@ export class SmartContextEngine {
 
     const intent = this.isProjectContextRequired(prompt, workspaceRoot)
     if (!intent.required || !workspaceRoot) {
-      return {
+      const res: SmartContextResult = {
         required: false,
         reason: intent.reason,
         selectedFiles: [],
@@ -1706,11 +1972,13 @@ export class SmartContextEngine {
         formattedContext: '',
         cacheStats: this.cache.getStats()
       }
+      this.recordLastResult(prompt, res)
+      return res
     }
 
     try {
       if (!window?.electronAPI) {
-        return {
+        const res: SmartContextResult = {
           required: false,
           reason: 'Electron API unavailable',
           selectedFiles: [],
@@ -1719,6 +1987,8 @@ export class SmartContextEngine {
           formattedContext: '',
           cacheStats: this.cache.getStats()
         }
+        this.recordLastResult(prompt, res)
+        return res
       }
 
       // Fetch directory tree
@@ -1727,7 +1997,7 @@ export class SmartContextEngine {
       const filePaths = this.extractRelativePaths(treeEntries, workspaceRoot)
 
       if (filePaths.length === 0) {
-        return {
+        const res: SmartContextResult = {
           required: true,
           reason: 'No source files found in workspace.',
           selectedFiles: [],
@@ -1736,30 +2006,60 @@ export class SmartContextEngine {
           formattedContext: '[Project Context]: Workspace contains no readable source files.',
           cacheStats: this.cache.getStats()
         }
+        this.recordLastResult(prompt, res)
+        return res
       }
 
       // Rank candidate files
       const rankedCandidates = this.rankCandidateFiles(prompt, filePaths)
 
-      // Filter top files that meet the minimum relevance threshold (or are explicitly requested)
-      const filesToRead = rankedCandidates
-        .filter((c) => c.score >= this.config.minScoreThreshold || c.isExplicit || c.score >= 500)
-        .slice(0, this.config.maxAutoReadFiles)
+      // Detect explicit single-file request (e.g. "Explain only the file <path>", "Read only <path>")
+      const singleFileDetection = this.detectExplicitSingleFileRequest(
+        prompt,
+        rankedCandidates,
+        filePaths
+      )
+      const isExplicitSingleFile = singleFileDetection.isExplicitSingleFile
+
+      let candidatesToSelect: RankedCandidate[]
+      let filesToRead: RankedCandidate[]
+
+      if (isExplicitSingleFile) {
+        if (singleFileDetection.candidate) {
+          // Select and read only that exact file, excluding all other ranked candidates
+          candidatesToSelect = [singleFileDetection.candidate]
+          filesToRead = [singleFileDetection.candidate]
+        } else {
+          // Explicit single file requested but not found in workspace
+          candidatesToSelect = []
+          filesToRead = []
+        }
+      } else {
+        // Normal multi-candidate ranking and selection
+        candidatesToSelect = rankedCandidates
+        filesToRead = rankedCandidates
+          .filter((c) => c.score >= this.config.minScoreThreshold || c.isExplicit || c.score >= 500)
+          .slice(0, this.config.maxAutoReadFiles)
+      }
 
       // Fetch file contents (via cache with smart refresh)
       const rawCandidatesToAllocate = []
+      const fileSourceMap = new Map<string, 'cache' | 'disk'>()
 
       for (const candidate of filesToRead) {
         let content: string | null = null
+        let source: 'cache' | 'disk' = 'disk'
         const cachedEntry = this.cache.get(candidate.path)
 
         if (cachedEntry) {
           content = cachedEntry.content
+          source = 'cache'
         } else {
           // Read from disk
           const readRes = await window.electronAPI.readWorkspaceFile(workspaceRoot, candidate.path)
           if (readRes.success && typeof readRes.content === 'string') {
             content = readRes.content
+            source = 'disk'
             this.cache.set(candidate.path, content)
           } else {
             if (this.config.debug) {
@@ -1769,6 +2069,7 @@ export class SmartContextEngine {
         }
 
         if (content !== null) {
+          fileSourceMap.set(candidate.path, source)
           rawCandidatesToAllocate.push({
             path: candidate.path,
             content,
@@ -1791,7 +2092,8 @@ export class SmartContextEngine {
           truncated: allocated.truncated,
           charCount: allocated.charCount,
           score: allocated.score,
-          isExplicit: allocated.isExplicit
+          isExplicit: allocated.isExplicit,
+          source: fileSourceMap.get(allocated.path) || 'disk'
         })
       }
 
@@ -1808,14 +2110,15 @@ export class SmartContextEngine {
 
       const promptLower = prompt.toLowerCase()
       const isStructureOrTechQuery =
-        promptLower.includes('summary of this project') ||
-        promptLower.includes('project structure') ||
-        promptLower.includes('technologies does this project') ||
-        promptLower.includes('technologies') ||
-        promptLower.includes('architecture') ||
-        promptLower.includes('entry points')
+        !isExplicitSingleFile &&
+        (promptLower.includes('summary of this project') ||
+          promptLower.includes('project structure') ||
+          promptLower.includes('technologies does this project') ||
+          promptLower.includes('technologies') ||
+          promptLower.includes('architecture') ||
+          promptLower.includes('entry points'))
 
-      if (readFiles.length > 0) {
+      if (readFiles.length > 0 && !isExplicitSingleFile) {
         const filesWithContent = readFiles.map((rf) => ({
           path: rf.path,
           content: rf.content
@@ -1983,12 +2286,17 @@ export class SmartContextEngine {
 
           formattedContext += `\n\n[Codebase Index & Project Understanding]:\n- Workspace Files: ${filePaths.length} total (${projectSummary.sourceFilesCount} indexed source, ${projectSummary.testFilesCount} tests, ${projectSummary.configFilesCount} config)\n- Main Directories: ${projectSummary.mainDirectories.join(', ') || 'root'}\n- Runtime Platform [Confirmed]: ${runtimeStr}\n- Test Environment [Test Runner]: ${testEnvStr}\n- Detected Technologies (Evidence-backed): ${techStr}\n- Detected Entry Points: ${entryStr}\n- Configuration Files: ${configStr}`
         }
+      } else if (isExplicitSingleFile && singleFileDetection.targetMention) {
+        formattedContext = `[Project Context]: Explicitly requested file "${singleFileDetection.targetMention}" was not found in workspace.`
       }
 
-      return {
+      const res: SmartContextResult = {
         required: true,
-        reason: intent.reason,
-        selectedFiles: rankedCandidates,
+        reason:
+          isExplicitSingleFile && singleFileDetection.candidate
+            ? `Explicit single-file request for ${singleFileDetection.candidate.path}.`
+            : intent.reason,
+        selectedFiles: candidatesToSelect,
         readFiles,
         droppedFiles: allocation.droppedFiles,
         formattedContext,
@@ -1998,9 +2306,11 @@ export class SmartContextEngine {
         symbolReferences,
         projectSummary
       }
+      this.recordLastResult(prompt, res)
+      return res
     } catch (err: unknown) {
       const message = err instanceof Error ? err.message : String(err)
-      return {
+      const res: SmartContextResult = {
         required: true,
         reason: `Context engine error: ${message}`,
         selectedFiles: [],
@@ -2009,6 +2319,8 @@ export class SmartContextEngine {
         formattedContext: '',
         cacheStats: this.cache.getStats()
       }
+      this.recordLastResult(prompt, res)
+      return res
     }
   }
 }

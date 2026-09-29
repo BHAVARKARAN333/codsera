@@ -235,7 +235,7 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
         console.error('Failed to load settings:', err)
       })
 
-    // Safe development-only debug bridge to enable indexing profiler
+    // Safe development-only debug bridge to enable indexing profiler and inspect smart context diagnostics
     if (import.meta.env.DEV) {
       window.__enableProfiling = (enabled = true) => {
         const engine = orchestrator.getSmartContextEngine()
@@ -243,11 +243,17 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
         console.log(`[SmartContextEngine] Indexing profiling is now ${enabled ? 'ENABLED' : 'DISABLED'}.`)
         return engine
       }
+
+      window.__getLastSmartContext = () => {
+        const engine = orchestrator.getSmartContextEngine()
+        return engine.getLastDiagnostics()
+      }
     }
 
     return () => {
       if (import.meta.env.DEV && typeof window !== 'undefined') {
         delete window.__enableProfiling
+        delete window.__getLastSmartContext
       }
     }
   }, [])
