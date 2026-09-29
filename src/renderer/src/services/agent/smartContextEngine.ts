@@ -508,8 +508,8 @@ export class SmartContextEngine {
       }
 
       const treeEntries = treeRes.tree
-      const filePaths = this.extractRelativePaths(treeEntries, normalizedRoot)
       const fileMetadataMap = this.extractFileMetadataMap(treeEntries, normalizedRoot)
+      const filePaths = Array.from(fileMetadataMap.keys())
 
       if (filePaths.length === 0) {
         // Only mark index fresh if readTree explicitly succeeded and confirmed the tree has no indexable files
@@ -1257,6 +1257,7 @@ export class SmartContextEngine {
 
   /**
    * Recursively flattens directory tree into normalized relative paths.
+   * Delegates to extractFileMetadataMap to avoid redundant tree traversal implementations.
    */
   extractRelativePaths(
     entries: FileEntry[],
@@ -1264,46 +1265,21 @@ export class SmartContextEngine {
     maxDepth = 6,
     currentDepth = 0
   ): string[] {
-    if (currentDepth > maxDepth || !entries) return []
-    const paths: string[] = []
-
-    for (const entry of entries) {
-      if (IGNORED_DIRS.has(entry.name)) continue
-
-      const relPath = toRelativeWorkspacePath(entry.path, rootPath)
-      if (!relPath) {
-        if (entry.isDirectory && entry.children && entry.children.length > 0) {
-          paths.push(...this.extractRelativePaths(entry.children, rootPath, maxDepth, currentDepth + 1))
-        }
-        continue
-      }
-
-      if (entry.isDirectory) {
-        if (entry.children && entry.children.length > 0) {
-          paths.push(...this.extractRelativePaths(entry.children, rootPath, maxDepth, currentDepth + 1))
-        }
-      } else {
-        const ext = entry.name.split('.').pop()?.toLowerCase() || ''
-        if (!BINARY_AND_ASSET_EXTS.has(ext)) {
-          paths.push(relPath)
-        }
-      }
-    }
-
-    return paths
+    return Array.from(this.extractFileMetadataMap(entries, rootPath, maxDepth, currentDepth).keys())
   }
 
   /**
    * Recursively extracts a map of normalized relative paths to file metadata (size, mtimeMs).
+   * Uses a shared accumulator Map across recursive calls to avoid intermediate allocations and merge loops.
    */
   extractFileMetadataMap(
     entries: FileEntry[],
     rootPath: string,
     maxDepth = 6,
-    currentDepth = 0
+    currentDepth = 0,
+    accumulator: Map<string, { size?: number; mtimeMs?: number }> = new Map()
   ): Map<string, { size?: number; mtimeMs?: number }> {
-    if (currentDepth > maxDepth || !entries) return new Map()
-    const map = new Map<string, { size?: number; mtimeMs?: number }>()
+    if (currentDepth > maxDepth || !entries) return accumulator
 
     for (const entry of entries) {
       if (IGNORED_DIRS.has(entry.name)) continue
@@ -1311,40 +1287,36 @@ export class SmartContextEngine {
       const relPath = toRelativeWorkspacePath(entry.path, rootPath)
       if (!relPath) {
         if (entry.isDirectory && entry.children && entry.children.length > 0) {
-          const subMap = this.extractFileMetadataMap(
+          this.extractFileMetadataMap(
             entry.children,
             rootPath,
             maxDepth,
-            currentDepth + 1
+            currentDepth + 1,
+            accumulator
           )
-          for (const [k, v] of subMap.entries()) {
-            map.set(k, v)
-          }
         }
         continue
       }
 
       if (entry.isDirectory) {
         if (entry.children && entry.children.length > 0) {
-          const subMap = this.extractFileMetadataMap(
+          this.extractFileMetadataMap(
             entry.children,
             rootPath,
             maxDepth,
-            currentDepth + 1
+            currentDepth + 1,
+            accumulator
           )
-          for (const [k, v] of subMap.entries()) {
-            map.set(k, v)
-          }
         }
       } else {
         const ext = entry.name.split('.').pop()?.toLowerCase() || ''
         if (!BINARY_AND_ASSET_EXTS.has(ext)) {
-          map.set(relPath, { size: entry.size, mtimeMs: entry.mtimeMs })
+          accumulator.set(relPath, { size: entry.size, mtimeMs: entry.mtimeMs })
         }
       }
     }
 
-    return map
+    return accumulator
   }
 
   /**
