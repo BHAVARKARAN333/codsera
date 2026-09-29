@@ -45,6 +45,7 @@ export interface LLMRequestOptions {
   temperature?: number
   timeoutMs?: number
   onRetry?: (attempt: number, maxRetries: number, delayMs: number, reason: string) => void
+  onChunk?: (chunk: string) => void
 }
 
 export interface LLMResponse {

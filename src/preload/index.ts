@@ -96,6 +96,24 @@ const api: IElectronAPI = {
   nvidiaListModels: (request) => {
     return ipcRenderer.invoke(IPC_CHANNELS.NVIDIA_LIST_MODELS, request)
   },
+  opencodeChatCompletion: (request) => {
+    return ipcRenderer.invoke(IPC_CHANNELS.OPENCODE_CHAT_COMPLETION, request)
+  },
+  opencodeListModels: (request) => {
+    return ipcRenderer.invoke(IPC_CHANNELS.OPENCODE_LIST_MODELS, request)
+  },
+  onOpenCodeStreamChunk: (callback) => {
+    const listener = (
+      _event: Electron.IpcRendererEvent,
+      data: import('../shared/types').OpenCodeStreamChunkEvent
+    ) => {
+      callback(data)
+    }
+    ipcRenderer.on(IPC_CHANNELS.OPENCODE_STREAM_CHUNK, listener)
+    return () => {
+      ipcRenderer.removeListener(IPC_CHANNELS.OPENCODE_STREAM_CHUNK, listener)
+    }
+  },
   saveWorkspaceIndex: (workspaceRoot: string, data: unknown) => {
     return ipcRenderer.invoke(IPC_CHANNELS.SAVE_WORKSPACE_INDEX, workspaceRoot, data)
   },

@@ -29,7 +29,12 @@ import {
   NvidiaChatCompletionResponse,
   NvidiaListModelsRequest,
   NvidiaListModelsResponse,
-  NvidiaModelItem
+  NvidiaModelItem,
+  OpenCodeChatCompletionRequest,
+  OpenCodeChatCompletionResponse,
+  OpenCodeListModelsRequest,
+  OpenCodeListModelsResponse,
+  OpenCodeModelItem
 } from '../shared/types'
 import { validateCommandSafety } from '../shared/commandValidator'
 
@@ -935,6 +940,9 @@ function registerIpcHandlers(): void {
     if (provider === 'nvidia') {
       return process.env.NVIDIA_API_KEY || process.env.NVIDIA_NIM_API_KEY || null
     }
+    if (provider === 'opencode') {
+      return process.env.OPENCODE_API_KEY || null
+    }
     return process.env.GEMINI_API_KEY || null
   })
 
@@ -1218,6 +1226,312 @@ function registerIpcHandlers(): void {
           isNetworkError: true,
           error: rawMessage,
           errorDetails: rawMessage
+        }
+      }
+    }
+  )
+
+  // Handle OpenCode Chat Completions (with streaming and tool calling) via Node.js fetch in main process
+  ipcMain.handle(
+    IPC_CHANNELS.OPENCODE_CHAT_COMPLETION,
+    async (event, request: OpenCodeChatCompletionRequest): Promise<OpenCodeChatCompletionResponse> => {
+      if (!request || typeof request !== 'object') {
+        return {
+          success: false,
+          error: 'Invalid request payload'
+        }
+      }
+
+      const {
+        model,
+        messages,
+        temperature = 0.2,
+        tools,
+        tool_choice,
+        timeoutMs = 60000,
+        stream = false,
+        requestId
+      } = request
+
+      if (!model) {
+        return {
+          success: false,
+          error: 'No OpenCode model selected. Please fetch and select an available free model in Settings.'
+        }
+      }
+
+      let apiKey = request.apiKey || ''
+      if (!apiKey) {
+        apiKey = process.env.OPENCODE_API_KEY || ''
+      }
+
+      const endpoint = 'https://opencode.ai/inference/openai/v1/chat/completions'
+      const headers: Record<string, string> = {
+        'Content-Type': 'application/json',
+        Accept: stream ? 'text/event-stream, application/json' : 'application/json'
+      }
+
+      // Free models should work without an API key; include Authorization header only when key is provided
+      if (apiKey && apiKey.trim()) {
+        headers.Authorization = `Bearer ${apiKey.trim()}`
+      }
+
+      const requestBody: Record<string, unknown> = {
+        model,
+        messages,
+        temperature,
+        stream
+      }
+
+      if (tools && tools.length > 0) {
+        requestBody.tools = tools
+        requestBody.tool_choice = tool_choice || 'auto'
+      }
+
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), timeoutMs)
+
+      try {
+        console.log(`[OpenCode IPC] Dispatching request to model: ${model}, stream: ${stream}, hasKey: ${!!apiKey}`)
+        const response = await fetch(endpoint, {
+          method: 'POST',
+          headers,
+          body: JSON.stringify(requestBody),
+          signal: controller.signal
+        })
+        clearTimeout(timer)
+
+        if (!response.ok) {
+          let errorDetails = `Status ${response.status} (${response.statusText})`
+          try {
+            const errJson = (await response.json()) as any
+            if (errJson.error?.message) {
+              errorDetails = errJson.error.message
+            } else if (errJson.message) {
+              errorDetails = errJson.message
+            }
+          } catch {}
+
+          console.log(`[OpenCode IPC] HTTP error ${response.status}: ${errorDetails}`)
+          return {
+            success: false,
+            status: response.status,
+            statusText: response.statusText,
+            error: errorDetails,
+            errorDetails
+          }
+        }
+
+        // If streaming is requested and response has a readable body stream
+        if (stream && response.body) {
+          const reader = response.body.getReader()
+          const decoder = new TextDecoder()
+          let accumulatedContent = ''
+          const toolCallsMap = new Map<number, { id: string; name: string; arguments: string }>()
+
+          let buffer = ''
+          while (true) {
+            const { done, value } = await reader.read()
+            if (done) break
+
+            buffer += decoder.decode(value, { stream: true })
+            const lines = buffer.split('\n')
+            buffer = lines.pop() || ''
+
+            for (const line of lines) {
+              const trimmed = line.trim()
+              if (!trimmed || !trimmed.startsWith('data:')) continue
+              const payload = trimmed.slice(5).trim()
+              if (payload === '[DONE]') continue
+
+              try {
+                const parsed = JSON.parse(payload)
+                const choice = parsed.choices?.[0]
+                if (!choice) continue
+
+                const delta = choice.delta
+                if (delta) {
+                  if (delta.content) {
+                    accumulatedContent += delta.content
+                    if (requestId && !event.sender.isDestroyed()) {
+                      event.sender.send(IPC_CHANNELS.OPENCODE_STREAM_CHUNK, {
+                        requestId,
+                        chunk: delta.content
+                      })
+                    }
+                  }
+
+                  if (delta.tool_calls && Array.isArray(delta.tool_calls)) {
+                    for (const tc of delta.tool_calls) {
+                      const idx = typeof tc.index === 'number' ? tc.index : toolCallsMap.size
+                      const existing = toolCallsMap.get(idx) || { id: '', name: '', arguments: '' }
+                      if (tc.id) existing.id = tc.id
+                      if (tc.function?.name) existing.name = tc.function.name
+                      if (tc.function?.arguments) existing.arguments += tc.function.arguments
+                      toolCallsMap.set(idx, existing)
+                    }
+                  }
+                }
+              } catch {
+                // Ignore partial JSON parse chunks
+              }
+            }
+          }
+
+          if (requestId && !event.sender.isDestroyed()) {
+            event.sender.send(IPC_CHANNELS.OPENCODE_STREAM_CHUNK, {
+              requestId,
+              done: true
+            })
+          }
+
+          const finalToolCalls = Array.from(toolCallsMap.values())
+            .filter((tc) => tc.name)
+            .map((tc) => ({
+              id: tc.id || `call_${tc.name}_${Date.now()}`,
+              type: 'function' as const,
+              function: {
+                name: tc.name,
+                arguments: tc.arguments
+              }
+            }))
+
+          return {
+            success: true,
+            status: response.status,
+            statusText: response.statusText,
+            data: {
+              choices: [
+                {
+                  message: {
+                    role: 'assistant',
+                    content: accumulatedContent || null,
+                    tool_calls: finalToolCalls.length > 0 ? finalToolCalls : undefined
+                  }
+                }
+              ]
+            }
+          }
+        }
+
+        // Standard non-streaming JSON response
+        const data = (await response.json()) as any
+        return {
+          success: true,
+          status: response.status,
+          statusText: response.statusText,
+          data
+        }
+      } catch (err: unknown) {
+        clearTimeout(timer)
+        const isAbort =
+          err instanceof Error &&
+          (err.name === 'AbortError' || err.message.toLowerCase().includes('abort'))
+        const rawMsg = isAbort ? `Request timed out after ${timeoutMs / 1000}s` : String(err)
+
+        if (requestId && stream && !event.sender.isDestroyed()) {
+          event.sender.send(IPC_CHANNELS.OPENCODE_STREAM_CHUNK, {
+            requestId,
+            error: rawMsg,
+            done: true
+          })
+        }
+
+        console.log(`[OpenCode IPC] Request failed: ${rawMsg}`)
+        return {
+          success: false,
+          isNetworkError: true,
+          error: rawMsg,
+          errorDetails: rawMsg
+        }
+      }
+    }
+  )
+
+  // Handle listing available OpenCode models securely via Node.js fetch in main process
+  ipcMain.handle(
+    IPC_CHANNELS.OPENCODE_LIST_MODELS,
+    async (_event, request?: OpenCodeListModelsRequest): Promise<OpenCodeListModelsResponse> => {
+      let apiKey = request?.apiKey || ''
+      if (!apiKey) {
+        apiKey = process.env.OPENCODE_API_KEY || ''
+      }
+
+      const timeoutMs = request?.timeoutMs || 15000
+      const controller = new AbortController()
+      const timer = setTimeout(() => controller.abort(), timeoutMs)
+
+      try {
+        const headers: Record<string, string> = {
+          Accept: 'application/json'
+        }
+        if (apiKey && apiKey.trim()) {
+          headers.Authorization = `Bearer ${apiKey.trim()}`
+        }
+
+        const endpoint = 'https://opencode.ai/inference/v1/models'
+        const response = await fetch(endpoint, {
+          method: 'GET',
+          headers,
+          signal: controller.signal
+        })
+        clearTimeout(timer)
+
+        if (!response.ok) {
+          let errorDetails = `Status ${response.status} (${response.statusText})`
+          try {
+            const errJson = (await response.json()) as any
+            if (errJson.error?.message) {
+              errorDetails = errJson.error.message
+            } else if (errJson.message) {
+              errorDetails = errJson.message
+            }
+          } catch {}
+
+          return {
+            success: false,
+            status: response.status,
+            statusText: response.statusText,
+            error: errorDetails,
+            errorDetails
+          }
+        }
+
+        const payload = (await response.json()) as any
+        const rawList: any[] = Array.isArray(payload.data) ? payload.data : Array.isArray(payload) ? payload : []
+
+        // Filter strictly for models officially marked as free
+        const freeModels: OpenCodeModelItem[] = rawList
+          .filter((m) => {
+            const id = String(m.id || '').toLowerCase()
+            return id.includes('free')
+          })
+          .map((m) => ({
+            id: String(m.id),
+            created: m.created,
+            owned_by: m.owned_by,
+            object: m.object,
+            isFree: true
+          }))
+
+        console.log(`[OpenCode IPC] Successfully retrieved ${freeModels.length} free models`)
+        return {
+          success: true,
+          models: freeModels,
+          status: response.status,
+          statusText: response.statusText
+        }
+      } catch (err: unknown) {
+        clearTimeout(timer)
+        const isAbort =
+          err instanceof Error &&
+          (err.name === 'AbortError' || err.message.toLowerCase().includes('abort'))
+        const rawMsg = isAbort ? `Request timed out after ${timeoutMs / 1000}s` : String(err)
+        return {
+          success: false,
+          isNetworkError: true,
+          error: rawMsg,
+          errorDetails: rawMsg
         }
       }
     }

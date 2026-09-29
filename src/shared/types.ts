@@ -107,7 +107,9 @@ export interface AppSettings {
   geminiApiKey?: string
   nvidiaApiKey?: string
   nvidiaModelId?: string
-  selectedProvider?: 'gemini' | 'openrouter' | 'nvidia'
+  opencodeApiKey?: string
+  opencodeModelId?: string
+  selectedProvider?: 'gemini' | 'openrouter' | 'nvidia' | 'opencode'
   lastWorkspaceRoot?: string
 }
 
@@ -192,6 +194,93 @@ export interface NvidiaListModelsResponse {
   isNetworkError?: boolean
 }
 
+export interface OpenCodeChatCompletionRequest {
+  model: string
+  messages: Array<{
+    role: string
+    content: string | null
+    tool_calls?: Array<{
+      id: string
+      type: 'function'
+      function: {
+        name: string
+        arguments: string
+      }
+    }>
+    tool_call_id?: string
+    name?: string
+  }>
+  temperature?: number
+  tools?: Array<{
+    type: 'function'
+    function: {
+      name: string
+      description: string
+      parameters?: Record<string, unknown>
+    }
+  }>
+  tool_choice?: 'auto' | 'none'
+  apiKey?: string
+  timeoutMs?: number
+  stream?: boolean
+  requestId?: string
+}
+
+export interface OpenCodeChatCompletionResponse {
+  success: boolean
+  data?: {
+    choices?: Array<{
+      message?: {
+        role: string
+        content?: string | null
+        tool_calls?: Array<{
+          id: string
+          type: 'function'
+          function: {
+            name: string
+            arguments: string
+          }
+        }>
+      }
+    }>
+  }
+  status?: number
+  statusText?: string
+  error?: string
+  errorDetails?: string
+  isNetworkError?: boolean
+}
+
+export interface OpenCodeModelItem {
+  id: string
+  created?: number
+  owned_by?: string
+  object?: string
+  isFree?: boolean
+}
+
+export interface OpenCodeListModelsRequest {
+  apiKey?: string
+  timeoutMs?: number
+}
+
+export interface OpenCodeListModelsResponse {
+  success: boolean
+  models?: OpenCodeModelItem[]
+  status?: number
+  statusText?: string
+  error?: string
+  errorDetails?: string
+  isNetworkError?: boolean
+}
+
+export interface OpenCodeStreamChunkEvent {
+  requestId: string
+  chunk?: string
+  done?: boolean
+  error?: string
+}
+
 export type WorkspaceFileChangeType = 'add' | 'change' | 'unlink'
 
 export interface WorkspaceFileChangeEvent {
@@ -240,6 +329,15 @@ export interface IElectronAPI {
   nvidiaListModels: (
     request?: NvidiaListModelsRequest
   ) => Promise<NvidiaListModelsResponse>
+  opencodeChatCompletion: (
+    request: OpenCodeChatCompletionRequest
+  ) => Promise<OpenCodeChatCompletionResponse>
+  opencodeListModels: (
+    request?: OpenCodeListModelsRequest
+  ) => Promise<OpenCodeListModelsResponse>
+  onOpenCodeStreamChunk: (
+    callback: (event: OpenCodeStreamChunkEvent) => void
+  ) => () => void
   saveWorkspaceIndex: (
     workspaceRoot: string,
     data: unknown
@@ -293,5 +391,8 @@ export const IPC_CHANNELS = {
   GET_SETTINGS: 'settings:get',
   SAVE_SETTINGS: 'settings:save',
   NVIDIA_CHAT_COMPLETION: 'ai:nvidiaChatCompletion',
-  NVIDIA_LIST_MODELS: 'ai:nvidiaListModels'
+  NVIDIA_LIST_MODELS: 'ai:nvidiaListModels',
+  OPENCODE_CHAT_COMPLETION: 'ai:opencodeChatCompletion',
+  OPENCODE_LIST_MODELS: 'ai:opencodeListModels',
+  OPENCODE_STREAM_CHUNK: 'ai:opencodeStreamChunk'
 } as const

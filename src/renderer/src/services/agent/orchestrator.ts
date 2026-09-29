@@ -26,6 +26,7 @@ export interface AgentRunOptions {
     result: { stdout: string; stderr: string; exitCode: number | null }
   ) => void
   onStep?: (event: AgentStepEvent) => void
+  onChunk?: (chunk: string) => void
 }
 
 export class AgentOrchestrator {
@@ -93,6 +94,7 @@ export class AgentOrchestrator {
       modelName,
       timeoutMs,
       onStep,
+      onChunk,
       requestApproval,
       onFileCreated,
       onFileEdited,
@@ -242,6 +244,7 @@ Rules for tool usage & failure handling:
           modelName,
           systemInstruction: dynamicSystemInstruction,
           timeoutMs,
+          onChunk,
           onRetry: (attempt, maxRetries) => {
             onStep?.({
               type: 'retrying',

@@ -30,6 +30,7 @@ import {
 import { GeminiProvider } from '../services/ai/geminiProvider'
 import { OpenRouterProvider } from '../services/ai/openRouterProvider'
 import { NvidiaProvider } from '../services/ai/nvidiaProvider'
+import { OpenCodeProvider } from '../services/ai/opencodeProvider'
 import { ListFilesTool } from '../services/tools/listFilesTool'
 import { ReadFileTool } from '../services/tools/readFileTool'
 import { CreateFileTool } from '../services/tools/createFileTool'
@@ -62,7 +63,7 @@ interface ChatMessage {
   isError?: boolean
 }
 
-type ProviderType = 'gemini' | 'openrouter' | 'nvidia'
+type ProviderType = 'gemini' | 'openrouter' | 'nvidia' | 'opencode'
 
 export const AIChatPanel: React.FC<AIChatPanelProps> = ({
   workspaceRoot,
@@ -78,21 +79,35 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
   const [openRouterApiKey, setOpenRouterApiKey] = useState<string>('')
   const [nvidiaApiKey, setNvidiaApiKey] = useState<string>('')
   const [nvidiaModelId, setNvidiaModelId] = useState<string>('')
+  const [opencodeApiKey, setOpencodeApiKey] = useState<string>('')
+  const [opencodeModelId, setOpencodeModelId] = useState<string>('space-bunny-free')
   const [showSettings, setShowSettings] = useState<boolean>(false)
   const [showKeyText, setShowKeyText] = useState<boolean>(false)
   const [settingsProviderTab, setSettingsProviderTab] = useState<ProviderType>('gemini')
   const [geminiKeyInput, setGeminiKeyInput] = useState<string>('')
   const [openRouterKeyInput, setOpenRouterKeyInput] = useState<string>('')
   const [nvidiaKeyInput, setNvidiaKeyInput] = useState<string>('')
+  const [opencodeKeyInput, setOpencodeKeyInput] = useState<string>('')
   const [geminiKeyCleared, setGeminiKeyCleared] = useState<boolean>(false)
   const [openRouterKeyCleared, setOpenRouterKeyCleared] = useState<boolean>(false)
   const [nvidiaKeyCleared, setNvidiaKeyCleared] = useState<boolean>(false)
+  const [opencodeKeyCleared, setOpencodeKeyCleared] = useState<boolean>(false)
   const [nvidiaModelInput, setNvidiaModelInput] = useState<string>('')
+  const [opencodeModelInput, setOpencodeModelInput] = useState<string>('space-bunny-free')
   const [availableNvidiaModels, setAvailableNvidiaModels] = useState<Array<{ id: string }>>([])
+  const [availableOpencodeModels, setAvailableOpencodeModels] = useState<Array<{ id: string }>>([])
   const [isFetchingModels, setIsFetchingModels] = useState<boolean>(false)
+  const [isFetchingOpencodeModels, setIsFetchingOpencodeModels] = useState<boolean>(false)
   const [fetchModelsError, setFetchModelsError] = useState<string | null>(null)
+  const [fetchOpencodeModelsError, setFetchOpencodeModelsError] = useState<string | null>(null)
   const [isTestingConnection, setIsTestingConnection] = useState<boolean>(false)
+  const [isTestingOpencodeConnection, setIsTestingOpencodeConnection] = useState<boolean>(false)
   const [connectionTestResult, setConnectionTestResult] = useState<{
+    success: boolean
+    status?: number
+    message: string
+  } | null>(null)
+  const [opencodeConnectionTestResult, setOpencodeConnectionTestResult] = useState<{
     success: boolean
     status?: number
     message: string
@@ -120,6 +135,7 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
   const geminiProviderRef = useRef<GeminiProvider>(new GeminiProvider())
   const openRouterProviderRef = useRef<OpenRouterProvider>(new OpenRouterProvider())
   const nvidiaProviderRef = useRef<NvidiaProvider>(new NvidiaProvider())
+  const openCodeProviderRef = useRef<OpenCodeProvider>(new OpenCodeProvider())
   const orchestratorRef = useRef<AgentOrchestrator | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
 
@@ -128,13 +144,17 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
       ? geminiApiKey
       : providerType === 'openrouter'
       ? openRouterApiKey
-      : nvidiaApiKey
+      : providerType === 'nvidia'
+      ? nvidiaApiKey
+      : opencodeApiKey
   const activeModelName =
     providerType === 'gemini'
       ? 'gemini-3.8-flash'
       : providerType === 'openrouter'
       ? 'openrouter/free'
-      : nvidiaModelId.trim()
+      : providerType === 'nvidia'
+      ? nvidiaModelId.trim()
+      : opencodeModelId.trim() || 'space-bunny-free'
 
   // Initialize orchestrator and load persisted settings & keys
   useEffect(() => {
@@ -149,10 +169,6 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
     orchestrator.registerTool(new GitLogTool())
     orchestratorRef.current = orchestrator
 
-    if (workspaceRoot) {
-      orchestrator.getSmartContextEngine().initializeWorkspaceIndex(workspaceRoot).catch(() => {})
-    }
-
     // Load persisted settings from secure Electron storage
     window.electronAPI
       .getSettings()
@@ -160,6 +176,7 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
         let resolvedGeminiKey = settings.geminiApiKey || ''
         let resolvedOpenRouterKey = settings.openRouterApiKey || ''
         let resolvedNvidiaKey = settings.nvidiaApiKey || ''
+        let resolvedOpenCodeKey = settings.opencodeApiKey || ''
 
         // Fall back to environment variables if not set in persisted settings
         if (!resolvedGeminiKey) {
@@ -177,33 +194,47 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
           if (envKey) resolvedNvidiaKey = envKey
         }
 
+        if (!resolvedOpenCodeKey) {
+          const envKey = await window.electronAPI.getEnvApiKey('opencode')
+          if (envKey) resolvedOpenCodeKey = envKey
+        }
+
         setGeminiApiKey(resolvedGeminiKey)
         setOpenRouterApiKey(resolvedOpenRouterKey)
         setNvidiaApiKey(resolvedNvidiaKey)
+        setOpencodeApiKey(resolvedOpenCodeKey)
 
         if (settings.nvidiaModelId) {
           setNvidiaModelId(settings.nvidiaModelId)
+        }
+        if (settings.opencodeModelId) {
+          setOpencodeModelId(settings.opencodeModelId)
+          setOpencodeModelInput(settings.opencodeModelId)
         }
 
         if (
           settings.selectedProvider &&
           (settings.selectedProvider === 'gemini' ||
             settings.selectedProvider === 'openrouter' ||
-            settings.selectedProvider === 'nvidia')
+            settings.selectedProvider === 'nvidia' ||
+            settings.selectedProvider === 'opencode')
         ) {
           setProviderType(settings.selectedProvider)
           if (settings.selectedProvider === 'gemini') {
             orchestrator.setProvider(geminiProviderRef.current)
           } else if (settings.selectedProvider === 'openrouter') {
             orchestrator.setProvider(openRouterProviderRef.current)
-          } else {
+          } else if (settings.selectedProvider === 'nvidia') {
             orchestrator.setProvider(nvidiaProviderRef.current)
+          } else {
+            orchestrator.setProvider(openCodeProviderRef.current)
           }
         }
       })
       .catch((err) => {
         console.error('Failed to load settings:', err)
       })
+
   }, [])
 
   // Trigger workspace indexing whenever workspaceRoot opens or switches
@@ -253,8 +284,10 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
         orchestratorRef.current.setProvider(geminiProviderRef.current)
       } else if (newProvider === 'openrouter') {
         orchestratorRef.current.setProvider(openRouterProviderRef.current)
-      } else {
+      } else if (newProvider === 'nvidia') {
         orchestratorRef.current.setProvider(nvidiaProviderRef.current)
+      } else {
+        orchestratorRef.current.setProvider(openCodeProviderRef.current)
       }
       orchestratorRef.current.clearHistory()
     }
@@ -376,6 +409,74 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
     }
   }
 
+  // Fetch available models list from OpenCode API
+  const handleFetchOpencodeModels = async () => {
+    setIsFetchingOpencodeModels(true)
+    setFetchOpencodeModelsError(null)
+    setOpencodeConnectionTestResult(null)
+    try {
+      const activeKey = opencodeKeyInput.trim() || (!opencodeKeyCleared ? opencodeApiKey.trim() : '')
+      const res = await window.electronAPI.opencodeListModels({ apiKey: activeKey || undefined })
+      if (res.success && Array.isArray(res.models)) {
+        setAvailableOpencodeModels(res.models)
+        if (res.models.length > 0) {
+          if (!opencodeModelInput.trim() && !opencodeModelId.trim()) {
+            setOpencodeModelInput(res.models[0].id)
+          }
+        }
+      } else {
+        const errorMsg = res.errorDetails || res.error || 'Failed to fetch model list from OpenCode.'
+        setFetchOpencodeModelsError(errorMsg)
+      }
+    } catch (err: unknown) {
+      const errorMsg = err instanceof Error ? err.message : String(err)
+      setFetchOpencodeModelsError(errorMsg)
+    } finally {
+      setIsFetchingOpencodeModels(false)
+    }
+  }
+
+  // Test connection with selected OpenCode model
+  const handleTestOpencodeConnection = async () => {
+    const activeModel = opencodeModelInput.trim() || opencodeModelId.trim() || 'space-bunny-free'
+    const activeKey = opencodeKeyInput.trim() || (!opencodeKeyCleared ? opencodeApiKey.trim() : '')
+
+    setIsTestingOpencodeConnection(true)
+    setOpencodeConnectionTestResult(null)
+
+    try {
+      const res = await window.electronAPI.opencodeChatCompletion({
+        model: activeModel,
+        messages: [{ role: 'user', content: 'Say OK' }],
+        apiKey: activeKey || undefined,
+        timeoutMs: 15000
+      })
+
+      if (res.success) {
+        setOpencodeConnectionTestResult({
+          success: true,
+          status: res.status || 200,
+          message: `Connection successful (HTTP ${res.status || 200} OK)`
+        })
+      } else {
+        const rawErr = res.errorDetails || res.error || 'Connection test failed'
+        setOpencodeConnectionTestResult({
+          success: false,
+          status: res.status,
+          message: `HTTP ${res.status || 'Error'}: ${rawErr}`
+        })
+      }
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err)
+      setOpencodeConnectionTestResult({
+        success: false,
+        message: `Connection failed: ${msg}`
+      })
+    } finally {
+      setIsTestingOpencodeConnection(false)
+    }
+  }
+
   // Open settings dialog
   const handleOpenSettings = (targetTab?: ProviderType) => {
     const tab = targetTab || providerType
@@ -383,12 +484,17 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
     setGeminiKeyInput('')
     setOpenRouterKeyInput('')
     setNvidiaKeyInput('')
+    setOpencodeKeyInput('')
     setGeminiKeyCleared(false)
     setOpenRouterKeyCleared(false)
     setNvidiaKeyCleared(false)
+    setOpencodeKeyCleared(false)
     setNvidiaModelInput(nvidiaModelId)
+    setOpencodeModelInput(opencodeModelId || 'space-bunny-free')
     setFetchModelsError(null)
+    setFetchOpencodeModelsError(null)
     setConnectionTestResult(null)
+    setOpencodeConnectionTestResult(null)
     setShowKeyText(false)
     setShowSettings(true)
   }
@@ -417,9 +523,9 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
       updates.openRouterApiKey = trimmedKey
     }
 
-    const trimmedModel = nvidiaModelInput.trim()
-    setNvidiaModelId(trimmedModel)
-    updates.nvidiaModelId = trimmedModel
+    const trimmedNvidiaModel = nvidiaModelInput.trim()
+    setNvidiaModelId(trimmedNvidiaModel)
+    updates.nvidiaModelId = trimmedNvidiaModel
 
     if (nvidiaKeyCleared) {
       setNvidiaApiKey('')
@@ -428,6 +534,19 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
       const trimmedKey = nvidiaKeyInput.trim()
       setNvidiaApiKey(trimmedKey)
       updates.nvidiaApiKey = trimmedKey
+    }
+
+    const trimmedOpencodeModel = opencodeModelInput.trim() || 'space-bunny-free'
+    setOpencodeModelId(trimmedOpencodeModel)
+    updates.opencodeModelId = trimmedOpencodeModel
+
+    if (opencodeKeyCleared) {
+      setOpencodeApiKey('')
+      updates.opencodeApiKey = ''
+    } else if (opencodeKeyInput.trim().length > 0) {
+      const trimmedKey = opencodeKeyInput.trim()
+      setOpencodeApiKey(trimmedKey)
+      updates.opencodeApiKey = trimmedKey
     }
 
     try {
@@ -460,7 +579,7 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
     if (!textToSend.trim() || isRunningRef.current) return
 
     let currentApiKey = activeApiKey
-    if (!currentApiKey) {
+    if (!currentApiKey && providerType !== 'opencode') {
       // Dynamic lookup to prevent any key desync
       try {
         const persisted = await window.electronAPI.getSettings()
@@ -471,14 +590,14 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
         } else if (providerType === 'openrouter') {
           currentApiKey = persisted.openRouterApiKey || envKey || ''
           if (currentApiKey) setOpenRouterApiKey(currentApiKey)
-        } else {
+        } else if (providerType === 'nvidia') {
           currentApiKey = persisted.nvidiaApiKey || envKey || ''
           if (currentApiKey) setNvidiaApiKey(currentApiKey)
         }
       } catch {}
     }
 
-    if (!currentApiKey) {
+    if (!currentApiKey && providerType !== 'opencode') {
       const providerLabel =
         providerType === 'gemini' ? 'Gemini' : providerType === 'openrouter' ? 'OpenRouter' : 'NVIDIA NIM'
       const missingKeyMsg: ChatMessage = {
@@ -556,21 +675,108 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
         onCommandExecuted: (cmd, res) => {
           onCommandExecuted?.(cmd, res)
         },
+        onChunk: (chunk: string) => {
+          if (currentRequestIdRef.current !== requestId || !chunk) return
+          setMessages((prev) => {
+            const assistantMsgId = `${requestId}-res`
+            const existingIdx = prev.findIndex((m) => m.id === assistantMsgId)
+            const toolSteps = recordedSteps.filter((s) => s.type === 'tool_result')
+
+            if (existingIdx >= 0) {
+              const updated = [...prev]
+              updated[existingIdx] = {
+                ...updated[existingIdx],
+                content: updated[existingIdx].content + chunk,
+                steps: toolSteps
+              }
+              return updated
+            } else {
+              return [
+                ...prev,
+                {
+                  id: assistantMsgId,
+                  role: 'assistant',
+                  content: chunk,
+                  steps: toolSteps
+                }
+              ]
+            }
+          })
+        },
         onStep: (event) => {
           if (currentRequestIdRef.current !== requestId) return
           recordedSteps.push(event)
           setCurrentStep(event)
+          if (event.type === 'tool_result') {
+            setMessages((prev) => {
+              const assistantMsgId = `${requestId}-res`
+              const existingIdx = prev.findIndex((m) => m.id === assistantMsgId)
+              const toolSteps = recordedSteps.filter((s) => s.type === 'tool_result')
+              if (existingIdx >= 0) {
+                const updated = [...prev]
+                updated[existingIdx] = {
+                  ...updated[existingIdx],
+                  steps: toolSteps
+                }
+                return updated
+              } else {
+                return [
+                  ...prev,
+                  {
+                    id: assistantMsgId,
+                    role: 'assistant',
+                    content: '',
+                    steps: toolSteps
+                  }
+                ]
+              }
+            })
+          }
         }
       })
 
       if (currentRequestIdRef.current === requestId) {
-        const assistantMessage: ChatMessage = {
-          id: `${requestId}-res`,
-          role: 'assistant',
-          content: finalResponse,
-          steps: recordedSteps.filter((s) => s.type === 'tool_result')
-        }
-        setMessages((prev) => [...prev, assistantMessage])
+        setMessages((prev) => {
+          const assistantMsgId = `${requestId}-res`
+          const existingIdx = prev.findIndex((m) => m.id === assistantMsgId)
+          const toolSteps = recordedSteps.filter((s) => s.type === 'tool_result')
+
+          if (existingIdx >= 0) {
+            const updated = [...prev]
+            const existingContent = updated[existingIdx].content
+
+            // Prevent duplicate text when finalResponse is received
+            let reconciledContent = existingContent
+            if (!existingContent) {
+              reconciledContent = finalResponse
+            } else if (
+              finalResponse &&
+              !existingContent.includes(finalResponse) &&
+              !finalResponse.includes(existingContent)
+            ) {
+              reconciledContent = `${existingContent}\n\n${finalResponse}`
+            } else if (finalResponse && finalResponse.length > existingContent.length) {
+              reconciledContent = finalResponse
+            }
+
+            updated[existingIdx] = {
+              ...updated[existingIdx],
+              content: reconciledContent,
+              steps: toolSteps
+            }
+            return updated
+          } else {
+            return [
+              ...prev,
+              {
+                id: assistantMsgId,
+                role: 'assistant',
+                content: finalResponse,
+                steps: toolSteps
+              }
+            ]
+          }
+        })
       }
     } catch (err: unknown) {
       if (currentRequestIdRef.current === requestId) {
@@ -629,14 +835,15 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
               <option value="gemini">Gemini</option>
               <option value="openrouter">OpenRouter (Free)</option>
               <option value="nvidia">NVIDIA NIM</option>
+              <option value="opencode">OpenCode (Free)</option>
             </select>
           </div>
 
           {/* Settings Button */}
           <button
-            className={`btn-icon ${activeApiKey ? 'configured' : 'warning'}`}
+            className={`btn-icon ${activeApiKey || providerType === 'opencode' ? 'configured' : 'warning'}`}
             onClick={() => handleOpenSettings()}
-            title={activeApiKey ? 'Provider Settings (Configured)' : 'Provider Settings (API Key Required)'}
+            title={activeApiKey || providerType === 'opencode' ? 'Provider Settings (Configured)' : 'Provider Settings (API Key Required)'}
             type="button"
           >
             <Settings size={13} />
@@ -675,11 +882,11 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
         </div>
         <div className="model-badge-right">
           <span
-            className={`key-dot ${activeApiKey ? 'active' : 'inactive'}`}
-            title={activeApiKey ? 'API Key Configured' : 'API Key Missing'}
+            className={`key-dot ${activeApiKey || providerType === 'opencode' ? 'active' : 'inactive'}`}
+            title={activeApiKey ? 'API Key Configured' : providerType === 'opencode' ? 'Free Tier Ready' : 'API Key Missing'}
           />
           <span className="key-status-text">
-            {activeApiKey ? 'Ready' : 'No Key'}
+            {activeApiKey ? 'Ready' : providerType === 'opencode' ? 'Free Tier' : 'No Key'}
           </span>
         </div>
       </div>
@@ -726,6 +933,13 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
                 >
                   NVIDIA NIM
                 </button>
+                <button
+                  type="button"
+                  className={`tab-btn ${settingsProviderTab === 'opencode' ? 'active' : ''}`}
+                  onClick={() => setSettingsProviderTab('opencode')}
+                >
+                  OpenCode (Free)
+                </button>
               </div>
 
               <div className="settings-field-group">
@@ -735,13 +949,17 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
                       ? 'Gemini API Key'
                       : settingsProviderTab === 'openrouter'
                       ? 'OpenRouter API Key'
-                      : 'NVIDIA NIM API Key'}
+                      : settingsProviderTab === 'nvidia'
+                      ? 'NVIDIA NIM API Key'
+                      : 'OpenCode Console API Key (Optional)'}
                   </label>
                   {(settingsProviderTab === 'gemini'
                     ? geminiKeyInput || (geminiApiKey && !geminiKeyCleared)
                     : settingsProviderTab === 'openrouter'
                     ? openRouterKeyInput || (openRouterApiKey && !openRouterKeyCleared)
-                    : nvidiaKeyInput || (nvidiaApiKey && !nvidiaKeyCleared)) && (
+                    : settingsProviderTab === 'nvidia'
+                    ? nvidiaKeyInput || (nvidiaApiKey && !nvidiaKeyCleared)
+                    : opencodeKeyInput || (opencodeApiKey && !opencodeKeyCleared)) && (
                     <button
                       type="button"
                       style={{
@@ -760,9 +978,12 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
                         } else if (settingsProviderTab === 'openrouter') {
                           setOpenRouterKeyInput('')
                           setOpenRouterKeyCleared(true)
-                        } else {
+                        } else if (settingsProviderTab === 'nvidia') {
                           setNvidiaKeyInput('')
                           setNvidiaKeyCleared(true)
+                        } else {
+                          setOpencodeKeyInput('')
+                          setOpencodeKeyCleared(true)
                         }
                       }}
                       title="Clear saved key"
@@ -784,20 +1005,26 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
                         ? geminiApiKey && !geminiKeyCleared
                         : settingsProviderTab === 'openrouter'
                         ? openRouterApiKey && !openRouterKeyCleared
-                        : nvidiaApiKey && !nvidiaKeyCleared)
+                        : settingsProviderTab === 'nvidia'
+                        ? nvidiaApiKey && !nvidiaKeyCleared
+                        : opencodeApiKey && !opencodeKeyCleared)
                         ? 'API key configured (enter new key to replace)'
                         : settingsProviderTab === 'gemini'
                         ? 'AIzaSy...'
                         : settingsProviderTab === 'openrouter'
                         ? 'sk-or-v1-...'
-                        : 'nvapi-...'
+                        : settingsProviderTab === 'nvidia'
+                        ? 'nvapi-...'
+                        : 'Optional (Free models work without an API key)'
                     }
                     value={
                       settingsProviderTab === 'gemini'
                         ? geminiKeyInput
                         : settingsProviderTab === 'openrouter'
                         ? openRouterKeyInput
-                        : nvidiaKeyInput
+                        : settingsProviderTab === 'nvidia'
+                        ? nvidiaKeyInput
+                        : opencodeKeyInput
                     }
                     onChange={(e) => {
                       const val = e.target.value
@@ -807,9 +1034,12 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
                       } else if (settingsProviderTab === 'openrouter') {
                         setOpenRouterKeyInput(val)
                         setOpenRouterKeyCleared(false)
-                      } else {
+                      } else if (settingsProviderTab === 'nvidia') {
                         setNvidiaKeyInput(val)
                         setNvidiaKeyCleared(false)
+                      } else {
+                        setOpencodeKeyInput(val)
+                        setOpencodeKeyCleared(false)
                       }
                     }}
                     autoFocus
@@ -824,15 +1054,24 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
                   </button>
                 </div>
                 <span className="settings-hint">
-                  Stored securely in local settings, or set{' '}
-                  <code>
-                    {settingsProviderTab === 'gemini'
-                      ? 'GEMINI_API_KEY'
-                      : settingsProviderTab === 'openrouter'
-                      ? 'OPENROUTER_API_KEY'
-                      : 'NVIDIA_API_KEY'}
-                  </code>{' '}
-                  in your local environment.
+                  {settingsProviderTab === 'opencode' ? (
+                    <>
+                      Free models work without an API key. For higher rate limits or Console access, enter your key or set{' '}
+                      <code>OPENCODE_API_KEY</code>.
+                    </>
+                  ) : (
+                    <>
+                      Stored securely in local settings, or set{' '}
+                      <code>
+                        {settingsProviderTab === 'gemini'
+                          ? 'GEMINI_API_KEY'
+                          : settingsProviderTab === 'openrouter'
+                          ? 'OPENROUTER_API_KEY'
+                          : 'NVIDIA_API_KEY'}
+                      </code>{' '}
+                      in your local environment.
+                    </>
+                  )}
                 </span>
               </div>
 
@@ -925,13 +1164,104 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
                 </div>
               )}
 
+              {settingsProviderTab === 'opencode' && (
+                <div className="settings-field-group">
+                  <div style={{ display: 'flex', justifyContent: 'space-between', alignItems: 'center', marginBottom: '4px' }}>
+                    <label className="settings-label" style={{ marginBottom: 0 }}>OpenCode Model ID (Free)</label>
+                    <button
+                      type="button"
+                      className="btn btn-secondary btn-sm"
+                      style={{ fontSize: '11px', padding: '2px 8px', display: 'flex', alignItems: 'center', gap: '4px' }}
+                      disabled={isFetchingOpencodeModels}
+                      onClick={handleFetchOpencodeModels}
+                      title="Query live free models from OpenCode catalog"
+                    >
+                      {isFetchingOpencodeModels && <Loader2 size={11} className="spin-icon" />}
+                      <span>{isFetchingOpencodeModels ? 'Fetching...' : 'Fetch Available Models'}</span>
+                    </button>
+                  </div>
+
+                  {fetchOpencodeModelsError && (
+                    <div style={{ color: '#ef4444', fontSize: '11px', marginBottom: '6px', lineHeight: '1.4' }}>
+                      {fetchOpencodeModelsError}
+                    </div>
+                  )}
+
+                  <div className="settings-input-wrapper">
+                    {availableOpencodeModels.length > 0 ? (
+                      <select
+                        className="settings-input"
+                        value={opencodeModelInput}
+                        onChange={(e) => setOpencodeModelInput(e.target.value)}
+                      >
+                        <option value="" disabled>-- Select a free model from catalog --</option>
+                        {!availableOpencodeModels.some((m) => m.id === opencodeModelInput) && opencodeModelInput && (
+                          <option value={opencodeModelInput}>{opencodeModelInput} (Custom)</option>
+                        )}
+                        {availableOpencodeModels.map((m) => (
+                          <option key={m.id} value={m.id}>{m.id}</option>
+                        ))}
+                      </select>
+                    ) : (
+                      <input
+                        type="text"
+                        className="settings-input"
+                        placeholder="e.g. space-bunny-free (Click 'Fetch Available Models' to list)"
+                        value={opencodeModelInput}
+                        onChange={(e) => setOpencodeModelInput(e.target.value)}
+                      />
+                    )}
+                  </div>
+                  <span className="settings-hint">
+                    {availableOpencodeModels.length > 0
+                      ? `Fetched ${availableOpencodeModels.length} free models from OpenCode. Default verified free model is space-bunny-free.`
+                      : 'Fetch free models from the OpenCode catalog or use space-bunny-free (recommended default).'}
+                  </span>
+
+                  {/* Connection Test Action */}
+                  <div style={{ marginTop: '10px', display: 'flex', alignItems: 'center', gap: '8px', flexWrap: 'wrap' }}>
+                    <button
+                      type="button"
+                      className="btn btn-secondary btn-sm"
+                      style={{ fontSize: '11px', padding: '3px 10px', display: 'flex', alignItems: 'center', gap: '4px' }}
+                      disabled={isTestingOpencodeConnection || !opencodeModelInput}
+                      onClick={handleTestOpencodeConnection}
+                      title="Send test request to verify OpenCode model availability"
+                    >
+                      {isTestingOpencodeConnection && <Loader2 size={11} className="spin-icon" />}
+                      <span>{isTestingOpencodeConnection ? 'Testing Connection...' : 'Test Connection'}</span>
+                    </button>
+                    {opencodeConnectionTestResult && (
+                      <span
+                        style={{
+                          fontSize: '11px',
+                          color: opencodeConnectionTestResult.success ? '#10b981' : '#ef4444',
+                          display: 'flex',
+                          alignItems: 'center',
+                          gap: '4px'
+                        }}
+                      >
+                        {opencodeConnectionTestResult.success ? (
+                          <CheckCircle2 size={12} color="#10b981" />
+                        ) : (
+                          <AlertCircle size={12} color="#ef4444" />
+                        )}
+                        <span>{opencodeConnectionTestResult.message}</span>
+                      </span>
+                    )}
+                  </div>
+                </div>
+              )}
+
               <div className="settings-status-row">
                 <span className="status-indicator">
                   {(settingsProviderTab === 'gemini'
                     ? geminiKeyInput.trim().length > 0
                     : settingsProviderTab === 'openrouter'
                     ? openRouterKeyInput.trim().length > 0
-                    : nvidiaKeyInput.trim().length > 0) ? (
+                    : settingsProviderTab === 'nvidia'
+                    ? nvidiaKeyInput.trim().length > 0
+                    : opencodeKeyInput.trim().length > 0) ? (
                     <>
                       <CheckCircle2 size={13} color="#10b981" /> New key entered (Click &apos;Save Settings&apos; to apply)
                     </>
@@ -939,9 +1269,15 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
                     ? geminiApiKey && !geminiKeyCleared
                     : settingsProviderTab === 'openrouter'
                     ? openRouterApiKey && !openRouterKeyCleared
-                    : nvidiaApiKey && !nvidiaKeyCleared) ? (
+                    : settingsProviderTab === 'nvidia'
+                    ? nvidiaApiKey && !nvidiaKeyCleared
+                    : opencodeApiKey && !opencodeKeyCleared) ? (
                     <>
                       <CheckCircle2 size={13} color="#10b981" /> API key configured (Saved in local settings)
+                    </>
+                  ) : settingsProviderTab === 'opencode' ? (
+                    <>
+                      <CheckCircle2 size={13} color="#10b981" /> Free tier ready (No API key required)
                     </>
                   ) : (
                     <>
@@ -1258,30 +1594,34 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
         )}
 
         {/* Live Running Indicator (Only one active status card at a time, hidden when pending approval) */}
-        {isRunning && !pendingApproval && (
-          <div className="ai-message-row assistant">
-            <div className="ai-message-bubble running-status">
-              <div className="single-status-indicator">
-                {currentStep?.type === 'tool_call' ? (
-                  <>
-                    <Loader2 size={13} className="spin-icon" color="#38bdf8" />
-                    <span>⚙ Running tool: <strong>{currentStep.toolName}</strong>...</span>
-                  </>
-                ) : currentStep?.type === 'retrying' ? (
-                  <>
-                    <Loader2 size={13} className="spin-icon" color="#f59e0b" />
-                    <span style={{ color: '#f59e0b' }}>↻ {currentStep.text || 'Temporary provider issue. Retrying...'}</span>
-                  </>
-                ) : (
-                  <>
-                    <Loader2 size={13} className="spin-icon" color="#38bdf8" />
-                    <span>● Thinking...</span>
-                  </>
-                )}
+        {isRunning &&
+          !pendingApproval &&
+          (currentStep?.type === 'tool_call' ||
+            currentStep?.type === 'retrying' ||
+            !messages.some((m) => m.id === `${currentRequestIdRef.current}-res` && m.content)) && (
+            <div className="ai-message-row assistant">
+              <div className="ai-message-bubble running-status">
+                <div className="single-status-indicator">
+                  {currentStep?.type === 'tool_call' ? (
+                    <>
+                      <Loader2 size={13} className="spin-icon" color="#38bdf8" />
+                      <span>⚙ Running tool: <strong>{currentStep.toolName}</strong>...</span>
+                    </>
+                  ) : currentStep?.type === 'retrying' ? (
+                    <>
+                      <Loader2 size={13} className="spin-icon" color="#f59e0b" />
+                      <span style={{ color: '#f59e0b' }}>↻ {currentStep.text || 'Temporary provider issue. Retrying...'}</span>
+                    </>
+                  ) : (
+                    <>
+                      <Loader2 size={13} className="spin-icon" color="#38bdf8" />
+                      <span>● Thinking...</span>
+                    </>
+                  )}
+                </div>
               </div>
             </div>
-          </div>
-        )}
+          )}
 
         <div ref={messagesEndRef} />
       </div>
