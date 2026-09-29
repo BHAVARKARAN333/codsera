@@ -207,6 +207,7 @@ class DependencyAnalyzer {
 class CodebaseIndex {
   constructor(dependencyAnalyzer) {
     this.entries = new Map()
+    this.reverseDependencies = new Map()
     this.workspaceRoot = null
     this.dependencyAnalyzer = dependencyAnalyzer || new DependencyAnalyzer()
     this.detectedTechnologies = new Set()
@@ -220,8 +221,34 @@ class CodebaseIndex {
     return this.normalizePath(filePath).toLowerCase()
   }
 
+  unregisterReverseDependencies(importerKey, dependencies) {
+    for (const dep of dependencies) {
+      const depKey = this.normalizeKey(dep)
+      const set = this.reverseDependencies.get(depKey)
+      if (set) {
+        set.delete(importerKey)
+        if (set.size === 0) {
+          this.reverseDependencies.delete(depKey)
+        }
+      }
+    }
+  }
+
+  registerReverseDependencies(importerKey, dependencies) {
+    for (const dep of dependencies) {
+      const depKey = this.normalizeKey(dep)
+      let set = this.reverseDependencies.get(depKey)
+      if (!set) {
+        set = new Set()
+        this.reverseDependencies.set(depKey, set)
+      }
+      set.add(importerKey)
+    }
+  }
+
   clear() {
     this.entries.clear()
+    this.reverseDependencies.clear()
     this.detectedTechnologies.clear()
     this.workspaceRoot = null
     if (this.dependencyAnalyzer && typeof this.dependencyAnalyzer.clearCache === 'function') {
@@ -326,6 +353,13 @@ class CodebaseIndex {
       fileSize: content.length,
       lastIndexed: Date.now()
     }
+
+    const previousEntry = this.entries.get(key)
+    if (previousEntry && previousEntry.resolvedDependencies) {
+      this.unregisterReverseDependencies(key, previousEntry.resolvedDependencies)
+    }
+    this.registerReverseDependencies(key, resolvedDependencies)
+
     this.entries.set(key, entry)
     return entry
   }
@@ -335,11 +369,46 @@ class CodebaseIndex {
   }
 
   removeFile(filePath) {
-    return this.entries.delete(this.normalizeKey(filePath))
+    const key = this.normalizeKey(filePath)
+    const normPath = this.normalizePath(filePath)
+    if (this.dependencyAnalyzer && typeof this.dependencyAnalyzer.invalidateFile === 'function') {
+      this.dependencyAnalyzer.invalidateFile(filePath)
+    }
+
+    // 1. Clean up references in entries that imported this file
+    const importerKeys = this.reverseDependencies.get(key)
+    if (importerKeys && importerKeys.size > 0) {
+      for (const importerKey of importerKeys) {
+        if (importerKey === key) continue
+        const importerEntry = this.entries.get(importerKey)
+        if (importerEntry && importerEntry.resolvedDependencies) {
+          importerEntry.resolvedDependencies = importerEntry.resolvedDependencies.filter(
+            (dep) => this.normalizeKey(dep) !== key && dep !== normPath
+          )
+        }
+      }
+      this.reverseDependencies.delete(key)
+    }
+
+    // 2. Clean up outgoing dependencies from reverse map
+    const existingEntry = this.entries.get(key)
+    if (existingEntry && existingEntry.resolvedDependencies) {
+      this.unregisterReverseDependencies(key, existingEntry.resolvedDependencies)
+    }
+
+    return this.entries.delete(key)
   }
 
   invalidateFile(filePath) {
-    this.entries.delete(this.normalizeKey(filePath))
+    const key = this.normalizeKey(filePath)
+    if (this.dependencyAnalyzer && typeof this.dependencyAnalyzer.invalidateFile === 'function') {
+      this.dependencyAnalyzer.invalidateFile(filePath)
+    }
+    const existingEntry = this.entries.get(key)
+    if (existingEntry && existingEntry.resolvedDependencies) {
+      this.unregisterReverseDependencies(key, existingEntry.resolvedDependencies)
+    }
+    this.entries.delete(key)
   }
 
   findFile(filePath) {
@@ -348,15 +417,42 @@ class CodebaseIndex {
 
   findImporters(filePath) {
     const targetKey = this.normalizeKey(filePath)
-    const targetNorm = this.normalizePath(filePath)
+    const importerKeys = this.reverseDependencies.get(targetKey)
+    if (!importerKeys || importerKeys.size === 0) {
+      return []
+    }
+
     const importers = []
-    for (const entry of this.entries.values()) {
-      if (entry.normalizedPath.toLowerCase() === targetKey) continue
-      if (entry.resolvedDependencies.some(dep => this.normalizeKey(dep) === targetKey || dep === targetNorm)) {
+    const staleKeys = []
+
+    for (const impKey of importerKeys) {
+      if (impKey === targetKey) continue
+      const entry = this.entries.get(impKey)
+      if (entry) {
         importers.push(entry.normalizedPath)
+      } else {
+        staleKeys.push(impKey)
       }
     }
-    return importers
+
+    if (staleKeys.length > 0) {
+      for (const stale of staleKeys) {
+        importerKeys.delete(stale)
+      }
+      if (importerKeys.size === 0) {
+        this.reverseDependencies.delete(targetKey)
+      }
+    }
+
+    return importers.sort()
+  }
+
+  getReverseDependencies(filePath) {
+    return this.findImporters(filePath)
+  }
+
+  getReverseDependencyMapSize() {
+    return this.reverseDependencies.size
   }
 
   findDependencies(filePath) {
@@ -807,6 +903,120 @@ async function runPhase5Tests() {
   assert.strictEqual(failingEngine.isWorkspaceIndexed('C:/projects/forbidden'), false)
   assert.strictEqual(failingEngine.getIndexingStatus().isIndexing, false)
   console.log('✓ PASS: Indexing failure was safely caught and did not crash or leave dirty indexing state.')
+
+  // Test 23: Reverse dependency consistency and fast importer lookup
+  console.log('\n[Test 23] Reverse dependency consistency and fast importer lookup')
+  const rIndex = new CodebaseIndex()
+  rIndex.indexFile('src/b.ts', 'export const b = 1;', ['src/a.ts', 'src/b.ts', 'src/c.ts', 'src/d.ts'])
+  rIndex.indexFile('src/c.ts', 'export const c = 1;', ['src/a.ts', 'src/b.ts', 'src/c.ts', 'src/d.ts'])
+  rIndex.indexFile('src/a.ts', 'import { b } from "./b";\nimport { c } from "./c";\nexport const a = b + c;', ['src/a.ts', 'src/b.ts', 'src/c.ts', 'src/d.ts'])
+  rIndex.indexFile('src/d.ts', 'import { b } from "./b";\nexport const d = b * 2;', ['src/a.ts', 'src/b.ts', 'src/c.ts', 'src/d.ts'])
+
+  assert.deepStrictEqual(rIndex.findImporters('src/b.ts'), ['src/a.ts', 'src/d.ts'])
+  assert.deepStrictEqual(rIndex.findImporters('src/c.ts'), ['src/a.ts'])
+  assert.deepStrictEqual(rIndex.findImporters('src/a.ts'), [])
+  assert.strictEqual(rIndex.getReverseDependencyMapSize(), 2)
+  console.log('✓ PASS: Reverse dependencies correctly mapped and queried in O(1).')
+
+  // Test 24: File update cleans up stale reverse dependencies and registers new ones
+  console.log('\n[Test 24] File update cleans up stale reverse dependencies and registers new ones')
+  // Update a.ts to only import c.ts and new e.ts (dropping b.ts)
+  rIndex.indexFile('src/e.ts', 'export const e = 1;', ['src/a.ts', 'src/b.ts', 'src/c.ts', 'src/d.ts', 'src/e.ts'])
+  rIndex.updateFile('src/a.ts', 'import { c } from "./c";\nimport { e } from "./e";\nexport const a = c + e;', ['src/a.ts', 'src/b.ts', 'src/c.ts', 'src/d.ts', 'src/e.ts'])
+
+  // b.ts should now only be imported by d.ts (a.ts was cleaned up)
+  assert.deepStrictEqual(rIndex.findImporters('src/b.ts'), ['src/d.ts'])
+  // e.ts is now imported by a.ts
+  assert.deepStrictEqual(rIndex.findImporters('src/e.ts'), ['src/a.ts'])
+  // c.ts is still imported by a.ts
+  assert.deepStrictEqual(rIndex.findImporters('src/c.ts'), ['src/a.ts'])
+  console.log('✓ PASS: Stale reverse dependencies were cleanly purged and new dependencies registered.')
+
+  // Test 25: Deletion cascade (A -> B -> C)
+  console.log('\n[Test 25] Deletion cascade (A -> B -> C)')
+  const cascadeIndex = new CodebaseIndex()
+  const cascadeWorkspace = ['src/cascadeA.ts', 'src/cascadeB.ts', 'src/cascadeC.ts']
+  cascadeIndex.indexFile('src/cascadeC.ts', 'export const c = 100;', cascadeWorkspace)
+  cascadeIndex.indexFile('src/cascadeB.ts', 'import { c } from "./cascadeC";\nexport const b = c;', cascadeWorkspace)
+  cascadeIndex.indexFile('src/cascadeA.ts', 'import { b } from "./cascadeB";\nexport const a = b;', cascadeWorkspace)
+
+  assert.deepStrictEqual(cascadeIndex.findImporters('src/cascadeC.ts'), ['src/cascadeB.ts'])
+  assert.deepStrictEqual(cascadeIndex.findImporters('src/cascadeB.ts'), ['src/cascadeA.ts'])
+
+  // Remove cascadeC.ts
+  const removedC = cascadeIndex.removeFile('src/cascadeC.ts')
+  assert.strictEqual(removedC, true)
+  assert.deepStrictEqual(cascadeIndex.findImporters('src/cascadeC.ts'), [])
+  // cascadeB.ts should no longer list cascadeC.ts in resolvedDependencies
+  assert.deepStrictEqual(cascadeIndex.findDependencies('src/cascadeB.ts'), [])
+  // cascadeA.ts still imports cascadeB.ts
+  assert.deepStrictEqual(cascadeIndex.findImporters('src/cascadeB.ts'), ['src/cascadeA.ts'])
+
+  // Remove cascadeB.ts
+  const removedB = cascadeIndex.removeFile('src/cascadeB.ts')
+  assert.strictEqual(removedB, true)
+  assert.deepStrictEqual(cascadeIndex.findImporters('src/cascadeB.ts'), [])
+  // cascadeA.ts should now have empty resolvedDependencies
+  assert.deepStrictEqual(cascadeIndex.findDependencies('src/cascadeA.ts'), [])
+  console.log('✓ PASS: Deletion cascade maintained complete consistency at each step.')
+
+  // Test 26: Repeated removals and missing paths
+  console.log('\n[Test 26] Repeated removals and missing paths')
+  assert.strictEqual(cascadeIndex.removeFile('src/cascadeB.ts'), false, 'Repeated removal must return false')
+  assert.strictEqual(cascadeIndex.removeFile('src/nonexistent.ts'), false, 'Missing path removal must return false')
+  assert.strictEqual(cascadeIndex.findImporters('src/nonexistent.ts').length, 0)
+  console.log('✓ PASS: Repeated removals and missing paths handled safely.')
+
+  // Test 27: Circular dependencies (A <-> B)
+  console.log('\n[Test 27] Circular dependencies (A <-> B)')
+  const circIndex = new CodebaseIndex()
+  const circFiles = ['src/circA.ts', 'src/circB.ts']
+  circIndex.indexFile('src/circA.ts', 'import { b } from "./circB";\nexport const a = () => b();', circFiles)
+  circIndex.indexFile('src/circB.ts', 'import { a } from "./circA";\nexport const b = () => a();', circFiles)
+
+  assert.deepStrictEqual(circIndex.findImporters('src/circA.ts'), ['src/circB.ts'])
+  assert.deepStrictEqual(circIndex.findImporters('src/circB.ts'), ['src/circA.ts'])
+
+  // Removing circA should clean up circB's forward and reverse dependencies without recursion
+  const circRemoved = circIndex.removeFile('src/circA.ts')
+  assert.strictEqual(circRemoved, true)
+  assert.deepStrictEqual(circIndex.findImporters('src/circA.ts'), [])
+  assert.deepStrictEqual(circIndex.findDependencies('src/circB.ts'), [])
+  assert.deepStrictEqual(circIndex.findImporters('src/circB.ts'), [])
+  assert.strictEqual(circIndex.removeFile('src/circB.ts'), true)
+  assert.strictEqual(circIndex.getReverseDependencyMapSize(), 0)
+  console.log('✓ PASS: Circular dependencies cleanly disconnected upon removal.')
+
+  // Test 28: Workspace clearing resets reverse dependency map
+  console.log('\n[Test 28] Workspace clearing resets reverse dependency map')
+  const clrIndex = new CodebaseIndex()
+  clrIndex.indexFile('src/x.ts', 'export const x = 1;', ['src/x.ts', 'src/y.ts'])
+  clrIndex.indexFile('src/y.ts', 'import { x } from "./x";\nexport const y = x;', ['src/x.ts', 'src/y.ts'])
+  assert(clrIndex.getReverseDependencyMapSize() > 0)
+  clrIndex.clear()
+  assert.strictEqual(clrIndex.getReverseDependencyMapSize(), 0)
+  assert.deepStrictEqual(clrIndex.findImporters('src/x.ts'), [])
+  console.log('✓ PASS: clear() emptied reverse dependency map completely.')
+
+  // Test 29: Self-dependencies handled safely
+  console.log('\n[Test 29] Self-dependencies handled safely')
+  const selfIndex = new CodebaseIndex()
+  selfIndex.indexFile('src/self.ts', 'import { x } from "./self";\nexport const x = 1;', ['src/self.ts'])
+  assert.deepStrictEqual(selfIndex.findImporters('src/self.ts'), [], 'Self import must not be included in findImporters')
+  assert.strictEqual(selfIndex.removeFile('src/self.ts'), true)
+  assert.strictEqual(selfIndex.getReverseDependencyMapSize(), 0)
+  console.log('✓ PASS: Self-dependencies handled safely without self-referential leak.')
+
+  // Test 30: Case-insensitivity on Windows-like paths
+  console.log('\n[Test 30] Case-insensitivity on importer and dependency paths')
+  const caseIndex = new CodebaseIndex()
+  caseIndex.indexFile('src/Service.ts', 'export const s = 1;', ['src/Service.ts', 'src/consumer.ts'])
+  caseIndex.indexFile('src/consumer.ts', 'import { s } from "./service";\nexport const c = s;', ['src/Service.ts', 'src/consumer.ts'])
+  assert.deepStrictEqual(caseIndex.findImporters('SRC/SERVICE.TS'), ['src/consumer.ts'])
+  assert.deepStrictEqual(caseIndex.findImporters('src/service.ts'), ['src/consumer.ts'])
+  assert.strictEqual(caseIndex.removeFile('src/service.ts'), true)
+  assert.deepStrictEqual(caseIndex.findDependencies('src/consumer.ts'), [])
+  console.log('✓ PASS: Case-insensitive lookups and removals behave consistently.')
 
   console.log('\n===========================================================')
   console.log('ALL PHASE 5 CODEBASE INDEX TESTS PASSED! ✓')

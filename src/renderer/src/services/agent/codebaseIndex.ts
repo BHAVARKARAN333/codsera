@@ -107,6 +107,7 @@ export interface SerializedWorkspaceIndex {
 
 export class CodebaseIndex {
   private entries: Map<string, FileIndexEntry> = new Map() // normalizedPath -> FileIndexEntry
+  private reverseDependencies: Map<string, Set<string>> = new Map() // dependencyKey -> Set<importerKey>
   private workspaceRoot: string | null = null
   private dependencyAnalyzer: DependencyAnalyzer
   private detectedTechnologies: Set<string> = new Set()
@@ -135,9 +136,35 @@ export class CodebaseIndex {
     return this.dependencyAnalyzer
   }
 
+  private unregisterReverseDependencies(importerKey: string, dependencies: string[]): void {
+    for (const dep of dependencies) {
+      const depKey = this.normalizeKey(dep)
+      const set = this.reverseDependencies.get(depKey)
+      if (set) {
+        set.delete(importerKey)
+        if (set.size === 0) {
+          this.reverseDependencies.delete(depKey)
+        }
+      }
+    }
+  }
+
+  private registerReverseDependencies(importerKey: string, dependencies: string[]): void {
+    for (const dep of dependencies) {
+      const depKey = this.normalizeKey(dep)
+      let set = this.reverseDependencies.get(depKey)
+      if (!set) {
+        set = new Set()
+        this.reverseDependencies.set(depKey, set)
+      }
+      set.add(importerKey)
+    }
+  }
+
   clear(): void {
     this.activeBuildId++
     this.entries.clear()
+    this.reverseDependencies.clear()
     this.detectedTechnologies.clear()
     this.workspaceRoot = null
     this.dependencyAnalyzer.clearCache()
@@ -240,6 +267,7 @@ export class CodebaseIndex {
     }
     for (const { key, entry } of validatedEntries) {
       this.entries.set(key, entry)
+      this.registerReverseDependencies(key, entry.resolvedDependencies)
     }
 
     if (this.debug) {
@@ -433,6 +461,13 @@ export class CodebaseIndex {
       lastIndexed: Date.now()
     }
 
+    // Maintain reverse dependency consistency on new or updated file
+    const previousEntry = this.entries.get(key)
+    if (previousEntry && previousEntry.resolvedDependencies) {
+      this.unregisterReverseDependencies(key, previousEntry.resolvedDependencies)
+    }
+    this.registerReverseDependencies(key, resolvedDependencies)
+
     this.entries.set(key, entry)
     return entry
   }
@@ -526,19 +561,32 @@ export class CodebaseIndex {
 
   /**
    * Removes a deleted file from the index and cleans up references in remaining entries.
+   * Utilizes reverse dependency map for O(1) importer lookup, eliminating full O(N) index scans.
    */
   removeFile(filePath: string): boolean {
     const key = this.normalizeKey(filePath)
     const normPath = this.normalizePath(filePath)
     this.dependencyAnalyzer.invalidateFile(filePath)
 
-    // Clean up references in remaining entries
-    for (const entry of this.entries.values()) {
-      if (entry.resolvedDependencies && entry.resolvedDependencies.length > 0) {
-        entry.resolvedDependencies = entry.resolvedDependencies.filter(
-          (dep) => this.normalizeKey(dep) !== key && dep !== normPath
-        )
+    // 1. Clean up references in entries that imported this file (using reverse dependencies)
+    const importerKeys = this.reverseDependencies.get(key)
+    if (importerKeys && importerKeys.size > 0) {
+      for (const importerKey of importerKeys) {
+        if (importerKey === key) continue
+        const importerEntry = this.entries.get(importerKey)
+        if (importerEntry && importerEntry.resolvedDependencies) {
+          importerEntry.resolvedDependencies = importerEntry.resolvedDependencies.filter(
+            (dep) => this.normalizeKey(dep) !== key && dep !== normPath
+          )
+        }
       }
+      this.reverseDependencies.delete(key)
+    }
+
+    // 2. Clean up this file's outgoing dependencies from the reverse dependency map
+    const existingEntry = this.entries.get(key)
+    if (existingEntry && existingEntry.resolvedDependencies) {
+      this.unregisterReverseDependencies(key, existingEntry.resolvedDependencies)
     }
 
     const removed = this.entries.delete(key)
@@ -572,6 +620,10 @@ export class CodebaseIndex {
   invalidateFile(filePath: string): void {
     const key = this.normalizeKey(filePath)
     this.dependencyAnalyzer.invalidateFile(filePath)
+    const existingEntry = this.entries.get(key)
+    if (existingEntry && existingEntry.resolvedDependencies) {
+      this.unregisterReverseDependencies(key, existingEntry.resolvedDependencies)
+    }
     this.entries.delete(key)
   }
 
@@ -591,24 +643,52 @@ export class CodebaseIndex {
 
   /**
    * Query API: Finds all files that import target file.
+   * Utilizes reverse dependency map for O(1) lookup rather than scanning all indexed files.
    */
   findImporters(filePath: string): string[] {
     const targetKey = this.normalizeKey(filePath)
-    const targetNorm = this.normalizePath(filePath)
+    const importerKeys = this.reverseDependencies.get(targetKey)
+    if (!importerKeys || importerKeys.size === 0) {
+      return []
+    }
+
     const importers: string[] = []
+    const staleKeys: string[] = []
 
-    for (const entry of this.entries.values()) {
-      if (entry.normalizedPath.toLowerCase() === targetKey) continue
-
-      const importsTarget = entry.resolvedDependencies.some(
-        (dep) => this.normalizeKey(dep) === targetKey || dep === targetNorm
-      )
-      if (importsTarget) {
+    for (const impKey of importerKeys) {
+      if (impKey === targetKey) continue
+      const entry = this.entries.get(impKey)
+      if (entry) {
         importers.push(entry.normalizedPath)
+      } else {
+        staleKeys.push(impKey)
       }
     }
 
-    return importers
+    if (staleKeys.length > 0) {
+      for (const stale of staleKeys) {
+        importerKeys.delete(stale)
+      }
+      if (importerKeys.size === 0) {
+        this.reverseDependencies.delete(targetKey)
+      }
+    }
+
+    return importers.sort()
+  }
+
+  /**
+   * Diagnostic / test helper: Returns direct importer normalized paths registered for target file.
+   */
+  getReverseDependencies(filePath: string): string[] {
+    return this.findImporters(filePath)
+  }
+
+  /**
+   * Diagnostic / test helper: Returns total number of registered reverse dependency targets.
+   */
+  getReverseDependencyMapSize(): number {
+    return this.reverseDependencies.size
   }
 
   /**

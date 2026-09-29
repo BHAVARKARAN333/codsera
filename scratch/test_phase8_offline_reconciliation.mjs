@@ -159,6 +159,7 @@ class DependencyAnalyzer {
 class CodebaseIndex {
   constructor(dependencyAnalyzer) {
     this.entries = new Map()
+    this.reverseDependencies = new Map()
     this.workspaceRoot = null
     this.dependencyAnalyzer = dependencyAnalyzer || new DependencyAnalyzer()
     this.detectedTechnologies = new Set()
@@ -173,8 +174,34 @@ class CodebaseIndex {
     return this.normalizePath(filePath).toLowerCase()
   }
 
+  unregisterReverseDependencies(importerKey, dependencies) {
+    for (const dep of dependencies) {
+      const depKey = this.normalizeKey(dep)
+      const set = this.reverseDependencies.get(depKey)
+      if (set) {
+        set.delete(importerKey)
+        if (set.size === 0) {
+          this.reverseDependencies.delete(depKey)
+        }
+      }
+    }
+  }
+
+  registerReverseDependencies(importerKey, dependencies) {
+    for (const dep of dependencies) {
+      const depKey = this.normalizeKey(dep)
+      let set = this.reverseDependencies.get(depKey)
+      if (!set) {
+        set = new Set()
+        this.reverseDependencies.set(depKey, set)
+      }
+      set.add(importerKey)
+    }
+  }
+
   clear() {
     this.entries.clear()
+    this.reverseDependencies.clear()
     this.detectedTechnologies.clear()
     this.workspaceRoot = null
   }
@@ -228,6 +255,7 @@ class CodebaseIndex {
     }
     for (const { key, entry } of validatedEntries) {
       this.entries.set(key, entry)
+      this.registerReverseDependencies(key, entry.resolvedDependencies)
     }
     return true
   }
@@ -301,6 +329,12 @@ class CodebaseIndex {
       lastIndexed: Date.now()
     }
 
+    const previousEntry = this.entries.get(key)
+    if (previousEntry && previousEntry.resolvedDependencies) {
+      this.unregisterReverseDependencies(key, previousEntry.resolvedDependencies)
+    }
+    this.registerReverseDependencies(key, resolvedDependencies)
+
     this.entries.set(key, entry)
     return entry
   }
@@ -365,12 +399,25 @@ class CodebaseIndex {
     const normPath = this.normalizePath(filePath)
     this.dependencyAnalyzer.invalidateFile(filePath)
 
-    for (const entry of this.entries.values()) {
-      if (entry.resolvedDependencies && entry.resolvedDependencies.length > 0) {
-        entry.resolvedDependencies = entry.resolvedDependencies.filter(
-          (dep) => this.normalizeKey(dep) !== key && dep !== normPath
-        )
+    // 1. Clean up references in entries that imported this file
+    const importerKeys = this.reverseDependencies.get(key)
+    if (importerKeys && importerKeys.size > 0) {
+      for (const importerKey of importerKeys) {
+        if (importerKey === key) continue
+        const importerEntry = this.entries.get(importerKey)
+        if (importerEntry && importerEntry.resolvedDependencies) {
+          importerEntry.resolvedDependencies = importerEntry.resolvedDependencies.filter(
+            (dep) => this.normalizeKey(dep) !== key && dep !== normPath
+          )
+        }
       }
+      this.reverseDependencies.delete(key)
+    }
+
+    // 2. Clean up outgoing dependencies from reverse map
+    const existingEntry = this.entries.get(key)
+    if (existingEntry && existingEntry.resolvedDependencies) {
+      this.unregisterReverseDependencies(key, existingEntry.resolvedDependencies)
     }
 
     const removed = this.entries.delete(key)
