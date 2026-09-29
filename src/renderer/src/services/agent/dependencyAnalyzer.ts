@@ -455,6 +455,19 @@ export class DependencyAnalyzer {
     const key = this.normalizeKey(filePath)
     const normalizedPath = this.normalizePath(filePath)
 
+    // Fast-path: If the file does not contain 'import', 'export', or 'require', skip line splitting & regex parsing
+    if (!content.includes('import') && !content.includes('export') && !content.includes('require')) {
+      const emptyInfo: FileDependencyInfo = {
+        path: normalizedPath,
+        imports: [],
+        exports: [],
+        unresolvedImports: [],
+        lastAnalyzed: Date.now()
+      }
+      this.fileCache.set(key, emptyInfo)
+      return emptyInfo
+    }
+
     const lines = content.split(/\r?\n/)
     const imports: ParsedImport[] = []
     const exports: ParsedExport[] = []
@@ -597,44 +610,47 @@ export class DependencyAnalyzer {
       }
 
       // Match CommonJS require(...)
-      const requireMatch = line.match(
-        /(?:const|let|var)\s+([\w\s{},]+)\s*=\s*require\s*\(\s*['"]([^'"]+)['"]\s*\)/
-      )
-      if (requireMatch) {
-        const rawSymbols = requireMatch[1].trim()
-        const specifier = requireMatch[2].trim()
-        const importedSymbols: string[] = []
+      if (line.includes('require')) {
+        const requireMatch = line.match(
+          /(?:const|let|var)\s+([\w\s{},]+)\s*=\s*require\s*\(\s*['"]([^'"]+)['"]\s*\)/
+        )
+        if (requireMatch) {
+          const rawSymbols = requireMatch[1].trim()
+          const specifier = requireMatch[2].trim()
+          const importedSymbols: string[] = []
 
-        if (rawSymbols.startsWith('{')) {
-          rawSymbols
-            .replace(/[{}]/g, '')
-            .split(',')
-            .forEach((s) => {
-              const sym = s.trim().split(':')[0].trim()
-              if (sym) importedSymbols.push(sym)
-            })
-        } else {
-          importedSymbols.push(rawSymbols)
-        }
-
-        const resolvedPath = this.resolveImportPath(normalizedPath, specifier, allWorkspaceFiles)
-        if (!resolvedPath && this.isLocalOrAliasSpecifier(specifier)) {
-          if (!unresolvedImports.includes(specifier)) {
-            unresolvedImports.push(specifier)
+          if (rawSymbols.startsWith('{')) {
+            rawSymbols
+              .replace(/[{}]/g, '')
+              .split(',')
+              .forEach((s) => {
+                const sym = s.trim().split(':')[0].trim()
+                if (sym) importedSymbols.push(sym)
+              })
+          } else {
+            importedSymbols.push(rawSymbols)
           }
-        }
 
-        imports.push({
-          specifier,
-          resolvedPath,
-          importedSymbols: Array.from(new Set(importedSymbols)),
-          isDefault: true,
-          isNamespace: false,
-          line: lineNum
-        })
-        seenImportSpecifiers.add(specifier)
-        continue
+          const resolvedPath = this.resolveImportPath(normalizedPath, specifier, allWorkspaceFiles)
+          if (!resolvedPath && this.isLocalOrAliasSpecifier(specifier)) {
+            if (!unresolvedImports.includes(specifier)) {
+              unresolvedImports.push(specifier)
+            }
+          }
+
+          imports.push({
+            specifier,
+            resolvedPath,
+            importedSymbols: Array.from(new Set(importedSymbols)),
+            isDefault: true,
+            isNamespace: false,
+            line: lineNum
+          })
+          seenImportSpecifiers.add(specifier)
+          continue
+        }
       }
+
 
       // 2. Detect and parse ESM Export Statements (single-line or multiline)
       if (

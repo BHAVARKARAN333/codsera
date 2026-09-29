@@ -305,6 +305,19 @@ class DependencyAnalyzer {
     const key = this.normalizeKey(filePath)
     const normalizedPath = this.normalizePath(filePath)
 
+    // Fast-path: If the file does not contain 'import', 'export', or 'require', skip line splitting & regex parsing
+    if (!content.includes('import') && !content.includes('export') && !content.includes('require')) {
+      const emptyInfo = {
+        path: normalizedPath,
+        imports: [],
+        exports: [],
+        unresolvedImports: [],
+        lastAnalyzed: Date.now()
+      }
+      this.fileCache.set(key, emptyInfo)
+      return emptyInfo
+    }
+
     const lines = content.split(/\r?\n/)
     const imports = []
     const exports = []
@@ -440,43 +453,45 @@ class DependencyAnalyzer {
         continue
       }
 
-      const requireMatch = line.match(
-        /(?:const|let|var)\s+([\w\s{},]+)\s*=\s*require\s*\(\s*['"]([^'"]+)['"]\s*\)/
-      )
-      if (requireMatch) {
-        const rawSymbols = requireMatch[1].trim()
-        const specifier = requireMatch[2].trim()
-        const importedSymbols = []
+      if (line.includes('require')) {
+        const requireMatch = line.match(
+          /(?:const|let|var)\s+([\w\s{},]+)\s*=\s*require\s*\(\s*['"]([^'"]+)['"]\s*\)/
+        )
+        if (requireMatch) {
+          const rawSymbols = requireMatch[1].trim()
+          const specifier = requireMatch[2].trim()
+          const importedSymbols = []
 
-        if (rawSymbols.startsWith('{')) {
-          rawSymbols
-            .replace(/[{}]/g, '')
-            .split(',')
-            .forEach((s) => {
-              const sym = s.trim().split(':')[0].trim()
-              if (sym) importedSymbols.push(sym)
-            })
-        } else {
-          importedSymbols.push(rawSymbols)
-        }
-
-        const resolvedPath = this.resolveImportPath(normalizedPath, specifier, allWorkspaceFiles)
-        if (!resolvedPath && this.isLocalOrAliasSpecifier(specifier)) {
-          if (!unresolvedImports.includes(specifier)) {
-            unresolvedImports.push(specifier)
+          if (rawSymbols.startsWith('{')) {
+            rawSymbols
+              .replace(/[{}]/g, '')
+              .split(',')
+              .forEach((s) => {
+                const sym = s.trim().split(':')[0].trim()
+                if (sym) importedSymbols.push(sym)
+              })
+          } else {
+            importedSymbols.push(rawSymbols)
           }
-        }
 
-        imports.push({
-          specifier,
-          resolvedPath,
-          importedSymbols: Array.from(new Set(importedSymbols)),
-          isDefault: true,
-          isNamespace: false,
-          line: lineNum
-        })
-        seenImportSpecifiers.add(specifier)
-        continue
+          const resolvedPath = this.resolveImportPath(normalizedPath, specifier, allWorkspaceFiles)
+          if (!resolvedPath && this.isLocalOrAliasSpecifier(specifier)) {
+            if (!unresolvedImports.includes(specifier)) {
+              unresolvedImports.push(specifier)
+            }
+          }
+
+          imports.push({
+            specifier,
+            resolvedPath,
+            importedSymbols: Array.from(new Set(importedSymbols)),
+            isDefault: true,
+            isNamespace: false,
+            line: lineNum
+          })
+          seenImportSpecifiers.add(specifier)
+          continue
+        }
       }
 
       if (
@@ -1389,6 +1404,89 @@ import { Button } from '@monaco-editor/react';
   )
   assert.strictEqual(edgeAnalyzer.isWorkspaceFilesCached(cachedFiles), true, 'Must remain cached')
   console.log('✓ PASS: Existing cache reuse and import resolution behavior verified.')
+
+  // -------------------------------------------------------------
+  // Test X: analyzeFileContent fast-path & parsing parity tests
+  // -------------------------------------------------------------
+  console.log('\n[Test X] analyzeFileContent fast-path, ESM, CommonJS, and multiline tests')
+  const fastPathAnalyzer = new DependencyAnalyzer()
+  const testWorkspaceFiles = ['src/utils/math.ts', 'src/types.ts', 'src/components/Button.tsx']
+
+  // 1. File with no imports, exports, or require (fast-path)
+  const noImportCode = `
+    // Pure calculation without dependencies
+    const FACTOR = 42;
+    function calculate(n) {
+      return n * FACTOR;
+    }
+  `
+  const noImportInfo = fastPathAnalyzer.analyzeFileContent('src/utils/calc.ts', noImportCode, testWorkspaceFiles)
+  assert.strictEqual(noImportInfo.imports.length, 0, 'No-import file must have 0 imports')
+  assert.strictEqual(noImportInfo.exports.length, 0, 'No-import file must have 0 exports')
+  assert.strictEqual(noImportInfo.unresolvedImports.length, 0, 'No-import file must have 0 unresolved imports')
+  assert.strictEqual(typeof noImportInfo.lastAnalyzed, 'number', 'lastAnalyzed timestamp must be set')
+  const cachedNoImport = fastPathAnalyzer.fileCache.get('src/utils/calc.ts')
+  assert.strictEqual(cachedNoImport, noImportInfo, 'No-import result must be stored in fileCache')
+  console.log('✓ PASS: File with no imports/exports/require fast-paths cleanly with cached empty result.')
+
+  // 2. Normal ESM imports and exports
+  const normalEsmCode = `
+    import { add } from './utils/math';
+    export const PI = 3.14159;
+    export function area(r: number): number {
+      return PI * r * r;
+    }
+  `
+  const normalEsmInfo = fastPathAnalyzer.analyzeFileContent('src/circle.ts', normalEsmCode, testWorkspaceFiles)
+  assert.strictEqual(normalEsmInfo.imports.length, 1, 'Normal ESM must have 1 import')
+  assert.strictEqual(normalEsmInfo.imports[0].specifier, './utils/math')
+  assert.strictEqual(normalEsmInfo.imports[0].resolvedPath, 'src/utils/math.ts')
+  assert.deepStrictEqual(normalEsmInfo.imports[0].importedSymbols, ['add'])
+  assert.strictEqual(normalEsmInfo.exports.length, 2, 'Normal ESM must have 2 exports')
+  assert.strictEqual(normalEsmInfo.exports[0].name, 'PI')
+  assert.strictEqual(normalEsmInfo.exports[1].name, 'area')
+  console.log('✓ PASS: Normal ESM imports and exports parsed accurately.')
+
+  // 3. CommonJS require (gated line-level check)
+  const cjsCode = `
+    const { add, subtract } = require('./utils/math');
+    const path = require('path');
+    module.exports = { add, subtract };
+  `
+  const cjsInfo = fastPathAnalyzer.analyzeFileContent('src/legacy.js', cjsCode, testWorkspaceFiles)
+  assert.strictEqual(cjsInfo.imports.length, 2, 'CommonJS require must detect 2 require imports')
+  const mathRequire = cjsInfo.imports.find((i) => i.specifier === './utils/math')
+  assert(mathRequire, 'Must find require for ./utils/math')
+  assert.strictEqual(mathRequire.resolvedPath, 'src/utils/math.ts')
+  assert.deepStrictEqual(mathRequire.importedSymbols, ['add', 'subtract'])
+  const pathRequire = cjsInfo.imports.find((i) => i.specifier === 'path')
+  assert(pathRequire, 'Must find require for path')
+  assert.strictEqual(pathRequire.resolvedPath, null, 'External path require resolvedPath should be null')
+  console.log('✓ PASS: CommonJS require statements parsed cleanly with line gating.')
+
+  // 4. Multiline ESM imports
+  const multilineCode = `
+    import {
+      add,
+      subtract
+    } from './utils/math';
+    export const compute = (a: number, b: number) => add(a, b);
+  `
+  const multilineInfo = fastPathAnalyzer.analyzeFileContent('src/multiline.ts', multilineCode, testWorkspaceFiles)
+  assert.strictEqual(multilineInfo.imports.length, 1, 'Multiline import must produce 1 import')
+  assert.strictEqual(multilineInfo.imports[0].specifier, './utils/math')
+  assert.strictEqual(multilineInfo.imports[0].resolvedPath, 'src/utils/math.ts')
+  assert.deepStrictEqual(multilineInfo.imports[0].importedSymbols, ['add', 'subtract'])
+  assert.strictEqual(multilineInfo.exports.length, 1)
+  assert.strictEqual(multilineInfo.exports[0].name, 'compute')
+  console.log('✓ PASS: Multiline import parsed correctly with preserved symbols and dependencies.')
+
+  // 5. Cache retrieval and invalidation
+  const cachedLookup = fastPathAnalyzer.fileCache.get('src/multiline.ts')
+  assert.strictEqual(cachedLookup, multilineInfo, 'File cache lookup should match returned object')
+  fastPathAnalyzer.invalidateFile('src/multiline.ts')
+  assert.strictEqual(fastPathAnalyzer.fileCache.has('src/multiline.ts'), false, 'Cache should be invalidated cleanly')
+  console.log('✓ PASS: Cache behavior and invalidation verified.')
 
   console.log('\n====================================================')
   console.log('ALL PHASE 3 DEPENDENCY-AWARE TESTS PASSED! ✓')
