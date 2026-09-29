@@ -50,7 +50,8 @@ const WATCHER_IGNORED_DIRS = new Set([
   '.idea',
   '.cache',
   'coverage',
-  '.parcel-cache'
+  '.parcel-cache',
+  'scratch'
 ])
 
 let currentWatcher: FSWatcher | null = null
@@ -312,7 +313,7 @@ async function safeClearWorkspaceIndex(
   }
 }
 
-async function readDirectoryTree(dirPath: string, maxDepth = 4, currentDepth = 0): Promise<FileEntry[]> {
+async function readDirectoryTree(dirPath: string, maxDepth = 8, currentDepth = 0): Promise<FileEntry[]> {
   if (currentDepth > maxDepth) {
     return []
   }

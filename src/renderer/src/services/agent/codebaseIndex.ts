@@ -11,6 +11,7 @@ import {
   DependencyAnalyzer,
   ParsedExport
 } from './dependencyAnalyzer'
+import type { IndexingHooks } from './indexingProfiler'
 
 export type FileType = 'source' | 'test' | 'config' | 'entry' | 'structure' | 'unknown'
 
@@ -289,7 +290,8 @@ export class CodebaseIndex {
     fileReader: (path: string) => Promise<string | null>,
     fileMetadataMap?: Map<string, { size?: number; mtimeMs?: number }>,
     shouldCancel?: () => boolean,
-    chunkSize = 25
+    chunkSize = 25,
+    hooks?: IndexingHooks
   ): Promise<boolean> {
     this.clear()
     const buildId = ++this.activeBuildId
@@ -336,13 +338,23 @@ export class CodebaseIndex {
 
       if (content !== null) {
         const meta = fileMetadataMap?.get(relPath)
+        const t0 = hooks?.onIndexFile && typeof performance !== 'undefined' ? performance.now() : 0
         this.indexFile(relPath, content, normalizedPaths, meta?.mtimeMs, meta?.size)
+        if (hooks?.onIndexFile) {
+          const t1 = typeof performance !== 'undefined' ? performance.now() : 0
+          hooks.onIndexFile(relPath, t1 - t0)
+        }
       }
 
       processedInChunk++
       if (processedInChunk >= chunkSize) {
         processedInChunk = 0
+        const t0 = hooks?.onYield && typeof performance !== 'undefined' ? performance.now() : 0
         await yieldToMain()
+        if (hooks?.onYield) {
+          const t1 = typeof performance !== 'undefined' ? performance.now() : 0
+          hooks.onYield(t1 - t0)
+        }
         if (shouldCancel && shouldCancel()) {
           cleanupIfActive()
           return false

@@ -235,6 +235,21 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
         console.error('Failed to load settings:', err)
       })
 
+    // Safe development-only debug bridge to enable indexing profiler
+    if (import.meta.env.DEV) {
+      window.__enableProfiling = (enabled = true) => {
+        const engine = orchestrator.getSmartContextEngine()
+        engine.enableProfiling(enabled)
+        console.log(`[SmartContextEngine] Indexing profiling is now ${enabled ? 'ENABLED' : 'DISABLED'}.`)
+        return engine
+      }
+    }
+
+    return () => {
+      if (import.meta.env.DEV && typeof window !== 'undefined') {
+        delete window.__enableProfiling
+      }
+    }
   }, [])
 
   // Trigger workspace indexing whenever workspaceRoot opens or switches

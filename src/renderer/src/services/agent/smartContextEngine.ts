@@ -12,6 +12,15 @@ import {
   SymbolReference
 } from './dependencyAnalyzer'
 import { CodebaseIndex, ProjectSummary, yieldToMain } from './codebaseIndex'
+import {
+  IndexingProfiler,
+  ProfilingSession,
+  IndexingProfileSummary,
+  IndexingHooks
+} from './indexingProfiler'
+
+export type { IndexingProfileSummary, IndexingHooks }
+export { IndexingProfiler, ProfilingSession }
 
 export interface RankedCandidate {
   path: string
@@ -27,8 +36,6 @@ export interface SmartContextFile {
   charCount: number
   score: number
   isExplicit: boolean
-}
-
 export interface SmartContextResult {
   required: boolean
   reason?: string
@@ -52,6 +59,7 @@ export interface SmartContextEngineConfig {
   minScoreThreshold?: number
   watcherBatchDebounceMs?: number
   debug?: boolean
+  profileIndexing?: boolean
 }
 
 /**
@@ -100,7 +108,8 @@ const BINARY_AND_ASSET_EXTS = new Set([
   'ttf',
   'eot',
   'map',
-  'wasm'
+  'wasm',
+  'tsbuildinfo'
 ])
 
 const IGNORED_DIRS = new Set([
@@ -112,7 +121,8 @@ const IGNORED_DIRS = new Set([
   '.idea',
   '.cache',
   'coverage',
-  '.parcel-cache'
+  '.parcel-cache',
+  'scratch'
 ])
 
 const COMMON_STOP_WORDS = new Set([
@@ -223,6 +233,8 @@ export class SmartContextEngine {
   private dependencyAnalyzer: DependencyAnalyzer
   private codebaseIndex: CodebaseIndex
   private currentWorkspaceRoot: string | null = null
+  private isProfilingEnabled: boolean = false
+  private profiler: IndexingProfiler | null = null
 
   constructor(config?: SmartContextEngineConfig) {
     const maxCandidates = config?.maxCandidates ?? 15
@@ -233,6 +245,7 @@ export class SmartContextEngine {
     const minScoreThreshold = config?.minScoreThreshold ?? 40
     const watcherBatchDebounceMs = config?.watcherBatchDebounceMs ?? 50
     const debug = config?.debug ?? false
+    const profileIndexing = config?.profileIndexing ?? false
 
     this.config = {
       maxCandidates,
@@ -242,7 +255,13 @@ export class SmartContextEngine {
       maxTotalContextChars,
       minScoreThreshold,
       watcherBatchDebounceMs,
-      debug
+      debug,
+      profileIndexing
+    }
+
+    this.isProfilingEnabled = profileIndexing
+    if (profileIndexing) {
+      this.profiler = new IndexingProfiler()
     }
 
     this.cache = new ContextCache(debug)
@@ -266,6 +285,25 @@ export class SmartContextEngine {
     this.deduplicator.setDebug(enabled)
     this.dependencyAnalyzer.setDebug(enabled)
     this.codebaseIndex.setDebug(enabled)
+  }
+
+  /**
+   * Explicitly enables or disables real-time indexing profiling.
+   * When enabled, records timing breakdowns and renderer long tasks.
+   */
+  enableProfiling(enabled: boolean): void {
+    this.isProfilingEnabled = enabled
+    this.config.profileIndexing = enabled
+    if (enabled && !this.profiler) {
+      this.profiler = new IndexingProfiler()
+    }
+  }
+
+  /**
+   * Returns the IndexingProfiler instance if created, or null.
+   */
+  getProfiler(): IndexingProfiler | null {
+    return this.profiler
   }
 
   getCache(): ContextCache {
@@ -302,7 +340,6 @@ export class SmartContextEngine {
   private isProcessingEventBatch = false
   private batchResolvers: Array<() => void> = []
   private recentlyModifiedBySelf: Map<string, number> = new Map()
-
   /**
    * Returns the count of pending file events in the active batch.
    */
@@ -489,97 +526,140 @@ export class SmartContextEngine {
       }
 
       // 2. Fall back to existing full indexing behavior if index is missing, incompatible, or reconciliation failed
-      const treeRes = await window.electronAPI.readTree(normalizedRoot)
-      if (sessionId !== this.activeIndexingSession) {
-        // Workspace was switched while reading tree; discard result
-        this.queuedWatcherEventsDuringRestore = []
-        return
-      }
+      const buildSession = this.isProfilingEnabled && this.profiler
+        ? this.profiler.startSession('initializeWorkspaceIndex', normalizedRoot)
+        : null
 
-      if (!treeRes.success || !Array.isArray(treeRes.tree)) {
-        if (this.config.debug) {
-          console.debug(
-            `[SmartContextEngine] Failed to read workspace tree for "${normalizedRoot}": ${treeRes.error || 'Unknown error'}`
-          )
+      try {
+        const tTree0 = buildSession && typeof performance !== 'undefined' ? performance.now() : 0
+        const treeRes = await window.electronAPI.readTree(normalizedRoot)
+        if (buildSession && typeof performance !== 'undefined') {
+          buildSession.recordFsIpcTime(performance.now() - tTree0)
         }
-        // Failure path: clear any queued events from the failed restore/reconciliation session
-        this.queuedWatcherEventsDuringRestore = []
-        return
-      }
+        if (sessionId !== this.activeIndexingSession) {
+          // Workspace was switched while reading tree; discard result
+          this.queuedWatcherEventsDuringRestore = []
+          return
+        }
 
-      const treeEntries = treeRes.tree
-      const fileMetadataMap = this.extractFileMetadataMap(treeEntries, normalizedRoot)
-      const filePaths = Array.from(fileMetadataMap.keys())
+        if (!treeRes.success || !Array.isArray(treeRes.tree)) {
+          if (this.config.debug) {
+            console.debug(
+              `[SmartContextEngine] Failed to read workspace tree for "${normalizedRoot}": ${treeRes.error || 'Unknown error'}`
+            )
+          }
+          // Failure path: clear any queued events from the failed restore/reconciliation session
+          this.queuedWatcherEventsDuringRestore = []
+          return
+        }
 
-      if (filePaths.length === 0) {
-        // Only mark index fresh if readTree explicitly succeeded and confirmed the tree has no indexable files
-        if (sessionId === this.activeIndexingSession) {
+        const tMeta0 = buildSession && typeof performance !== 'undefined' ? performance.now() : 0
+        const treeEntries = treeRes.tree
+        const fileMetadataMap = this.extractFileMetadataMap(treeEntries, normalizedRoot)
+        const filePaths = Array.from(fileMetadataMap.keys())
+        if (buildSession && typeof performance !== 'undefined') {
+          buildSession.recordReconciliationTime(performance.now() - tMeta0)
+        }
+
+        if (filePaths.length === 0) {
+          // Only mark index fresh if readTree explicitly succeeded and confirmed the tree has no indexable files
+          if (sessionId === this.activeIndexingSession) {
+            this.indexedWorkspaceRoot = normalizedRoot
+            this.isIndexFresh = true
+            this.isIndexRestored = false
+            await this.replayQueuedWatcherEvents(sessionId)
+          } else {
+            this.queuedWatcherEventsDuringRestore = []
+          }
+          return
+        }
+
+        // Safe file reader through Electron API and ContextCache
+        const fileReader = async (relPath: string): Promise<string | null> => {
+          if (sessionId !== this.activeIndexingSession) return null
+
+          const cached = this.cache.get(relPath)
+          if (cached) return cached.content
+
+          const tRead0 = buildSession && typeof performance !== 'undefined' ? performance.now() : 0
+          const res = await window.electronAPI.readWorkspaceFile(normalizedRoot, relPath)
+          if (buildSession && typeof performance !== 'undefined') {
+            buildSession.recordFsIpcTime(performance.now() - tRead0)
+            buildSession.incrementFilesRead()
+          }
+          if (sessionId !== this.activeIndexingSession) return null
+
+          if (res.success && typeof res.content === 'string') {
+            this.cache.set(relPath, res.content)
+            return res.content
+          }
+          return null
+        }
+
+        const hooks: IndexingHooks | undefined = buildSession
+          ? {
+              onIndexFile: (_rel, durationMs) => {
+                buildSession.recordParsingHashingTime(durationMs)
+                buildSession.incrementFilesIndexed()
+              },
+              onYield: (durationMs) => {
+                buildSession.recordYieldTime(durationMs)
+              }
+            }
+          : undefined
+
+        // Build codebase index with metadata map for future fast-paths in bounded chunks
+        const buildOk = await this.codebaseIndex.buildIndex(
+          normalizedRoot,
+          filePaths,
+          fileReader,
+          fileMetadataMap,
+          () => sessionId !== this.activeIndexingSession || this.currentWorkspaceRoot !== normalizedRoot,
+          25,
+          hooks
+        )
+
+        // Only mark as successfully indexed if session and workspace root are still current
+        if (buildOk && sessionId === this.activeIndexingSession && this.currentWorkspaceRoot === normalizedRoot) {
           this.indexedWorkspaceRoot = normalizedRoot
+          this.restoredWorkspaceRoot = null
           this.isIndexFresh = true
           this.isIndexRestored = false
-          await this.replayQueuedWatcherEvents(sessionId)
-        } else {
-          this.queuedWatcherEventsDuringRestore = []
-        }
-        return
-      }
+          if (this.config.debug) {
+            console.debug(
+              `[SmartContextEngine] Background workspace indexing completed for "${normalizedRoot}".`
+            )
+          }
 
-      // Safe file reader through Electron API and ContextCache
-      const fileReader = async (relPath: string): Promise<string | null> => {
-        if (sessionId !== this.activeIndexingSession) return null
-
-        const cached = this.cache.get(relPath)
-        if (cached) return cached.content
-
-        const res = await window.electronAPI.readWorkspaceFile(normalizedRoot, relPath)
-        if (sessionId !== this.activeIndexingSession) return null
-
-        if (res.success && typeof res.content === 'string') {
-          this.cache.set(relPath, res.content)
-          return res.content
-        }
-        return null
-      }
-
-      // Build codebase index with metadata map for future fast-paths in bounded chunks
-      const buildOk = await this.codebaseIndex.buildIndex(
-        normalizedRoot,
-        filePaths,
-        fileReader,
-        fileMetadataMap,
-        () => sessionId !== this.activeIndexingSession || this.currentWorkspaceRoot !== normalizedRoot,
-        25
-      )
-
-      // Only mark as successfully indexed if session and workspace root are still current
-      if (buildOk && sessionId === this.activeIndexingSession && this.currentWorkspaceRoot === normalizedRoot) {
-        this.indexedWorkspaceRoot = normalizedRoot
-        this.restoredWorkspaceRoot = null
-        this.isIndexFresh = true
-        this.isIndexRestored = false
-        if (this.config.debug) {
-          console.debug(
-            `[SmartContextEngine] Background workspace indexing completed for "${normalizedRoot}".`
-          )
-        }
-
-        // Save index after successful full build
-        if (window.electronAPI.saveWorkspaceIndex) {
-          window.electronAPI
-            .saveWorkspaceIndex(normalizedRoot, this.codebaseIndex.serialize())
-            .catch((err) => {
+          // Save index after successful full build
+          if (window.electronAPI.saveWorkspaceIndex) {
+            const tSave0 = buildSession && typeof performance !== 'undefined' ? performance.now() : 0
+            try {
+              await window.electronAPI.saveWorkspaceIndex(
+                normalizedRoot,
+                this.codebaseIndex.serialize()
+              )
+              if (buildSession && typeof performance !== 'undefined') {
+                buildSession.recordFsIpcTime(performance.now() - tSave0)
+              }
+            } catch (err) {
               if (this.config.debug) {
                 console.debug('[SmartContextEngine] Failed to save persistent workspace index:', err)
               }
-            })
-        }
+            }
+          }
 
-        // Replay any queued watcher events from the reconciliation/build period so no file events are lost
-        await this.replayQueuedWatcherEvents(sessionId)
-      } else {
-        this.queuedWatcherEventsDuringRestore = []
-        if (sessionId === this.activeIndexingSession && this.currentWorkspaceRoot === normalizedRoot) {
-          this.codebaseIndex.clear()
+          // Replay any queued watcher events from the reconciliation/build period so no file events are lost
+          await this.replayQueuedWatcherEvents(sessionId)
+        } else {
+          this.queuedWatcherEventsDuringRestore = []
+          if (sessionId === this.activeIndexingSession && this.currentWorkspaceRoot === normalizedRoot) {
+            this.codebaseIndex.clear()
+          }
+        }
+      } finally {
+        if (buildSession) {
+          this.profiler?.recordCompletedSummary(buildSession.end())
         }
       }
     } catch (err: unknown) {
@@ -610,202 +690,284 @@ export class SmartContextEngine {
       return false
     }
 
-    // 1. Read current workspace tree and metadata from disk
-    const treeRes = await window.electronAPI.readTree(normalizedRoot)
-    if (sessionId !== this.activeIndexingSession) return false
-    if (!treeRes.success || !treeRes.tree) {
-      return false
-    }
+    const session = this.isProfilingEnabled && this.profiler
+      ? this.profiler.startSession('reconcileRestoredIndex', normalizedRoot)
+      : null
 
-    const diskFileMap = this.extractFileMetadataMap(treeRes.tree, normalizedRoot)
-    const diskPaths = Array.from(diskFileMap.keys())
-    const diskPathSet = new Set(diskPaths.map((p) => p.toLowerCase()))
+    try {
+      // 1. Read current workspace tree and metadata from disk
+      const tTree0 = session && typeof performance !== 'undefined' ? performance.now() : 0
+      const treeRes = await window.electronAPI.readTree(normalizedRoot)
+      if (session && typeof performance !== 'undefined') {
+        session.recordFsIpcTime(performance.now() - tTree0)
+      }
+      if (sessionId !== this.activeIndexingSession) return false
+      if (!treeRes.success || !treeRes.tree) {
+        return false
+      }
 
-    const indexedPaths = this.codebaseIndex.getAllFilePaths()
-    const indexedPathSet = new Set(indexedPaths.map((p) => p.toLowerCase()))
+      const tMeta0 = session && typeof performance !== 'undefined' ? performance.now() : 0
+      const diskFileMap = this.extractFileMetadataMap(treeRes.tree, normalizedRoot)
+      const diskPaths = Array.from(diskFileMap.keys())
+      const diskPathSet = new Set(diskPaths.map((p) => p.toLowerCase()))
 
-    let indexChanged = false
+      const indexedPaths = this.codebaseIndex.getAllFilePaths()
+      const indexedPathSet = new Set(indexedPaths.map((p) => p.toLowerCase()))
+      if (session && typeof performance !== 'undefined') {
+        session.recordReconciliationTime(performance.now() - tMeta0)
+      }
 
-    // 2. Identify & remove deleted files (files in index that no longer exist on disk)
-    let deletedCount = 0
-    for (const indexedPath of indexedPaths) {
-      if (sessionId !== this.activeIndexingSession || this.currentWorkspaceRoot !== normalizedRoot) return false
-      const lower = indexedPath.toLowerCase()
-      if (!diskPathSet.has(lower)) {
-        this.codebaseIndex.removeFile(indexedPath)
-        this.cache.invalidate(indexedPath)
-        this.deduplicator.invalidateFile(indexedPath)
-        this.dependencyAnalyzer.invalidateFile(indexedPath)
-        indexChanged = true
-        if (this.config.debug) {
-          console.debug(
-            `[SmartContextEngine] Reconcile: removed deleted file "${indexedPath}" from index`
-          )
-        }
-        deletedCount++
-        if (deletedCount % 25 === 0) {
-          await yieldToMain()
-          if (sessionId !== this.activeIndexingSession || this.currentWorkspaceRoot !== normalizedRoot) return false
+      let indexChanged = false
+
+      // 2. Identify & remove deleted files (files in index that no longer exist on disk)
+      let deletedCount = 0
+      for (const indexedPath of indexedPaths) {
+        if (sessionId !== this.activeIndexingSession || this.currentWorkspaceRoot !== normalizedRoot) return false
+        const lower = indexedPath.toLowerCase()
+        if (!diskPathSet.has(lower)) {
+          const tDel0 = session && typeof performance !== 'undefined' ? performance.now() : 0
+          this.codebaseIndex.removeFile(indexedPath)
+          this.cache.invalidate(indexedPath)
+          this.deduplicator.invalidateFile(indexedPath)
+          this.dependencyAnalyzer.invalidateFile(indexedPath)
+          if (session && typeof performance !== 'undefined') {
+            session.recordReconciliationTime(performance.now() - tDel0)
+          }
+          indexChanged = true
+          if (this.config.debug) {
+            console.debug(
+              `[SmartContextEngine] Reconcile: removed deleted file "${indexedPath}" from index`
+            )
+          }
+          deletedCount++
+          if (deletedCount % 25 === 0) {
+            const tYield0 = session && typeof performance !== 'undefined' ? performance.now() : 0
+            await yieldToMain()
+            if (session && typeof performance !== 'undefined') {
+              session.recordYieldTime(performance.now() - tYield0)
+            }
+            if (sessionId !== this.activeIndexingSession || this.currentWorkspaceRoot !== normalizedRoot) return false
+          }
         }
       }
-    }
 
-    // 3. Identify & index newly created files (files on disk not present in index)
-    let createdCount = 0
-    for (const diskPath of diskPaths) {
-      if (sessionId !== this.activeIndexingSession || this.currentWorkspaceRoot !== normalizedRoot) return false
-      const lower = diskPath.toLowerCase()
-      if (!indexedPathSet.has(lower)) {
+      // 3. Identify & index newly created files (files on disk not present in index)
+      let createdCount = 0
+      for (const diskPath of diskPaths) {
+        if (sessionId !== this.activeIndexingSession || this.currentWorkspaceRoot !== normalizedRoot) return false
+        const lower = diskPath.toLowerCase()
+        if (!indexedPathSet.has(lower)) {
+          try {
+            const tRead0 = session && typeof performance !== 'undefined' ? performance.now() : 0
+            const res = await window.electronAPI.readWorkspaceFile(normalizedRoot, diskPath)
+            if (session && typeof performance !== 'undefined') {
+              session.recordFsIpcTime(performance.now() - tRead0)
+              session.incrementFilesRead()
+            }
+            if (sessionId !== this.activeIndexingSession || this.currentWorkspaceRoot !== normalizedRoot) return false
+
+            if (res.success && typeof res.content === 'string') {
+              const meta = diskFileMap.get(diskPath)
+              this.cache.set(diskPath, res.content)
+              const tIdx0 = session && typeof performance !== 'undefined' ? performance.now() : 0
+              this.codebaseIndex.indexFile(
+                diskPath,
+                res.content,
+                diskPaths,
+                meta?.mtimeMs,
+                meta?.size ?? res.content.length
+              )
+              if (session && typeof performance !== 'undefined') {
+                session.recordParsingHashingTime(performance.now() - tIdx0)
+                session.incrementFilesIndexed()
+              }
+              indexChanged = true
+              if (this.config.debug) {
+                console.debug(
+                  `[SmartContextEngine] Reconcile: added new file "${diskPath}" to index`
+                )
+              }
+            }
+          } catch (err) {
+            if (this.config.debug) {
+              console.debug(`[SmartContextEngine] Failed reading new file "${diskPath}":`, err)
+            }
+          }
+          createdCount++
+          if (createdCount % 25 === 0) {
+            const tYield0 = session && typeof performance !== 'undefined' ? performance.now() : 0
+            await yieldToMain()
+            if (session && typeof performance !== 'undefined') {
+              session.recordYieldTime(performance.now() - tYield0)
+            }
+            if (sessionId !== this.activeIndexingSession || this.currentWorkspaceRoot !== normalizedRoot) return false
+          }
+        }
+      }
+
+      // 4. Verify freshness for common files
+      let freshnessCheckCount = 0
+      for (const relPath of diskPaths) {
+        if (sessionId !== this.activeIndexingSession || this.currentWorkspaceRoot !== normalizedRoot) return false
+        const lower = relPath.toLowerCase()
+        if (!indexedPathSet.has(lower)) {
+          // Handled above as new file
+          continue
+        }
+
+        const tFresh0 = session && typeof performance !== 'undefined' ? performance.now() : 0
+        const existingEntry = this.codebaseIndex.findFile(relPath)
+        if (!existingEntry) {
+          if (session && typeof performance !== 'undefined') {
+            session.recordReconciliationTime(performance.now() - tFresh0)
+          }
+          continue
+        }
+
+        const diskMeta = diskFileMap.get(relPath)
+
+        // Fast-path heuristic: If both size and mtimeMs exist and match exactly, file is unchanged.
+        const hasFastMeta =
+          diskMeta &&
+          typeof diskMeta.size === 'number' &&
+          typeof diskMeta.mtimeMs === 'number' &&
+          typeof existingEntry.mtimeMs === 'number'
+
+        const isFastMatch =
+          hasFastMeta &&
+          diskMeta.size === existingEntry.fileSize &&
+          diskMeta.mtimeMs === existingEntry.mtimeMs
+
+        if (isFastMatch) {
+          if (session && typeof performance !== 'undefined') {
+            session.recordReconciliationTime(performance.now() - tFresh0)
+          }
+          // Zero file-read overhead: file is verified fresh via metadata fast-path
+          freshnessCheckCount++
+          if (freshnessCheckCount % 50 === 0) {
+            const tYield0 = session && typeof performance !== 'undefined' ? performance.now() : 0
+            await yieldToMain()
+            if (session && typeof performance !== 'undefined') {
+              session.recordYieldTime(performance.now() - tYield0)
+            }
+            if (sessionId !== this.activeIndexingSession || this.currentWorkspaceRoot !== normalizedRoot) return false
+          }
+          continue
+        }
+
+        if (session && typeof performance !== 'undefined') {
+          session.recordReconciliationTime(performance.now() - tFresh0)
+        }
+
+        // Metadata changed or unavailable: read file to verify content hash
         try {
-          const res = await window.electronAPI.readWorkspaceFile(normalizedRoot, diskPath)
+          const tRead0 = session && typeof performance !== 'undefined' ? performance.now() : 0
+          const res = await window.electronAPI.readWorkspaceFile(normalizedRoot, relPath)
+          if (session && typeof performance !== 'undefined') {
+            session.recordFsIpcTime(performance.now() - tRead0)
+            session.incrementFilesRead()
+          }
           if (sessionId !== this.activeIndexingSession || this.currentWorkspaceRoot !== normalizedRoot) return false
 
-          if (res.success && typeof res.content === 'string') {
-            const meta = diskFileMap.get(diskPath)
-            this.cache.set(diskPath, res.content)
-            this.codebaseIndex.indexFile(
-              diskPath,
-              res.content,
-              diskPaths,
-              meta?.mtimeMs,
-              meta?.size ?? res.content.length
-            )
+          if (!res.success || typeof res.content !== 'string') {
+            // File failed to read: remove from index
+            const tRem0 = session && typeof performance !== 'undefined' ? performance.now() : 0
+            this.codebaseIndex.removeFile(relPath)
+            this.cache.invalidate(relPath)
+            this.deduplicator.invalidateFile(relPath)
+            this.dependencyAnalyzer.invalidateFile(relPath)
+            if (session && typeof performance !== 'undefined') {
+              session.recordReconciliationTime(performance.now() - tRem0)
+            }
             indexChanged = true
-            if (this.config.debug) {
-              console.debug(
-                `[SmartContextEngine] Reconcile: added new file "${diskPath}" to index`
+          } else {
+            const tHash0 = session && typeof performance !== 'undefined' ? performance.now() : 0
+            const currentHash = computeContentHash(res.content)
+            if (currentHash === existingEntry.contentHash) {
+              // Content hash is identical: update mtimeMs and fileSize without reparsing AST
+              this.codebaseIndex.updateFileMetadata(
+                relPath,
+                diskMeta?.mtimeMs,
+                diskMeta?.size ?? res.content.length
               )
+              if (session && typeof performance !== 'undefined') {
+                session.recordParsingHashingTime(performance.now() - tHash0)
+              }
+              this.cache.set(relPath, res.content)
+              indexChanged = true
+            } else {
+              // Content hash changed: full incremental AST re-parse and dependency update
+              this.cache.set(relPath, res.content)
+              this.deduplicator.invalidateFile(relPath)
+              this.dependencyAnalyzer.invalidateFile(relPath)
+              this.codebaseIndex.updateFile(
+                relPath,
+                res.content,
+                diskPaths,
+                diskMeta?.mtimeMs,
+                diskMeta?.size ?? res.content.length
+              )
+              if (session && typeof performance !== 'undefined') {
+                session.recordParsingHashingTime(performance.now() - tHash0)
+                session.incrementFilesIndexed()
+              }
+              indexChanged = true
+              if (this.config.debug) {
+                console.debug(
+                  `[SmartContextEngine] Reconcile: updated modified file "${relPath}" in index`
+                )
+              }
             }
           }
         } catch (err) {
           if (this.config.debug) {
-            console.debug(`[SmartContextEngine] Failed reading new file "${diskPath}":`, err)
+            console.debug(
+              `[SmartContextEngine] Error verifying freshness for "${relPath}":`,
+              err
+            )
           }
         }
-        createdCount++
-        if (createdCount % 25 === 0) {
-          await yieldToMain()
-          if (sessionId !== this.activeIndexingSession || this.currentWorkspaceRoot !== normalizedRoot) return false
-        }
-      }
-    }
 
-    // 4. Verify freshness for common files
-    let freshnessCheckCount = 0
-    for (const relPath of diskPaths) {
-      if (sessionId !== this.activeIndexingSession || this.currentWorkspaceRoot !== normalizedRoot) return false
-      const lower = relPath.toLowerCase()
-      if (!indexedPathSet.has(lower)) {
-        // Handled above as new file
-        continue
-      }
-
-      const existingEntry = this.codebaseIndex.findFile(relPath)
-      if (!existingEntry) continue
-
-      const diskMeta = diskFileMap.get(relPath)
-
-      // Fast-path heuristic: If both size and mtimeMs exist and match exactly, file is unchanged.
-      const hasFastMeta =
-        diskMeta &&
-        typeof diskMeta.size === 'number' &&
-        typeof diskMeta.mtimeMs === 'number' &&
-        typeof existingEntry.mtimeMs === 'number'
-
-      const isFastMatch =
-        hasFastMeta &&
-        diskMeta.size === existingEntry.fileSize &&
-        diskMeta.mtimeMs === existingEntry.mtimeMs
-
-      if (isFastMatch) {
-        // Zero file-read overhead: file is verified fresh via metadata fast-path
         freshnessCheckCount++
         if (freshnessCheckCount % 50 === 0) {
+          const tYield0 = session && typeof performance !== 'undefined' ? performance.now() : 0
           await yieldToMain()
+          if (session && typeof performance !== 'undefined') {
+            session.recordYieldTime(performance.now() - tYield0)
+          }
           if (sessionId !== this.activeIndexingSession || this.currentWorkspaceRoot !== normalizedRoot) return false
         }
-        continue
       }
 
-      // Metadata changed or unavailable: read file to verify content hash
-      try {
-        const res = await window.electronAPI.readWorkspaceFile(normalizedRoot, relPath)
-        if (sessionId !== this.activeIndexingSession || this.currentWorkspaceRoot !== normalizedRoot) return false
-
-        if (!res.success || typeof res.content !== 'string') {
-          // File failed to read: remove from index
-          this.codebaseIndex.removeFile(relPath)
-          this.cache.invalidate(relPath)
-          this.deduplicator.invalidateFile(relPath)
-          this.dependencyAnalyzer.invalidateFile(relPath)
-          indexChanged = true
-        } else {
-          const currentHash = computeContentHash(res.content)
-          if (currentHash === existingEntry.contentHash) {
-            // Content hash is identical: update mtimeMs and fileSize without reparsing AST
-            this.codebaseIndex.updateFileMetadata(
-              relPath,
-              diskMeta?.mtimeMs,
-              diskMeta?.size ?? res.content.length
-            )
-            this.cache.set(relPath, res.content)
-            indexChanged = true
-          } else {
-            // Content hash changed: full incremental AST re-parse and dependency update
-            this.cache.set(relPath, res.content)
-            this.deduplicator.invalidateFile(relPath)
-            this.dependencyAnalyzer.invalidateFile(relPath)
-            this.codebaseIndex.updateFile(
-              relPath,
-              res.content,
-              diskPaths,
-              diskMeta?.mtimeMs,
-              diskMeta?.size ?? res.content.length
-            )
-            indexChanged = true
-            if (this.config.debug) {
-              console.debug(
-                `[SmartContextEngine] Reconcile: updated modified file "${relPath}" in index`
-              )
-            }
+      // 5. If index changed during reconciliation, persist updated index
+      if (
+        indexChanged &&
+        window.electronAPI.saveWorkspaceIndex &&
+        sessionId === this.activeIndexingSession &&
+        this.currentWorkspaceRoot === normalizedRoot
+      ) {
+        try {
+          const tSave0 = session && typeof performance !== 'undefined' ? performance.now() : 0
+          await window.electronAPI.saveWorkspaceIndex(
+            normalizedRoot,
+            this.codebaseIndex.serialize()
+          )
+          if (session && typeof performance !== 'undefined') {
+            session.recordFsIpcTime(performance.now() - tSave0)
+          }
+        } catch (err) {
+          if (this.config.debug) {
+            console.debug('[SmartContextEngine] Error saving reconciled index:', err)
           }
         }
-      } catch (err) {
-        if (this.config.debug) {
-          console.debug(
-            `[SmartContextEngine] Error verifying freshness for "${relPath}":`,
-            err
-          )
-        }
       }
 
-      freshnessCheckCount++
-      if (freshnessCheckCount % 50 === 0) {
-        await yieldToMain()
-        if (sessionId !== this.activeIndexingSession || this.currentWorkspaceRoot !== normalizedRoot) return false
+      return sessionId === this.activeIndexingSession && this.currentWorkspaceRoot === normalizedRoot
+    } finally {
+      if (session) {
+        this.profiler?.recordCompletedSummary(session.end())
       }
     }
-
-    // 5. If index changed during reconciliation, persist updated index
-    if (
-      indexChanged &&
-      window.electronAPI.saveWorkspaceIndex &&
-      sessionId === this.activeIndexingSession &&
-      this.currentWorkspaceRoot === normalizedRoot
-    ) {
-      try {
-        await window.electronAPI.saveWorkspaceIndex(
-          normalizedRoot,
-          this.codebaseIndex.serialize()
-        )
-      } catch (err) {
-        if (this.config.debug) {
-          console.debug('[SmartContextEngine] Error saving reconciled index:', err)
-        }
-      }
-    }
-
-    return sessionId === this.activeIndexingSession && this.currentWorkspaceRoot === normalizedRoot
   }
 
   /**
@@ -929,6 +1091,12 @@ export class SmartContextEngine {
 
     if (!cleanRel || cleanRel.startsWith('..') || cleanRel.includes('/../')) return
 
+    const pathParts = cleanRel.split('/')
+    if (pathParts.some((part) => IGNORED_DIRS.has(part))) return
+
+    const ext = cleanRel.split('.').pop()?.toLowerCase() || ''
+    if (BINARY_AND_ASSET_EXTS.has(ext)) return
+
     this.recordSelfModified(cleanRel)
     this.cache.set(cleanRel, content)
     this.deduplicator.invalidateFile(cleanRel)
@@ -974,6 +1142,18 @@ export class SmartContextEngine {
       if (this.config.debug) {
         console.debug(`[SmartContextEngine] Rejected path traversal event for "${event.relativePath}"`)
       }
+      return
+    }
+
+    // Filter out ignored directories (e.g. scratch, .git, node_modules)
+    const pathParts = cleanRel.split('/')
+    if (pathParts.some((part) => IGNORED_DIRS.has(part))) {
+      return
+    }
+
+    // Filter out binary/asset/cache extensions (e.g. .tsbuildinfo, .png)
+    const ext = cleanRel.split('.').pop()?.toLowerCase() || ''
+    if (BINARY_AND_ASSET_EXTS.has(ext)) {
       return
     }
 
@@ -1262,7 +1442,7 @@ export class SmartContextEngine {
   extractRelativePaths(
     entries: FileEntry[],
     rootPath: string,
-    maxDepth = 6,
+    maxDepth = 8,
     currentDepth = 0
   ): string[] {
     return Array.from(this.extractFileMetadataMap(entries, rootPath, maxDepth, currentDepth).keys())
@@ -1275,7 +1455,7 @@ export class SmartContextEngine {
   extractFileMetadataMap(
     entries: FileEntry[],
     rootPath: string,
-    maxDepth = 6,
+    maxDepth = 8,
     currentDepth = 0,
     accumulator: Map<string, { size?: number; mtimeMs?: number }> = new Map()
   ): Map<string, { size?: number; mtimeMs?: number }> {
@@ -1509,14 +1689,6 @@ export class SmartContextEngine {
     return candidates.slice(0, this.config.maxCandidates)
   }
 
-  /**
-   * Resolves smart project context:
-   * 1. Checks intent and workspace change.
-   * 2. Ranks candidate files.
-   * 3. Reads files using ContextCache with content hashing and smart refresh.
-   * 4. Allocates budget using ContextBudgetManager.
-   * 5. Deduplicates active context via ContextDeduplicator.
-   */
   async resolveContext(
     prompt: string,
     workspaceRoot: string | null
