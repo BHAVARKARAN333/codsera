@@ -1480,8 +1480,8 @@ export class SmartContextEngine {
 
     // 4. Pure general programming questions without project scope
     const generalConceptQuestions = [
-      /^(what is|what are|explain|describe|define)\s+(python|javascript|typescript|rust|c\+\+|java|go|recursion|binary search|quicksort|rest api|graphql|sql|nosql|docker|kubernetes|oauth|jwt|http|https|css|html|polymorphism|encapsulation|inheritance|solid principles|git|react|vue|angular)\b[?.]*$/i,
-      /^(how does|how do)\s+(recursion|binary search|quicksort|https|http|garbage collection|event loop|async\/await|dns|tcp|udp)\s+(work|function)\b[?.]*$/i,
+      /^(what is|what are|explain|describe|define)\s+(python|javascript|typescript|rust|c\+\+|java|go|recursion|binary search|quicksort|rest api|graphql|sql|nosql|docker|kubernetes|oauth|jwt|http|https|css|html|polymorphism|encapsulation|inheritance|solid principles|git|react|vue|angular)\b/i,
+      /^(how does|how do)\s+(recursion|binary search|quicksort|https|http|garbage collection|event loop|async\/await|dns|tcp|udp)\s+(work|function)\b/i,
       /^(write|show|give me)\s+an?\s+(example of|sample of|simple)\s+(recursion|binary search|quicksort|fibonacci|hello world)\b/i
     ]
 
@@ -1491,7 +1491,35 @@ export class SmartContextEngine {
       }
     }
 
-    // 5. Default heuristic for queries asking about code implementations
+    // 5. Project-specific code-flow, architecture, and relevant-file intent patterns
+    const codeFlowPatterns = [
+      /\b(?:request|data|code|control|execution|message|event)\s+flows?\b/i,
+      /\bflows?\s+from\s+.+\s+(?:to|through)\b/i,
+      /\bflows?\s+through\s+(?:the\s+)?(?:system|app|codebase|project|chat|ui|orchestrator|provider|renderer|preload|main|indexer|pipeline|middleware|bridge)\b/i,
+      /\bhow\s+(?:do|does\s+)?(?:the\s+|an?\s+)?(?:ai\s+)?(?:requests?|messages?|data|events?|commands?|calls?)\s+flows?\b/i,
+      /\btrace\s+(?:the\s+)?(?:code|request|data|execution|call)\s+flow\b/i
+    ]
+
+    for (const pattern of codeFlowPatterns) {
+      if (pattern.test(trimmed)) {
+        return { required: true, reason: 'Prompt asks about project code or request flow.' }
+      }
+    }
+
+    const relevantFilesPatterns = [
+      /\b(?:relevant|related|involved|affected)\s+files?\b/i,
+      /\bfiles?\s+(?:are\s+)?(?:relevant|related|involved|affected)\b/i,
+      /\b(?:identify|find|list|show|locate)\s+(?:the\s+)?(?:relevant\s+|related\s+)?files?\b/i,
+      /\bwhich\s+files\b/i
+    ]
+
+    for (const pattern of relevantFilesPatterns) {
+      if (pattern.test(trimmed)) {
+        return { required: true, reason: 'Prompt asks to identify relevant project files.' }
+      }
+    }
+
+    // 6. Default heuristic for queries asking about code implementations
     const implementationWords = [
       'implement',
       'architecture',
@@ -1504,7 +1532,16 @@ export class SmartContextEngine {
       'save',
       'terminal',
       'editor',
-      'settings'
+      'settings',
+      'orchestrator',
+      'provider',
+      'indexer',
+      'watcher',
+      'pipeline',
+      'lifecycle',
+      'smartcontext',
+      'codebase index',
+      'chat ui'
     ]
     const hasImplementationWord = implementationWords.some((w) => lower.includes(w))
 
@@ -1583,7 +1620,9 @@ export class SmartContextEngine {
    * Tokenizes a text into meaningful lowercase words (splitting camelCase, kebab-case, snake_case).
    */
   tokenize(text: string): string[] {
-    const splitCamel = text.replace(/([a-z])([A-Z])/g, '$1 $2')
+    const splitCamel = text
+      .replace(/([a-z\d])([A-Z])/g, '$1 $2')
+      .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
     const words = splitCamel.toLowerCase().split(/[^a-z0-9_.-]+/)
     const cleanTokens: string[] = []
 
@@ -1623,6 +1662,8 @@ export class SmartContextEngine {
     const isConfigIntent =
       /\b(config|dependency|dependencies|package|build|vite|tsconfig|typescript)\b/i.test(prompt)
     const isTestIntent = /\b(test|tests|spec|verify|verification)\b/i.test(prompt)
+    const isAiFlowIntent =
+      /\b(ai|chat|orchestrator|provider|opencode|gemini|openrouter|nvidia|agent|flow|flows)\b/i.test(prompt)
 
     for (const relPath of filePaths) {
       const normalizedPath = relPath.replace(/\\/g, '/')
@@ -1651,6 +1692,7 @@ export class SmartContextEngine {
         }
       }
 
+      const baseName = fileName.replace(/\.[a-zA-Z0-9]+$/, '')
       if (promptLower.includes(pathLower)) {
         score += 800
         isExplicit = true
@@ -1658,18 +1700,24 @@ export class SmartContextEngine {
       } else if (promptLower.includes(fileName)) {
         score += 300
         reasons.push(`File name "${fileName}" appears in prompt`)
+      } else if (baseName.length >= 4 && promptLower.includes(baseName)) {
+        score += 250
+        reasons.push(`File base name "${baseName}" appears in prompt`)
       }
 
       // 2. Token overlap
       let matchingTokens = 0
       for (const token of fileTokens) {
-        if (promptTokenSet.has(token)) {
+        if (promptTokenSet.has(token) || (token.length >= 4 && promptLower.includes(token))) {
           matchingTokens++
           score += 60
         }
       }
       for (const token of pathTokens) {
-        if (!fileTokens.includes(token) && promptTokenSet.has(token)) {
+        if (
+          !fileTokens.includes(token) &&
+          (promptTokenSet.has(token) || (token.length >= 4 && promptLower.includes(token)))
+        ) {
           matchingTokens++
           score += 25
         }
@@ -1749,6 +1797,22 @@ export class SmartContextEngine {
         ) {
           score += 100
           reasons.push('Test / verification file')
+        }
+      }
+
+      if (isAiFlowIntent) {
+        if (
+          pathLower.includes('orchestrator') ||
+          pathLower.includes('provider') ||
+          pathLower.includes('aichat') ||
+          pathLower.includes('smartcontext')
+        ) {
+          score += 150
+          reasons.push('Matches AI / chat orchestrator / provider domain')
+        }
+        if (promptLower.includes('opencode') && pathLower.includes('opencode')) {
+          score += 100
+          reasons.push('Matches specified OpenCode provider')
         }
       }
 

@@ -38,6 +38,22 @@ const mockDiskFiles = new Map([
     fs.readFileSync('src/renderer/src/services/agent/orchestrator.ts', 'utf8')
   ],
   [
+    'src/renderer/src/services/ai/opencodeProvider.ts',
+    fs.readFileSync('src/renderer/src/services/ai/opencodeProvider.ts', 'utf8')
+  ],
+  [
+    'src/renderer/src/services/ai/openRouterProvider.ts',
+    fs.readFileSync('src/renderer/src/services/ai/openRouterProvider.ts', 'utf8')
+  ],
+  [
+    'src/renderer/src/services/ai/geminiProvider.ts',
+    fs.readFileSync('src/renderer/src/services/ai/geminiProvider.ts', 'utf8')
+  ],
+  [
+    'src/renderer/src/components/AIChatPanel.tsx',
+    fs.readFileSync('src/renderer/src/components/AIChatPanel.tsx', 'utf8')
+  ],
+  [
     'src/renderer/src/App.tsx',
     fs.readFileSync('src/renderer/src/App.tsx', 'utf8')
   ],
@@ -80,23 +96,13 @@ console.log('===========================================================')
 
 const engine = new SmartContextEngine()
 
-// TEST 1: The exact user prompt that previously failed in live testing:
-console.log('\n[Test 1] Exact user prompt on production SmartContextEngine:')
+// TEST 1: The exact user prompt for single file isolation
+console.log('\n[Test 1] Explicit single-file isolation on production SmartContextEngine:')
 const exactPrompt = 'Explain only the file `src/renderer/src/services/agent/smartContextEngine.ts`. Do not inspect, read, or use any other project file. Do not modify any files.'
 console.log(`Prompt: "${exactPrompt}"`)
 
 const res1 = await engine.resolveContext(exactPrompt, workspaceRoot)
 const diag1 = engine.getLastDiagnostics()
-
-console.log('\nDiagnostics returned by production engine:')
-console.log('- required:', diag1.required)
-console.log('- selectedFiles count:', diag1.selectedFiles.length, diag1.selectedFiles.map(f => f.path))
-console.log('- readFiles count:', diag1.readFiles.length, diag1.readFiles.map(f => f.path))
-console.log('- formattedContextFileList:', diag1.formattedContextFileList)
-console.log('- dependencyGraph:', res1.dependencyGraph)
-console.log('- dependencyGraphs count:', res1.dependencyGraphs?.length)
-console.log('- symbolReferences count:', res1.symbolReferences?.length)
-console.log('- projectSummary:', res1.projectSummary)
 
 assert.strictEqual(diag1.required, true, 'required should be true')
 assert.strictEqual(diag1.selectedFiles.length, 1, 'selectedFiles count must be exactly 1')
@@ -118,7 +124,7 @@ assert.ok(!res1.formattedContext.includes('--- File: src/renderer/src/App.tsx --
 assert.ok(!res1.formattedContext.includes('[Dependency Graph & Impact Analysis]'))
 assert.ok(!res1.formattedContext.includes('[Symbol References]'))
 
-console.log('✓ PASS: Production SmartContextEngine selects and reads strictly 1 file for the exact prompt!')
+console.log('✓ PASS: Production SmartContextEngine selects and reads strictly 1 file for explicit single-file request!')
 
 // TEST 2: Missing explicit single file does not trigger fallback reads
 console.log('\n[Test 2] Missing explicit single file on production SmartContextEngine:')
@@ -126,9 +132,6 @@ const missingPrompt = 'Explain only the file `src/nonexistent/fakeFile.ts`. Do n
 const res2 = await engine.resolveContext(missingPrompt, workspaceRoot)
 const diag2 = engine.getLastDiagnostics()
 
-console.log('- selectedFiles count:', diag2.selectedFiles.length)
-console.log('- readFiles count:', diag2.readFiles.length)
-console.log('- formattedContextFileList:', diag2.formattedContextFileList)
 assert.strictEqual(diag2.selectedFiles.length, 0, 'Missing file must select 0 files')
 assert.strictEqual(diag2.readFiles.length, 0, 'Missing file must read 0 files')
 assert.strictEqual(diag2.formattedContextFileList.length, 0, 'Missing file formattedContextFileList must be empty')
@@ -143,15 +146,84 @@ const normalPrompt = 'Explain the architecture, dependencies, and configuration 
 const res3 = await engine.resolveContext(normalPrompt, workspaceRoot)
 const diag3 = engine.getLastDiagnostics()
 
-console.log('- selectedFiles count:', diag3.selectedFiles.length)
-console.log('- readFiles count:', diag3.readFiles.length)
-console.log('- formattedContextFileList count:', diag3.formattedContextFileList.length)
 assert.ok(diag3.selectedFiles.length > 1, 'Normal query must select multiple candidates')
 assert.ok(diag3.readFiles.length > 1, 'Normal query must read multiple candidates')
 assert.ok(diag3.formattedContextFileList.length > 1)
 assert.ok(res3.formattedContext.includes('[Dependency Graph & Impact Analysis]'))
 
 console.log('✓ PASS: Normal queries retain multi-file selection and dependency enrichment!')
+
+// TEST 4: The exact failing AI request flow prompt
+console.log('\n[Test 4] Exact failing AI request flow prompt on production SmartContextEngine:')
+const flowPrompt = 'Explain how the AI request flows from the chat UI through the orchestrator to the OpenCode provider. Identify the relevant files.'
+console.log(`Prompt: "${flowPrompt}"`)
+const res4 = await engine.resolveContext(flowPrompt, workspaceRoot)
+const diag4 = engine.getLastDiagnostics()
+
+console.log('- required:', diag4.required)
+console.log('- reason:', diag4.reason)
+console.log('- selectedFiles:', diag4.selectedFiles.map(f => `${f.path} (score: ${f.score})`))
+console.log('- readFiles:', diag4.readFiles.map(f => `${f.path} (source: ${f.source})`))
+console.log('- formattedContextFileList:', diag4.formattedContextFileList)
+
+assert.strictEqual(diag4.required, true, 'Request flow prompt must require project context')
+assert.ok(diag4.selectedFiles.length >= 3, 'Must select multiple relevant candidates')
+assert.ok(diag4.readFiles.length >= 3, 'Must read multiple relevant candidates')
+assert.ok(diag4.formattedContextFileList.some(p => p.includes('orchestrator')), 'Must include orchestrator.ts in context')
+assert.ok(diag4.formattedContextFileList.some(p => p.includes('AIChatPanel')), 'Must include AIChatPanel.tsx in context')
+assert.ok(diag4.formattedContextFileList.some(p => p.includes('opencodeProvider')), 'Must include opencodeProvider.ts in context')
+
+console.log('✓ PASS: Exact AI request flow prompt resolves required=true and pre-injects orchestrator, AIChatPanel, and opencodeProvider!')
+
+// TEST 5: Similar architecture/code-flow prompts
+console.log('\n[Test 5] Similar architecture and code-flow prompts:')
+const codeFlowPrompts = [
+  'How does data flow from the editor to the language server?',
+  'Trace the request flow from chat UI through orchestrator to provider',
+  'Explain how the orchestrator coordinates tool calls and streaming responses',
+  'Which files are relevant to provider switching and settings persistence?',
+  'Which files are relevant to authentication?',
+  'Identify the relevant files for codebase indexing and file watching',
+  'How does the indexer process file change events?',
+  'Show the code flow between orchestrator and smartContextEngine',
+  'How do AI requests flow through the system?',
+  'Trace the execution flow of runCommand tool'
+]
+
+for (const p of codeFlowPrompts) {
+  const intent = engine.isProjectContextRequired(p, workspaceRoot)
+  console.log(`  "${p.slice(0, 48)}...": required=${intent.required} (${intent.reason})`)
+  assert.strictEqual(intent.required, true, `Prompt "${p}" must require project context`)
+}
+console.log('✓ PASS: All 10 architecture and code-flow prompts correctly require project context!')
+
+// TEST 6: General questions MUST NOT require project context
+console.log('\n[Test 6] General knowledge questions without project context:')
+const generalPrompts = [
+  'What is Python?',
+  'What is Python? Explain in two simple sentences.',
+  'Explain recursion with an example.',
+  'How does quicksort work?',
+  'What is Docker?',
+  'What is a binary search tree?',
+  'How does https work?',
+  'Write a simple hello world in Rust',
+  'Tell me a joke',
+  'Hi, how are you?'
+]
+
+for (const p of generalPrompts) {
+  const intent = engine.isProjectContextRequired(p, workspaceRoot)
+  console.log(`  "${p}": required=${intent.required} (${intent.reason})`)
+  assert.strictEqual(intent.required, false, `General prompt "${p}" must NOT require project context`)
+  const fullRes = await engine.resolveContext(p, workspaceRoot)
+  const fullDiag = engine.getLastDiagnostics()
+  assert.strictEqual(fullDiag.required, false)
+  assert.strictEqual(fullDiag.selectedFiles.length, 0)
+  assert.strictEqual(fullDiag.readFiles.length, 0)
+  assert.strictEqual(fullDiag.formattedContextFileList.length, 0)
+}
+console.log('✓ PASS: All 10 general questions correctly return required=false with 0 files selected/read!')
 
 // Clean up temp bundle
 try {
