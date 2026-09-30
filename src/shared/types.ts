@@ -141,6 +141,7 @@ export interface NvidiaChatCompletionRequest {
   tool_choice?: 'auto' | 'none'
   apiKey?: string
   timeoutMs?: number
+  requestId?: string
 }
 
 export interface NvidiaChatCompletionResponse {
@@ -167,6 +168,7 @@ export interface NvidiaChatCompletionResponse {
   errorDetails?: string
   isNetworkError?: boolean
   stage?: string
+  retryAfter?: string | number | null
 }
 
 export interface NvidiaModelItem {
@@ -249,6 +251,7 @@ export interface OpenCodeChatCompletionResponse {
   error?: string
   errorDetails?: string
   isNetworkError?: boolean
+  retryAfter?: string | number | null
 }
 
 export interface OpenCodeModelItem {
@@ -338,6 +341,9 @@ export interface IElectronAPI {
   onOpenCodeStreamChunk: (
     callback: (event: OpenCodeStreamChunkEvent) => void
   ) => () => void
+  cancelChatCompletion: (
+    requestId: string
+  ) => Promise<{ success: boolean; canceled?: boolean }>
   saveWorkspaceIndex: (
     workspaceRoot: string,
     data: unknown
@@ -394,5 +400,6 @@ export const IPC_CHANNELS = {
   NVIDIA_LIST_MODELS: 'ai:nvidiaListModels',
   OPENCODE_CHAT_COMPLETION: 'ai:opencodeChatCompletion',
   OPENCODE_LIST_MODELS: 'ai:opencodeListModels',
-  OPENCODE_STREAM_CHUNK: 'ai:opencodeStreamChunk'
+  OPENCODE_STREAM_CHUNK: 'ai:opencodeStreamChunk',
+  CANCEL_CHAT_COMPLETION: 'ai:cancelChatCompletion'
 } as const

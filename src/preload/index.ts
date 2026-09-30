@@ -114,6 +114,9 @@ const api: IElectronAPI = {
       ipcRenderer.removeListener(IPC_CHANNELS.OPENCODE_STREAM_CHUNK, listener)
     }
   },
+  cancelChatCompletion: (requestId: string) => {
+    return ipcRenderer.invoke(IPC_CHANNELS.CANCEL_CHAT_COMPLETION, requestId)
+  },
   saveWorkspaceIndex: (workspaceRoot: string, data: unknown) => {
     return ipcRenderer.invoke(IPC_CHANNELS.SAVE_WORKSPACE_INDEX, workspaceRoot, data)
   },

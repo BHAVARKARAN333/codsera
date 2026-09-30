@@ -1,109 +1,41 @@
 import {
+  FunctionCallPart,
   FunctionDeclaration,
   IAIProvider,
   LLMMessage,
   LLMPart,
   LLMRequestOptions,
-  LLMResponse
+  LLMResponse,
+  ProviderCapabilities
 } from './types'
+import {
+  calculateRetryDelay,
+  classifyProviderError
+} from './providerUtils'
 
-export class GeminiProvider implements IAIProvider {
-  readonly id = 'gemini'
-  readonly name = 'Google Gemini'
+export interface GeminiProviderConfig {
+  defaultModel?: string
+  defaultTimeoutMs?: number
+  fetchImpl?: typeof fetch
+}
 
-  private defaultModel = 'gemini-3.8-flash'
-  private defaultTimeoutMs = 30000 // 30 seconds
+/**
+ * Formats LLMMessage array into Gemini's distinct contents schema.
+ * Merges consecutive turns of the same role (e.g. multiple tool responses)
+ * into a single turn to strictly uphold Gemini's alternating user/model contract.
+ */
+export function formatGeminiContents(
+  messages: LLMMessage[]
+): Array<{ role: 'user' | 'model'; parts: Record<string, unknown>[] }> {
+  const formattedContents: Array<{ role: 'user' | 'model'; parts: Record<string, unknown>[] }> = []
 
-  private isRetryableError(status: number, message: string): boolean {
-    // Retryable HTTP status codes
-    if (status === 429 || status === 500 || status === 502 || status === 503 || status === 504) {
-      return true
-    }
+  for (const msg of messages) {
+    if (!msg || typeof msg !== 'object') continue
+    const parts: Record<string, unknown>[] = []
 
-    // Temporary overload or network failure keywords
-    const lower = message.toLowerCase()
-    if (
-      lower.includes('high demand') ||
-      lower.includes('temporarily unavailable') ||
-      lower.includes('resource_exhausted') ||
-      lower.includes('overloaded') ||
-      lower.includes('try again') ||
-      lower.includes('rate limit') ||
-      lower.includes('timed out') ||
-      lower.includes('timeout')
-    ) {
-      return true
-    }
-
-    return false
-  }
-
-  private formatUserFriendlyError(status: number, rawMessage: string): string {
-    if (
-      status === 400 &&
-      (rawMessage.toLowerCase().includes('api_key') ||
-        rawMessage.toLowerCase().includes('key not valid'))
-    ) {
-      return 'Invalid Gemini API key. Please check your key in Settings.'
-    }
-    if (
-      status === 401 ||
-      status === 403 ||
-      rawMessage.toLowerCase().includes('api key') ||
-      rawMessage.toLowerCase().includes('unauthorized')
-    ) {
-      return 'Invalid Gemini API key. Please check your key in Settings.'
-    }
-    if (
-      status === 404 ||
-      rawMessage.toLowerCase().includes('not found') ||
-      rawMessage.toLowerCase().includes('is not available')
-    ) {
-      return 'The selected AI model (gemini-3.8-flash) is currently unavailable.'
-    }
-    if (
-      status === 429 ||
-      rawMessage.toLowerCase().includes('resource_exhausted') ||
-      rawMessage.toLowerCase().includes('rate limit')
-    ) {
-      return 'Gemini rate limit reached or model is under high demand. Please try again shortly.'
-    }
-    if (rawMessage.toLowerCase().includes('timed out') || rawMessage.toLowerCase().includes('abort')) {
-      return 'Request timed out after 30s. The Gemini service may be experiencing high load.'
-    }
-    return (
-      rawMessage.replace(/^Gemini API error:\s*/i, '').trim() ||
-      'The AI provider is temporarily unavailable. Please try again.'
-    )
-  }
-
-  async sendMessage(
-    messages: LLMMessage[],
-    tools: FunctionDeclaration[],
-    options: LLMRequestOptions
-  ): Promise<LLMResponse> {
-    const {
-      apiKey,
-      modelName = this.defaultModel,
-      systemInstruction,
-      temperature = 0.2,
-      timeoutMs = this.defaultTimeoutMs,
-      onRetry
-    } = options
-
-    if (!apiKey || apiKey.trim() === '') {
-      throw new Error('Gemini API key is not configured. Please provide a valid API key.')
-    }
-
-    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${modelName}:generateContent?key=${encodeURIComponent(
-      apiKey.trim()
-    )}`
-
-    // Format messages for Gemini API, strictly adhering to Gemini's Part schema
-    const formattedContents = messages.map((msg) => {
-      const parts: Record<string, unknown>[] = []
-
+    if (Array.isArray(msg.parts)) {
       for (const part of msg.parts) {
+        if (!part || typeof part !== 'object') continue
         const raw = part as Record<string, unknown>
 
         if (part.functionResponse) {
@@ -153,11 +85,112 @@ export class GeminiProvider implements IAIProvider {
           }
         }
       }
+    }
 
-      // Gemini maps 'function' role to 'user' in v1beta multi-turn chat format
-      const role = msg.role === 'function' ? 'user' : msg.role
-      return { role, parts }
+    if (parts.length === 0) continue
+
+    // Gemini v1beta multi-turn format requires 'user' or 'model' roles
+    const role: 'user' | 'model' = msg.role === 'function' || msg.role === 'user' ? 'user' : 'model'
+
+    // Strictly enforce alternating turns: merge consecutive parts into existing turn
+    if (formattedContents.length > 0 && formattedContents[formattedContents.length - 1].role === role) {
+      formattedContents[formattedContents.length - 1].parts.push(...parts)
+    } else {
+      formattedContents.push({ role, parts })
+    }
+  }
+
+  return formattedContents
+}
+
+export class GeminiProvider implements IAIProvider {
+  readonly id = 'gemini'
+  readonly name = 'Google Gemini'
+  readonly capabilities: ProviderCapabilities = {
+    supportsStreaming: true,
+    supportsTools: true,
+    requiresApiKey: true,
+    supportsModelListing: false
+  }
+
+  private defaultModel = 'gemini-3.8-flash'
+  private defaultTimeoutMs = 30000 // 30 seconds
+  private fetchImpl?: typeof fetch
+
+  constructor(config?: GeminiProviderConfig) {
+    if (config?.defaultModel) this.defaultModel = config.defaultModel
+    if (config?.defaultTimeoutMs) this.defaultTimeoutMs = config.defaultTimeoutMs
+    if (config?.fetchImpl) this.fetchImpl = config.fetchImpl
+  }
+
+  isRetryableError(status: number, message: string): boolean {
+    return classifyProviderError(new Error(message), {
+      status,
+      providerName: this.name
+    }).isRetryable
+  }
+
+  formatUserFriendlyError(status: number, rawMessage: string): string {
+    return classifyProviderError(new Error(rawMessage), {
+      status,
+      providerName: this.name,
+      modelName: this.defaultModel
+    }).userFriendlyMessage
+  }
+
+  /**
+   * Cancellable delay that aborts immediately if the signal fires during the sleep.
+   */
+  private async cancellableSleep(delayMs: number, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) {
+      throw new Error('Request was stopped by user.')
+    }
+    return new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        cleanup()
+        resolve()
+      }, delayMs)
+
+      const onAbort = () => {
+        cleanup()
+        reject(new Error('Request was stopped by user.'))
+      }
+
+      const cleanup = () => {
+        clearTimeout(timer)
+        signal?.removeEventListener('abort', onAbort)
+      }
+
+      signal?.addEventListener('abort', onAbort, { once: true })
     })
+  }
+
+  async sendMessage(
+    messages: LLMMessage[],
+    tools: FunctionDeclaration[],
+    options: LLMRequestOptions
+  ): Promise<LLMResponse> {
+    const {
+      apiKey,
+      modelName = this.defaultModel,
+      systemInstruction,
+      temperature = 0.2,
+      timeoutMs = this.defaultTimeoutMs,
+      signal,
+      onChunk,
+      onRetry
+    } = options
+
+    // Check cancellation before initiating work
+    if (signal?.aborted) {
+      throw new Error('Request was stopped by user.')
+    }
+
+    if (!apiKey || apiKey.trim() === '') {
+      throw new Error('Gemini API key is not configured. Please provide a valid API key.')
+    }
+
+    const formattedContents = formatGeminiContents(messages)
 
     const requestBody: Record<string, unknown> = {
       contents: formattedContents,
@@ -180,15 +213,39 @@ export class GeminiProvider implements IAIProvider {
       ]
     }
 
+    const isStreaming = typeof onChunk === 'function'
+    const endpointAction = isStreaming ? 'streamGenerateContent?alt=sse&' : 'generateContent?'
+    const endpoint = `https://generativelanguage.googleapis.com/v1beta/models/${encodeURIComponent(
+      modelName
+    )}:${endpointAction}key=${encodeURIComponent(apiKey.trim())}`
+
     const MAX_RETRIES = 2
     let lastError: Error | null = null
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      if (signal?.aborted) {
+        throw new Error('Request was stopped by user.')
+      }
+
       const controller = new AbortController()
-      const timer = setTimeout(() => controller.abort(), timeoutMs)
+      let timeoutFired = false
+      const timer = setTimeout(() => {
+        timeoutFired = true
+        controller.abort()
+      }, timeoutMs)
+
+      const onUserAbort = () => {
+        controller.abort()
+      }
+
+      if (signal) {
+        signal.addEventListener('abort', onUserAbort, { once: true })
+      }
+
+      const fetchFunc = this.fetchImpl || fetch
 
       try {
-        const response = await fetch(endpoint, {
+        const response = await fetchFunc(endpoint, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json'
@@ -196,7 +253,15 @@ export class GeminiProvider implements IAIProvider {
           body: JSON.stringify(requestBody),
           signal: controller.signal
         })
+
         clearTimeout(timer)
+        if (signal) {
+          signal.removeEventListener('abort', onUserAbort)
+        }
+
+        if (signal?.aborted) {
+          throw new Error('Request was stopped by user.')
+        }
 
         if (!response.ok) {
           let errorDetails = `Status ${response.status} (${response.statusText})`
@@ -206,21 +271,153 @@ export class GeminiProvider implements IAIProvider {
               errorDetails = errorJson.error.message
             }
           } catch {
-            // Use status text if body isn't JSON
+            // Body was not JSON
           }
 
-          const isRetryable = this.isRetryableError(response.status, errorDetails)
-          if (isRetryable && attempt < MAX_RETRIES) {
-            const backoffMs = (attempt + 1) * 1000 // 1000ms for 1st retry, 2000ms for 2nd retry
-            onRetry?.(attempt + 1, MAX_RETRIES, backoffMs, errorDetails)
-            await new Promise((resolve) => setTimeout(resolve, backoffMs))
+          const retryAfterHeader = response.headers ? response.headers.get('retry-after') : null
+          const classification = classifyProviderError(new Error(errorDetails), {
+            status: response.status,
+            retryAfterHeader,
+            providerName: this.name,
+            modelName,
+            signal
+          })
+
+          // User cancellations must NEVER be retried
+          if (classification.isUserCancellation || signal?.aborted) {
+            throw new Error('Request was stopped by user.')
+          }
+
+          if (classification.isRetryable && attempt < MAX_RETRIES) {
+            const delayMs = calculateRetryDelay(attempt, retryAfterHeader, {
+              baseDelayMs: 1000,
+              minDelayMs: 500,
+              maxDelayMs: 30000
+            })
+            onRetry?.(attempt + 1, MAX_RETRIES, delayMs, errorDetails)
+            await this.cancellableSleep(delayMs, signal)
             continue
           }
 
-          const friendlyError = this.formatUserFriendlyError(response.status, errorDetails)
-          throw new Error(friendlyError)
+          throw new Error(classification.userFriendlyMessage)
         }
 
+        // Handle SSE streaming response
+        if (isStreaming && response.body) {
+          const reader = response.body.getReader()
+          const decoder = new TextDecoder()
+          let buffer = ''
+          let combinedText = ''
+          const functionCalls: FunctionCallPart[] = []
+          const responseParts: LLMPart[] = []
+
+          const onStreamAbort = () => {
+            try {
+              reader.cancel().catch(() => {})
+            } catch {}
+          }
+          if (signal) {
+            signal.addEventListener('abort', onStreamAbort, { once: true })
+          }
+
+          try {
+            while (true) {
+              if (signal?.aborted) {
+                throw new Error('Request was stopped by user.')
+              }
+
+              const { done, value } = await reader.read()
+              if (done) {
+                if (signal?.aborted) {
+                  throw new Error('Request was stopped by user.')
+                }
+                break
+              }
+
+              buffer += decoder.decode(value, { stream: true })
+              const lines = buffer.split('\n')
+              buffer = lines.pop() || ''
+
+              for (const line of lines) {
+                const trimmed = line.trim()
+                if (!trimmed || !trimmed.startsWith('data:')) continue
+                const payload = trimmed.slice(5).trim()
+                if (payload === '[DONE]') continue
+
+                try {
+                  const chunkData = JSON.parse(payload)
+                  const candidate = chunkData.candidates?.[0]
+                  if (!candidate) continue
+
+                  const parts: LLMPart[] = candidate.content?.parts || []
+                  for (const part of parts) {
+                    responseParts.push(part)
+
+                    if (part.functionCall && typeof part.functionCall.name === 'string') {
+                      functionCalls.push({
+                        name: part.functionCall.name,
+                        args: (part.functionCall.args as Record<string, unknown>) || {}
+                      })
+                    }
+
+                    // Strict thought isolation: never deliver internal thinking to onChunk or user-visible text
+                    const isThought = Boolean((part as Record<string, unknown>).thought)
+                    if (typeof part.text === 'string' && !isThought) {
+                      combinedText += part.text
+                      onChunk(part.text)
+                    }
+                  }
+                } catch {
+                  // Ignore partial or non-JSON chunk lines
+                }
+              }
+            }
+
+            // Flush trailing line in buffer if present
+            if (buffer.trim().startsWith('data:')) {
+              try {
+                const payload = buffer.trim().slice(5).trim()
+                if (payload && payload !== '[DONE]') {
+                  const chunkData = JSON.parse(payload)
+                  const candidate = chunkData.candidates?.[0]
+                  if (candidate?.content?.parts) {
+                    for (const part of candidate.content.parts) {
+                      responseParts.push(part)
+                      if (part.functionCall && typeof part.functionCall.name === 'string') {
+                        functionCalls.push({
+                          name: part.functionCall.name,
+                          args: (part.functionCall.args as Record<string, unknown>) || {}
+                        })
+                      }
+                      const isThought = Boolean((part as Record<string, unknown>).thought)
+                      if (typeof part.text === 'string' && !isThought) {
+                        combinedText += part.text
+                        onChunk(part.text)
+                      }
+                    }
+                  }
+                }
+              } catch {}
+            }
+
+            return {
+              text: combinedText || undefined,
+              functionCalls: functionCalls.length > 0 ? functionCalls : undefined,
+              rawModelParts: responseParts
+            }
+          } catch (streamErr: unknown) {
+            try {
+              await reader.cancel()
+            } catch {}
+            throw streamErr
+          } finally {
+            if (signal) {
+              signal.removeEventListener('abort', onStreamAbort)
+            }
+          }
+        }
+
+        // Standard non-streaming JSON response handling
         const data = await response.json()
         const candidate = data.candidates?.[0]
 
@@ -232,17 +429,20 @@ export class GeminiProvider implements IAIProvider {
         }
 
         const responseParts: LLMPart[] = candidate.content?.parts || []
-        const functionCalls: { name: string; args: Record<string, unknown> }[] = []
+        const functionCalls: FunctionCallPart[] = []
         let combinedText = ''
 
         for (const part of responseParts) {
-          if (part.functionCall) {
+          if (part.functionCall && typeof part.functionCall.name === 'string') {
             functionCalls.push({
               name: part.functionCall.name,
               args: (part.functionCall.args as Record<string, unknown>) || {}
             })
           }
-          if (part.text) {
+
+          // Strict thought isolation: exclude internal reasoning parts from visible response text
+          const isThought = Boolean((part as Record<string, unknown>).thought)
+          if (typeof part.text === 'string' && !isThought) {
             combinedText += part.text
           }
         }
@@ -254,28 +454,38 @@ export class GeminiProvider implements IAIProvider {
         }
       } catch (networkOrTimeoutError: unknown) {
         clearTimeout(timer)
+        if (signal) {
+          signal.removeEventListener('abort', onUserAbort)
+        }
 
-        const isAbort =
-          networkOrTimeoutError instanceof Error &&
-          (networkOrTimeoutError.name === 'AbortError' ||
-            networkOrTimeoutError.message.toLowerCase().includes('abort'))
+        // User cancellation must immediately bubble without retrying
+        if (signal?.aborted) {
+          throw new Error('Request was stopped by user.')
+        }
 
-        const rawMessage = isAbort
-          ? `Request timed out after ${timeoutMs / 1000}s`
-          : networkOrTimeoutError instanceof Error
-          ? networkOrTimeoutError.message
-          : String(networkOrTimeoutError)
+        const classification = classifyProviderError(networkOrTimeoutError, {
+          signal,
+          isTimeout: timeoutFired,
+          providerName: this.name,
+          modelName
+        })
 
-        const isRetryable = isAbort || this.isRetryableError(0, rawMessage)
-        if (isRetryable && attempt < MAX_RETRIES) {
-          const backoffMs = (attempt + 1) * 1000 // 1000ms, 2000ms
-          onRetry?.(attempt + 1, MAX_RETRIES, backoffMs, rawMessage)
-          await new Promise((resolve) => setTimeout(resolve, backoffMs))
+        if (classification.isUserCancellation) {
+          throw new Error('Request was stopped by user.')
+        }
+
+        if (classification.isRetryable && attempt < MAX_RETRIES) {
+          const delayMs = calculateRetryDelay(attempt, null, {
+            baseDelayMs: 1000,
+            minDelayMs: 500,
+            maxDelayMs: 30000
+          })
+          onRetry?.(attempt + 1, MAX_RETRIES, delayMs, classification.reason)
+          await this.cancellableSleep(delayMs, signal)
           continue
         }
 
-        const friendlyMsg = this.formatUserFriendlyError(0, rawMessage)
-        lastError = new Error(friendlyMsg)
+        lastError = new Error(classification.userFriendlyMessage)
         throw lastError
       }
     }

@@ -2,11 +2,19 @@ import {
   FunctionDeclaration,
   IAIProvider,
   LLMMessage,
-  LLMPart,
   LLMRequestOptions,
-  LLMResponse
+  LLMResponse,
+  ProviderCapabilities
 } from './types'
 import { NvidiaChatCompletionRequest, NvidiaChatCompletionResponse } from '../../../../shared/types'
+import {
+  calculateRetryDelay,
+  cancellableSleep,
+  classifyProviderError,
+  parseOpenAIToolCalls,
+  serializeOpenAIMessages,
+  serializeOpenAITools
+} from './providerUtils'
 
 export interface NvidiaProviderConfig {
   defaultModel?: string
@@ -19,6 +27,13 @@ export interface NvidiaProviderConfig {
 export class NvidiaProvider implements IAIProvider {
   readonly id = 'nvidia'
   readonly name = 'NVIDIA NIM'
+
+  readonly capabilities: ProviderCapabilities = {
+    supportsStreaming: false,
+    supportsTools: true,
+    requiresApiKey: true,
+    supportsModelListing: true
+  }
 
   private defaultModel?: string
   private defaultTimeoutMs = 30000 // 30 seconds
@@ -45,116 +60,6 @@ export class NvidiaProvider implements IAIProvider {
     }
   }
 
-  private isRetryableError(status: number, message: string): boolean {
-    if (status === 429 || status === 500 || status === 502 || status === 503 || status === 504) {
-      return true
-    }
-
-    const lower = message.toLowerCase()
-    if (
-      lower.includes('rate limit') ||
-      lower.includes('too many requests') ||
-      lower.includes('high demand') ||
-      lower.includes('overloaded') ||
-      lower.includes('service unavailable') ||
-      lower.includes('temporarily unavailable') ||
-      lower.includes('timeout') ||
-      lower.includes('timed out') ||
-      lower.includes('try again')
-    ) {
-      return true
-    }
-
-    return false
-  }
-
-  private isToolCallingUnsupportedError(status: number, message: string): boolean {
-    const lower = message.toLowerCase()
-    return (
-      (status === 400 || status === 422) &&
-      (lower.includes('tools') ||
-        lower.includes('function') ||
-        lower.includes('tool_choice') ||
-        lower.includes('not supported') ||
-        lower.includes('unrecognized field') ||
-        lower.includes('extra fields not permitted') ||
-        lower.includes('function calling'))
-    )
-  }
-
-  private formatUserFriendlyError(
-    status: number,
-    rawMessage: string,
-    modelName: string,
-    failedBeforeResponse = false
-  ): string {
-    if (
-      rawMessage.includes('Electron IPC handler for NVIDIA NIM is not available') ||
-      rawMessage.includes('nvidiaChatCompletion is undefined')
-    ) {
-      return 'Electron IPC handler for NVIDIA NIM is not available. Please restart the application.'
-    }
-    if (rawMessage.includes('API key is not configured') || rawMessage.includes('Please provide a valid API key in Settings')) {
-      return rawMessage
-    }
-    if (rawMessage.includes('No NVIDIA NIM model')) {
-      return rawMessage
-    }
-    if (
-      status === 401 ||
-      status === 403 ||
-      rawMessage.toLowerCase().includes('api key') ||
-      rawMessage.toLowerCase().includes('unauthorized') ||
-      rawMessage.toLowerCase().includes('forbidden')
-    ) {
-      return 'Invalid NVIDIA API key. Please check your key in Settings.'
-    }
-    const lower = rawMessage.toLowerCase()
-    const isExplicitEol =
-      lower.includes('end of life') ||
-      lower.includes('end-of-life') ||
-      lower.includes('retired') ||
-      lower.includes('deprecated') ||
-      lower.includes('decommissioned') ||
-      lower.includes('no longer available') ||
-      lower.includes('model is disabled')
-
-    if (isExplicitEol) {
-      return `The selected NVIDIA model ('${modelName}') has reached end of life. Please fetch and select an available model from the NVIDIA NIM catalog in Settings.`
-    }
-
-    if (
-      status === 404 ||
-      status === 410 ||
-      lower.includes('model not found') ||
-      lower.includes('does not exist') ||
-      lower.includes('unknown model')
-    ) {
-      return `The selected NVIDIA model ('${modelName}') was not found in NVIDIA NIM. Please fetch and select an active model in Settings.`
-    }
-
-    if (this.isToolCallingUnsupportedError(status, rawMessage)) {
-      return `The selected NVIDIA model ('${modelName}') does not support tool calling or rejected the tools parameter. Please choose a tool-compatible model or use conversational mode.`
-    }
-    if (status === 429 || rawMessage.toLowerCase().includes('rate limit')) {
-      return 'NVIDIA NIM rate limit reached. Please try again in a moment.'
-    }
-    if (
-      rawMessage.toLowerCase().includes('timed out') ||
-      rawMessage.toLowerCase().includes('abort') ||
-      rawMessage.toLowerCase().includes('timeout')
-    ) {
-      return 'Request timed out after 30s. The NVIDIA API service may be experiencing high latency.'
-    }
-    if (failedBeforeResponse || rawMessage.toLowerCase().includes('fetch') || rawMessage.toLowerCase().includes('econnrefused')) {
-      return `Failed to connect to NVIDIA NIM (${rawMessage.replace(/^Error:\s*/i, '')}). Please verify your network connection and proxy settings.`
-    }
-    return (
-      rawMessage.replace(/^NVIDIA NIM API error:\s*/i, '').trim() ||
-      'The NVIDIA AI provider is temporarily unavailable. Please try again.'
-    )
-  }
-
   async sendMessage(
     messages: LLMMessage[],
     tools: FunctionDeclaration[],
@@ -166,8 +71,13 @@ export class NvidiaProvider implements IAIProvider {
       systemInstruction,
       temperature = 0.2,
       timeoutMs = this.defaultTimeoutMs,
+      signal,
       onRetry
     } = options
+
+    if (signal?.aborted) {
+      throw new Error('Request was stopped by user.')
+    }
 
     if (!apiKey || apiKey.trim() === '') {
       this.logDiagnostic('validation_failed', { reason: 'missing_api_key' })
@@ -186,142 +96,54 @@ export class NvidiaProvider implements IAIProvider {
       toolCount: tools?.length || 0
     })
 
-    // Format messages for OpenAI-compatible Chat Completions API
-    const formattedMessages: Array<{
-      role: string
-      content: string | null
-      tool_calls?: Array<{
-        id: string
-        type: 'function'
-        function: { name: string; arguments: string }
-      }>
-      tool_call_id?: string
-      name?: string
-    }> = []
-
-    if (systemInstruction) {
-      formattedMessages.push({
-        role: 'system',
-        content: systemInstruction
-      })
-    }
-
-    let lastToolCallId = 'call_tool_1'
-
-    for (const msg of messages) {
-      if (msg.role === 'user') {
-        const text = msg.parts.map((p) => p.text || '').join('\n')
-        formattedMessages.push({
-          role: 'user',
-          content: text
-        })
-      } else if (msg.role === 'model') {
-        const toolCalls: Array<{
-          id: string
-          type: 'function'
-          function: { name: string; arguments: string }
-        }> = []
-        let textContent = ''
-
-        for (const part of msg.parts) {
-          if (part.functionCall) {
-            const toolCallId =
-              (part['id'] as string) ||
-              (part['tool_call_id'] as string) ||
-              `call_${part.functionCall.name}_${formattedMessages.length}`
-            part['id'] = toolCallId
-            part['tool_call_id'] = toolCallId
-            lastToolCallId = toolCallId
-
-            toolCalls.push({
-              id: toolCallId,
-              type: 'function',
-              function: {
-                name: part.functionCall.name,
-                arguments: JSON.stringify(part.functionCall.args || {})
-              }
-            })
-          }
-          if (part.text) {
-            textContent += part.text
-          }
-        }
-
-        const assistantMsg: {
-          role: string
-          content: string | null
-          tool_calls?: Array<{
-            id: string
-            type: 'function'
-            function: { name: string; arguments: string }
-          }>
-        } = {
-          role: 'assistant',
-          content: textContent || null
-        }
-
-        if (toolCalls.length > 0) {
-          assistantMsg.tool_calls = toolCalls
-        }
-
-        formattedMessages.push(assistantMsg)
-      } else if (msg.role === 'function') {
-        for (const part of msg.parts) {
-          if (part.functionResponse) {
-            const content = part.functionResponse.response.content
-            const contentStr =
-              typeof content === 'string'
-                ? content
-                : JSON.stringify(content, null, 2)
-
-            formattedMessages.push({
-              role: 'tool',
-              tool_call_id: (part['tool_call_id'] as string) || lastToolCallId,
-              name: part.functionResponse.name,
-              content: contentStr
-            })
-          }
-        }
-      }
-    }
-
-    const ipcRequest: NvidiaChatCompletionRequest = {
-      model: activeModel,
-      messages: formattedMessages,
-      temperature,
-      apiKey: apiKey.trim(),
-      timeoutMs
-    }
-
-    if (tools && tools.length > 0) {
-      ipcRequest.tools = tools.map((tool) => ({
-        type: 'function',
-        function: {
-          name: tool.name,
-          description: tool.description,
-          parameters: tool.parameters
-        }
-      }))
-      ipcRequest.tool_choice = 'auto'
-    }
+    // Format messages and tools using standardized OpenAI-compatible serializers
+    const formattedMessages = serializeOpenAIMessages(messages, systemInstruction)
+    const formattedTools = serializeOpenAITools(tools)
 
     const MAX_RETRIES = 2
     let lastError: Error | null = null
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      if (signal?.aborted) {
+        throw new Error('Request was stopped by user.')
+      }
+
+      const requestId = `nvidia_${Date.now()}_${Math.random().toString(36).slice(2, 9)}_att${attempt}`
+      const ipcRequest: NvidiaChatCompletionRequest = {
+        model: activeModel,
+        messages: formattedMessages,
+        temperature,
+        apiKey: apiKey.trim(),
+        timeoutMs,
+        requestId
+      }
+
+      if (formattedTools && formattedTools.length > 0) {
+        ipcRequest.tools = formattedTools
+        ipcRequest.tool_choice = 'auto'
+      }
+
+      const onAbort = () => {
+        if (typeof window !== 'undefined' && window.electronAPI?.cancelChatCompletion) {
+          window.electronAPI.cancelChatCompletion(requestId).catch(() => {})
+        }
+      }
+
+      if (signal) {
+        signal.addEventListener('abort', onAbort, { once: true })
+      }
+
       try {
         let ipcResponse: NvidiaChatCompletionResponse
 
-        // Check if running in Electron environment with window.electronAPI.nvidiaChatCompletion or injected ipcCaller
         if (this.ipcCaller) {
-          this.logDiagnostic('sending_custom_ipc', { attempt, model: modelName })
+          this.logDiagnostic('sending_custom_ipc', { attempt, model: activeModel, requestId })
           ipcResponse = await this.ipcCaller(ipcRequest)
         } else if (typeof window !== 'undefined' && window.electronAPI?.nvidiaChatCompletion) {
-          this.logDiagnostic('sending_electron_ipc', { attempt, model: modelName })
+          this.logDiagnostic('sending_electron_ipc', { attempt, model: activeModel, requestId })
           ipcResponse = await window.electronAPI.nvidiaChatCompletion(ipcRequest)
         } else if (typeof window !== 'undefined' && !this.fetchImpl) {
-          // Running in Electron window but IPC bridge is missing - never attempt direct browser fetch (CORS block)
-          this.logDiagnostic('missing_electron_ipc', { attempt, model: modelName })
+          this.logDiagnostic('missing_electron_ipc', { attempt, model: activeModel })
           ipcResponse = {
             success: false,
             error: 'Electron IPC handler for NVIDIA NIM is not available. Please restart the application.',
@@ -329,11 +151,20 @@ export class NvidiaProvider implements IAIProvider {
             stage: 'init'
           }
         } else {
-          // Direct fallback for Node.js / non-browser test harnesses or when fetchImpl is injected
-          this.logDiagnostic('sending_direct_fetch', { attempt, model: modelName })
+          // Direct fetch fallback for non-browser / unit test environments
+          this.logDiagnostic('sending_direct_fetch', { attempt, model: activeModel, requestId })
           const fetchFunction = this.fetchImpl || fetch
           const controller = new AbortController()
-          const timer = setTimeout(() => controller.abort(), timeoutMs)
+          let isTimedOut = false
+          const timer = setTimeout(() => {
+            isTimedOut = true
+            controller.abort()
+          }, timeoutMs)
+
+          const onSignalAbort = () => controller.abort()
+          if (signal) {
+            signal.addEventListener('abort', onSignalAbort, { once: true })
+          }
 
           const requestBody: Record<string, unknown> = {
             model: ipcRequest.model,
@@ -357,6 +188,9 @@ export class NvidiaProvider implements IAIProvider {
               signal: controller.signal
             })
             clearTimeout(timer)
+            if (signal) {
+              signal.removeEventListener('abort', onSignalAbort)
+            }
 
             if (!resp.ok) {
               let errorDetails = `Status ${resp.status} (${resp.statusText})`
@@ -366,15 +200,19 @@ export class NvidiaProvider implements IAIProvider {
                   errorDetails = errorJson.error.message
                 } else if (errorJson.message) {
                   errorDetails = errorJson.message
+                } else if (errorJson.detail) {
+                  errorDetails = typeof errorJson.detail === 'string' ? errorJson.detail : JSON.stringify(errorJson.detail)
                 }
               } catch {}
 
+              const retryAfter = resp.headers.get('retry-after')
               ipcResponse = {
                 success: false,
                 status: resp.status,
                 statusText: resp.statusText,
                 error: errorDetails,
                 errorDetails,
+                retryAfter: retryAfter || undefined,
                 stage: 'response_received'
               }
             } else {
@@ -388,51 +226,70 @@ export class NvidiaProvider implements IAIProvider {
             }
           } catch (fetchErr: unknown) {
             clearTimeout(timer)
+            if (signal) {
+              signal.removeEventListener('abort', onSignalAbort)
+            }
+
+            const isUserCancel = (signal?.aborted || controller.signal.aborted) && !isTimedOut
             const isAbort =
               fetchErr instanceof Error &&
               (fetchErr.name === 'AbortError' || fetchErr.message.toLowerCase().includes('abort'))
-            const rawMsg = isAbort ? `Request timed out after ${timeoutMs / 1000}s` : String(fetchErr)
+            const rawMsg = isUserCancel
+              ? 'Request was stopped by user.'
+              : isAbort || isTimedOut
+              ? `Request timed out after ${timeoutMs / 1000}s`
+              : String(fetchErr)
+
             ipcResponse = {
               success: false,
-              isNetworkError: true,
+              isNetworkError: !isUserCancel,
               error: rawMsg,
               errorDetails: rawMsg,
-              stage: 'failed'
+              stage: isUserCancel ? 'cancelled' : 'failed'
             }
           }
         }
 
-        this.logDiagnostic('response_evaluated', {
-          success: ipcResponse.success,
-          status: ipcResponse.status,
-          stage: ipcResponse.stage
-        })
+        if (signal?.aborted) {
+          throw new Error('Request was stopped by user.')
+        }
 
         if (!ipcResponse.success) {
-          const status = ipcResponse.status || 0
-          const rawMessage = ipcResponse.errorDetails || ipcResponse.error || 'Unknown error'
-          const isRetryable = this.isRetryableError(status, rawMessage)
+          const classification = classifyProviderError(
+            {
+              status: ipcResponse.status,
+              message: ipcResponse.errorDetails || ipcResponse.error,
+              errorDetails: ipcResponse.errorDetails,
+              isNetworkError: ipcResponse.isNetworkError
+            },
+            {
+              signal,
+              providerName: this.name,
+              modelName: activeModel
+            }
+          )
 
-          if (isRetryable && attempt < MAX_RETRIES) {
-            const backoffMs = (attempt + 1) * 1000
-            this.logDiagnostic('retrying', { attempt: attempt + 1, backoffMs, status })
-            onRetry?.(attempt + 1, MAX_RETRIES, backoffMs, rawMessage)
-            await new Promise((resolve) => setTimeout(resolve, backoffMs))
+          if (classification.isUserCancellation) {
+            throw new Error('Request was stopped by user.')
+          }
+
+          if (classification.isRetryable && attempt < MAX_RETRIES) {
+            const delayMs = calculateRetryDelay(attempt, (ipcResponse as any).retryAfter || null, {
+              baseDelayMs: 1000,
+              minDelayMs: 500,
+              maxDelayMs: 30000
+            })
+            this.logDiagnostic('retrying', { attempt: attempt + 1, delayMs, status: ipcResponse.status })
+            onRetry?.(attempt + 1, MAX_RETRIES, delayMs, classification.reason)
+            await cancellableSleep(delayMs, signal)
             continue
           }
 
-          const friendlyError = this.formatUserFriendlyError(
-            status,
-            rawMessage,
-            activeModel,
-            ipcResponse.isNetworkError || status === 0
-          )
           this.logDiagnostic('failed_final', {
-            status,
-            sanitizedError: friendlyError,
-            failedBeforeResponse: ipcResponse.isNetworkError || status === 0
+            status: ipcResponse.status,
+            sanitizedError: classification.userFriendlyMessage
           })
-          throw new Error(friendlyError)
+          throw new Error(classification.userFriendlyMessage)
         }
 
         const choice = ipcResponse.data?.choices?.[0]
@@ -442,36 +299,7 @@ export class NvidiaProvider implements IAIProvider {
         }
 
         const choiceMsg = choice.message
-        const functionCalls: { name: string; args: Record<string, unknown> }[] = []
-        const rawModelParts: LLMPart[] = []
-
-        if (choiceMsg.tool_calls && Array.isArray(choiceMsg.tool_calls)) {
-          for (const call of choiceMsg.tool_calls) {
-            let parsedArgs: Record<string, unknown> = {}
-            try {
-              parsedArgs =
-                typeof call.function.arguments === 'string'
-                  ? JSON.parse(call.function.arguments)
-                  : call.function.arguments || {}
-            } catch {
-              parsedArgs = {}
-            }
-
-            functionCalls.push({
-              name: call.function.name,
-              args: parsedArgs
-            })
-
-            rawModelParts.push({
-              functionCall: {
-                name: call.function.name,
-                args: parsedArgs
-              },
-              id: call.id,
-              tool_call_id: call.id
-            })
-          }
-        }
+        const { functionCalls, rawModelParts } = parseOpenAIToolCalls(choiceMsg.tool_calls)
 
         if (choiceMsg.content) {
           rawModelParts.push({
@@ -490,40 +318,38 @@ export class NvidiaProvider implements IAIProvider {
           rawModelParts
         }
       } catch (err: unknown) {
-        if (err instanceof Error && err.message.startsWith('Invalid NVIDIA API key')) {
-          throw err
-        }
-        if (err instanceof Error && err.message.includes('not found or is currently unavailable')) {
-          throw err
-        }
-        if (err instanceof Error && err.message.includes('does not support tool calling')) {
-          throw err
-        }
-        if (err instanceof Error && err.message.includes('rate limit')) {
-          throw err
-        }
-        if (err instanceof Error && err.message.includes('Failed to connect to NVIDIA NIM')) {
-          throw err
+        if (signal?.aborted) {
+          throw new Error('Request was stopped by user.')
         }
 
-        const rawMessage = err instanceof Error ? err.message : String(err)
-        const isRetryable = this.isRetryableError(0, rawMessage)
+        const classification = classifyProviderError(err, {
+          signal,
+          providerName: this.name,
+          modelName: activeModel
+        })
 
-        if (isRetryable && attempt < MAX_RETRIES) {
-          const backoffMs = (attempt + 1) * 1000
-          this.logDiagnostic('retrying_catch', { attempt: attempt + 1, backoffMs })
-          onRetry?.(attempt + 1, MAX_RETRIES, backoffMs, rawMessage)
-          await new Promise((resolve) => setTimeout(resolve, backoffMs))
+        if (classification.isUserCancellation) {
+          throw new Error('Request was stopped by user.')
+        }
+
+        if (classification.isRetryable && attempt < MAX_RETRIES) {
+          const delayMs = calculateRetryDelay(attempt, null, {
+            baseDelayMs: 1000,
+            minDelayMs: 500,
+            maxDelayMs: 30000
+          })
+          this.logDiagnostic('retrying_catch', { attempt: attempt + 1, delayMs })
+          onRetry?.(attempt + 1, MAX_RETRIES, delayMs, classification.reason)
+          await cancellableSleep(delayMs, signal)
           continue
         }
 
-        const friendlyMsg = this.formatUserFriendlyError(0, rawMessage, activeModel, true)
-        this.logDiagnostic('failed_catch_final', {
-          sanitizedError: friendlyMsg,
-          failedBeforeResponse: true
-        })
-        lastError = new Error(friendlyMsg)
+        lastError = new Error(classification.userFriendlyMessage)
         throw lastError
+      } finally {
+        if (signal) {
+          signal.removeEventListener('abort', onAbort)
+        }
       }
     }
 

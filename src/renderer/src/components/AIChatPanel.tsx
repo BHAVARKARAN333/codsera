@@ -27,10 +27,7 @@ import {
   EyeOff,
   Cpu
 } from 'lucide-react'
-import { GeminiProvider } from '../services/ai/geminiProvider'
-import { OpenRouterProvider } from '../services/ai/openRouterProvider'
-import { NvidiaProvider } from '../services/ai/nvidiaProvider'
-import { OpenCodeProvider } from '../services/ai/opencodeProvider'
+import { providerRegistry } from '../services/ai/providerRegistry'
 import { ListFilesTool } from '../services/tools/listFilesTool'
 import { ReadFileTool } from '../services/tools/readFileTool'
 import { CreateFileTool } from '../services/tools/createFileTool'
@@ -132,10 +129,6 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
 
   const isRunningRef = useRef<boolean>(false)
   const currentRequestIdRef = useRef<string | null>(null)
-  const geminiProviderRef = useRef<GeminiProvider>(new GeminiProvider())
-  const openRouterProviderRef = useRef<OpenRouterProvider>(new OpenRouterProvider())
-  const nvidiaProviderRef = useRef<NvidiaProvider>(new NvidiaProvider())
-  const openCodeProviderRef = useRef<OpenCodeProvider>(new OpenCodeProvider())
   const orchestratorRef = useRef<AgentOrchestrator | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
 
@@ -148,17 +141,18 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
       ? nvidiaApiKey
       : opencodeApiKey
   const activeModelName =
-    providerType === 'gemini'
-      ? 'gemini-3.8-flash'
-      : providerType === 'openrouter'
-      ? 'openrouter/free'
-      : providerType === 'nvidia'
+    providerType === 'nvidia'
       ? nvidiaModelId.trim()
-      : opencodeModelId.trim() || 'space-bunny-free'
+      : providerType === 'opencode'
+      ? opencodeModelId.trim() || 'space-bunny-free'
+      : providerRegistry.has(providerType)
+      ? providerRegistry.getMetadata(providerType).defaultModel
+      : 'gemini-3.8-flash'
 
   // Initialize orchestrator and load persisted settings & keys
   useEffect(() => {
-    const orchestrator = new AgentOrchestrator(geminiProviderRef.current)
+    const initialProvider = providerRegistry.get('gemini')
+    const orchestrator = new AgentOrchestrator(initialProvider)
     orchestrator.registerTool(new ListFilesTool())
     orchestrator.registerTool(new ReadFileTool())
     orchestrator.registerTool(new CreateFileTool())
@@ -214,21 +208,11 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
 
         if (
           settings.selectedProvider &&
-          (settings.selectedProvider === 'gemini' ||
-            settings.selectedProvider === 'openrouter' ||
-            settings.selectedProvider === 'nvidia' ||
-            settings.selectedProvider === 'opencode')
+          providerRegistry.has(settings.selectedProvider)
         ) {
-          setProviderType(settings.selectedProvider)
-          if (settings.selectedProvider === 'gemini') {
-            orchestrator.setProvider(geminiProviderRef.current)
-          } else if (settings.selectedProvider === 'openrouter') {
-            orchestrator.setProvider(openRouterProviderRef.current)
-          } else if (settings.selectedProvider === 'nvidia') {
-            orchestrator.setProvider(nvidiaProviderRef.current)
-          } else {
-            orchestrator.setProvider(openCodeProviderRef.current)
-          }
+          const pType = settings.selectedProvider as ProviderType
+          setProviderType(pType)
+          orchestrator.setProvider(providerRegistry.get(pType))
         }
       })
       .catch((err) => {
@@ -302,16 +286,13 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
     }
 
     if (orchestratorRef.current) {
-      if (newProvider === 'gemini') {
-        orchestratorRef.current.setProvider(geminiProviderRef.current)
-      } else if (newProvider === 'openrouter') {
-        orchestratorRef.current.setProvider(openRouterProviderRef.current)
-      } else if (newProvider === 'nvidia') {
-        orchestratorRef.current.setProvider(nvidiaProviderRef.current)
-      } else {
-        orchestratorRef.current.setProvider(openCodeProviderRef.current)
+      try {
+        const provider = providerRegistry.get(newProvider)
+        orchestratorRef.current.setProvider(provider)
+        orchestratorRef.current.clearHistory()
+      } catch (err: unknown) {
+        console.error(`Failed to switch to provider "${newProvider}":`, err)
       }
-      orchestratorRef.current.clearHistory()
     }
 
     setMessages([])
@@ -601,7 +582,12 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
     if (!textToSend.trim() || isRunningRef.current) return
 
     let currentApiKey = activeApiKey
-    if (!currentApiKey && providerType !== 'opencode') {
+    const providerMeta = providerRegistry.has(providerType)
+      ? providerRegistry.getMetadata(providerType)
+      : null
+    const requiresKey = providerMeta?.capabilities.requiresApiKey ?? (providerType !== 'opencode')
+
+    if (!currentApiKey && requiresKey) {
       // Dynamic lookup to prevent any key desync
       try {
         const persisted = await window.electronAPI.getSettings()
@@ -619,9 +605,8 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
       } catch {}
     }
 
-    if (!currentApiKey && providerType !== 'opencode') {
-      const providerLabel =
-        providerType === 'gemini' ? 'Gemini' : providerType === 'openrouter' ? 'OpenRouter' : 'NVIDIA NIM'
+    if (!currentApiKey && requiresKey) {
+      const providerLabel = providerMeta?.name || providerType
       const missingKeyMsg: ChatMessage = {
         id: crypto.randomUUID(),
         role: 'assistant',

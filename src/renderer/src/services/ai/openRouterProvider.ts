@@ -2,68 +2,85 @@ import {
   FunctionDeclaration,
   IAIProvider,
   LLMMessage,
-  LLMPart,
   LLMRequestOptions,
-  LLMResponse
+  LLMResponse,
+  ProviderCapabilities
 } from './types'
+import {
+  calculateRetryDelay,
+  classifyProviderError,
+  parseOpenAIToolCalls,
+  serializeOpenAIMessages,
+  serializeOpenAITools
+} from './providerUtils'
+
+export interface OpenRouterProviderConfig {
+  defaultModel?: string
+  defaultTimeoutMs?: number
+  fetchImpl?: typeof fetch
+}
 
 export class OpenRouterProvider implements IAIProvider {
   readonly id = 'openrouter'
   readonly name = 'OpenRouter'
+  readonly capabilities: ProviderCapabilities = {
+    supportsStreaming: true,
+    supportsTools: true,
+    requiresApiKey: true,
+    supportsModelListing: false
+  }
 
   // Default free router selecting an available free model
   private defaultModel = 'openrouter/free'
   private defaultTimeoutMs = 30000 // 30 seconds
+  private fetchImpl?: typeof fetch
 
-  private isRetryableError(status: number, message: string): boolean {
-    if (status === 429 || status === 500 || status === 502 || status === 503 || status === 504) {
-      return true
-    }
-
-    const lower = message.toLowerCase()
-    if (
-      lower.includes('rate limit') ||
-      lower.includes('too many requests') ||
-      lower.includes('high demand') ||
-      lower.includes('overloaded') ||
-      lower.includes('service unavailable') ||
-      lower.includes('temporarily unavailable') ||
-      lower.includes('timeout') ||
-      lower.includes('timed out') ||
-      lower.includes('try again')
-    ) {
-      return true
-    }
-
-    return false
+  constructor(config?: OpenRouterProviderConfig) {
+    if (config?.defaultModel) this.defaultModel = config.defaultModel
+    if (config?.defaultTimeoutMs) this.defaultTimeoutMs = config.defaultTimeoutMs
+    if (config?.fetchImpl) this.fetchImpl = config.fetchImpl
   }
 
-  private formatUserFriendlyError(status: number, rawMessage: string): string {
-    if (
-      status === 401 ||
-      status === 403 ||
-      rawMessage.toLowerCase().includes('api key') ||
-      rawMessage.toLowerCase().includes('unauthorized')
-    ) {
-      return 'Invalid OpenRouter API key. Please check your key in Settings.'
+  isRetryableError(status: number, message: string): boolean {
+    return classifyProviderError(new Error(message), {
+      status,
+      providerName: this.name
+    }).isRetryable
+  }
+
+  formatUserFriendlyError(status: number, rawMessage: string): string {
+    return classifyProviderError(new Error(rawMessage), {
+      status,
+      providerName: this.name,
+      modelName: this.defaultModel
+    }).userFriendlyMessage
+  }
+
+  /**
+   * Cancellable delay that aborts immediately if the signal fires during the sleep.
+   */
+  private async cancellableSleep(delayMs: number, signal?: AbortSignal): Promise<void> {
+    if (signal?.aborted) {
+      throw new Error('Request was stopped by user.')
     }
-    if (
-      status === 404 ||
-      rawMessage.toLowerCase().includes('model not found') ||
-      rawMessage.toLowerCase().includes('no available model')
-    ) {
-      return 'The selected AI model (openrouter/free) is currently unavailable.'
-    }
-    if (status === 429 || rawMessage.toLowerCase().includes('rate limit')) {
-      return 'OpenRouter free rate limit reached. Please try again in a moment.'
-    }
-    if (rawMessage.toLowerCase().includes('timed out') || rawMessage.toLowerCase().includes('abort')) {
-      return 'Request timed out after 30s. The provider may be experiencing high demand.'
-    }
-    return (
-      rawMessage.replace(/^OpenRouter API error:\s*/i, '').trim() ||
-      'The AI provider is temporarily unavailable. Please try again.'
-    )
+    return new Promise<void>((resolve, reject) => {
+      const timer = setTimeout(() => {
+        cleanup()
+        resolve()
+      }, delayMs)
+
+      const onAbort = () => {
+        cleanup()
+        reject(new Error('Request was stopped by user.'))
+      }
+
+      const cleanup = () => {
+        clearTimeout(timer)
+        signal?.removeEventListener('abort', onAbort)
+      }
+
+      signal?.addEventListener('abort', onAbort, { once: true })
+    })
   }
 
   async sendMessage(
@@ -77,8 +94,14 @@ export class OpenRouterProvider implements IAIProvider {
       systemInstruction,
       temperature = 0.2,
       timeoutMs = this.defaultTimeoutMs,
+      signal,
+      onChunk,
       onRetry
     } = options
+
+    if (signal?.aborted) {
+      throw new Error('Request was stopped by user.')
+    }
 
     if (!apiKey || apiKey.trim() === '') {
       throw new Error('OpenRouter API key is not configured. Please provide a valid API key.')
@@ -86,88 +109,11 @@ export class OpenRouterProvider implements IAIProvider {
 
     const endpoint = 'https://openrouter.ai/api/v1/chat/completions'
 
-    // Format messages for OpenAI-compatible Chat Completions API
-    const formattedMessages: Record<string, unknown>[] = []
+    // Format messages and tools using robust shared OpenAI-compatible serializer
+    const formattedMessages = serializeOpenAIMessages(messages, systemInstruction)
+    const formattedTools = serializeOpenAITools(tools)
 
-    if (systemInstruction) {
-      formattedMessages.push({
-        role: 'system',
-        content: systemInstruction
-      })
-    }
-
-    // Keep track of tool_call IDs to align tool responses
-    let lastToolCallId = 'call_list_files_1'
-
-    for (const msg of messages) {
-      if (msg.role === 'user') {
-        const text = msg.parts.map((p) => p.text || '').join('\n')
-        formattedMessages.push({
-          role: 'user',
-          content: text
-        })
-      } else if (msg.role === 'model') {
-        const toolCalls: Record<string, unknown>[] = []
-        let textContent = ''
-
-        for (const part of msg.parts) {
-          if (part.functionCall) {
-            const toolCallId =
-              (part['id'] as string) ||
-              (part['tool_call_id'] as string) ||
-              `call_${part.functionCall.name}_${formattedMessages.length}`
-            part['id'] = toolCallId
-            part['tool_call_id'] = toolCallId
-            lastToolCallId = toolCallId
-
-            toolCalls.push({
-              id: toolCallId,
-              type: 'function',
-              function: {
-                name: part.functionCall.name,
-                arguments: JSON.stringify(part.functionCall.args || {})
-              }
-            })
-          }
-          if (part.text) {
-            textContent += part.text
-          }
-        }
-
-        const assistantMsg: Record<string, unknown> = {
-          role: 'assistant',
-          content: textContent || null
-        }
-
-        if (toolCalls.length > 0) {
-          assistantMsg['tool_calls'] = toolCalls
-        }
-
-        formattedMessages.push(assistantMsg)
-      } else if (msg.role === 'function') {
-        for (const part of msg.parts) {
-          if (part.functionResponse) {
-            const content = part.functionResponse.response.content
-            const contentStr =
-              typeof content === 'string'
-                ? content
-                : JSON.stringify(content, null, 2)
-
-            const toolCallId =
-              (part['tool_call_id'] as string) ||
-              (part['id'] as string) ||
-              lastToolCallId
-
-            formattedMessages.push({
-              role: 'tool',
-              tool_call_id: toolCallId,
-              name: part.functionResponse.name,
-              content: contentStr
-            })
-          }
-        }
-      }
-    }
+    const isStreaming = typeof onChunk === 'function'
 
     const requestBody: Record<string, unknown> = {
       model: modelName,
@@ -175,15 +121,12 @@ export class OpenRouterProvider implements IAIProvider {
       temperature
     }
 
-    if (tools && tools.length > 0) {
-      requestBody['tools'] = tools.map((tool) => ({
-        type: 'function',
-        function: {
-          name: tool.name,
-          description: tool.description,
-          parameters: tool.parameters
-        }
-      }))
+    if (isStreaming) {
+      requestBody['stream'] = true
+    }
+
+    if (formattedTools && formattedTools.length > 0) {
+      requestBody['tools'] = formattedTools
       requestBody['tool_choice'] = 'auto'
     }
 
@@ -191,22 +134,49 @@ export class OpenRouterProvider implements IAIProvider {
     let lastError: Error | null = null
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      if (signal?.aborted) {
+        throw new Error('Request was stopped by user.')
+      }
+
       const controller = new AbortController()
-      const timer = setTimeout(() => controller.abort(), timeoutMs)
+      let timeoutFired = false
+      const timer = setTimeout(() => {
+        timeoutFired = true
+        controller.abort()
+      }, timeoutMs)
+
+      const onUserAbort = () => {
+        controller.abort()
+      }
+
+      if (signal) {
+        signal.addEventListener('abort', onUserAbort, { once: true })
+      }
+
+      const fetchFunc = this.fetchImpl || fetch
 
       try {
-        const response = await fetch(endpoint, {
+        const response = await fetchFunc(endpoint, {
           method: 'POST',
           headers: {
             'Content-Type': 'application/json',
             Authorization: `Bearer ${apiKey.trim()}`,
             'HTTP-Referer': 'https://ai-ide.local',
-            'X-Title': 'AI IDE'
+            'X-Title': 'AI IDE',
+            ...(isStreaming ? { Accept: 'text/event-stream' } : {})
           },
           body: JSON.stringify(requestBody),
           signal: controller.signal
         })
+
         clearTimeout(timer)
+        if (signal) {
+          signal.removeEventListener('abort', onUserAbort)
+        }
+
+        if (signal?.aborted) {
+          throw new Error('Request was stopped by user.')
+        }
 
         if (!response.ok) {
           let errorDetails = `Status ${response.status} (${response.statusText})`
@@ -214,61 +184,199 @@ export class OpenRouterProvider implements IAIProvider {
             const errorJson = await response.json()
             if (errorJson.error?.message) {
               errorDetails = errorJson.error.message
+            } else if (typeof errorJson.error === 'string') {
+              errorDetails = errorJson.error
             }
           } catch {
             // Non-JSON response
           }
 
-          const isRetryable = this.isRetryableError(response.status, errorDetails)
-          if (isRetryable && attempt < MAX_RETRIES) {
-            const backoffMs = (attempt + 1) * 1000
-            onRetry?.(attempt + 1, MAX_RETRIES, backoffMs, errorDetails)
-            await new Promise((resolve) => setTimeout(resolve, backoffMs))
+          const retryAfterHeader = response.headers ? response.headers.get('retry-after') : null
+          const classification = classifyProviderError(new Error(errorDetails), {
+            status: response.status,
+            retryAfterHeader,
+            providerName: this.name,
+            modelName,
+            signal
+          })
+
+          if (classification.isUserCancellation || signal?.aborted) {
+            throw new Error('Request was stopped by user.')
+          }
+
+          if (classification.isRetryable && attempt < MAX_RETRIES) {
+            const delayMs = calculateRetryDelay(attempt, retryAfterHeader, {
+              baseDelayMs: 1000,
+              minDelayMs: 500,
+              maxDelayMs: 30000
+            })
+            onRetry?.(attempt + 1, MAX_RETRIES, delayMs, errorDetails)
+            await this.cancellableSleep(delayMs, signal)
             continue
           }
 
-          const friendlyError = this.formatUserFriendlyError(response.status, errorDetails)
-          throw new Error(friendlyError)
+          throw new Error(classification.userFriendlyMessage)
         }
 
+        // Handle SSE streaming response
+        if (isStreaming && response.body) {
+          const reader = response.body.getReader()
+          const decoder = new TextDecoder()
+          let buffer = ''
+          let combinedText = ''
+          const toolCallsMap = new Map<number, { id: string; name: string; arguments: string }>()
+
+          const onStreamAbort = () => {
+            try {
+              reader.cancel().catch(() => {})
+            } catch {}
+          }
+          if (signal) {
+            signal.addEventListener('abort', onStreamAbort, { once: true })
+          }
+
+          try {
+            while (true) {
+              if (signal?.aborted) {
+                throw new Error('Request was stopped by user.')
+              }
+
+              const { done, value } = await reader.read()
+              if (done) {
+                if (signal?.aborted) {
+                  throw new Error('Request was stopped by user.')
+                }
+                break
+              }
+
+              buffer += decoder.decode(value, { stream: true })
+              const lines = buffer.split('\n')
+              buffer = lines.pop() || ''
+
+              for (const line of lines) {
+                const trimmed = line.trim()
+                if (!trimmed || !trimmed.startsWith('data:')) continue
+                const payload = trimmed.slice(5).trim()
+                if (payload === '[DONE]') continue
+
+                try {
+                  const parsed = JSON.parse(payload)
+                  if (parsed.error) {
+                    const errMsg =
+                      typeof parsed.error === 'string'
+                        ? parsed.error
+                        : parsed.error.message || JSON.stringify(parsed.error)
+                    throw new Error(errMsg)
+                  }
+
+                  const choice = parsed.choices?.[0]
+                  if (!choice) continue
+
+                  const delta = choice.delta
+                  if (delta) {
+                    if (typeof delta.content === 'string') {
+                      combinedText += delta.content
+                      onChunk(delta.content)
+                    }
+
+                    if (Array.isArray(delta.tool_calls)) {
+                      for (const tc of delta.tool_calls) {
+                        const idx = typeof tc.index === 'number' ? tc.index : toolCallsMap.size
+                        const existing = toolCallsMap.get(idx) || { id: '', name: '', arguments: '' }
+                        if (typeof tc.id === 'string' && tc.id.trim()) existing.id = tc.id.trim()
+                        if (tc.function?.name) existing.name += tc.function.name
+                        if (tc.function?.arguments) existing.arguments += tc.function.arguments
+                        toolCallsMap.set(idx, existing)
+                      }
+                    }
+                  }
+                } catch (parseErr: unknown) {
+                  if (
+                    parseErr instanceof Error &&
+                    parseErr.message &&
+                    !parseErr.message.includes('JSON')
+                  ) {
+                    throw parseErr
+                  }
+                  // Ignore partial or non-JSON chunk lines
+                }
+              }
+            }
+
+            // Flush trailing buffer line if present
+            if (buffer.trim().startsWith('data:')) {
+              const payload = buffer.trim().slice(5).trim()
+              if (payload && payload !== '[DONE]') {
+                try {
+                  const parsed = JSON.parse(payload)
+                  const choice = parsed.choices?.[0]
+                  if (choice?.delta) {
+                    if (typeof choice.delta.content === 'string') {
+                      combinedText += choice.delta.content
+                      onChunk(choice.delta.content)
+                    }
+                    if (Array.isArray(choice.delta.tool_calls)) {
+                      for (const tc of choice.delta.tool_calls) {
+                        const idx = typeof tc.index === 'number' ? tc.index : toolCallsMap.size
+                        const existing = toolCallsMap.get(idx) || { id: '', name: '', arguments: '' }
+                        if (typeof tc.id === 'string' && tc.id.trim()) existing.id = tc.id.trim()
+                        if (tc.function?.name) existing.name += tc.function.name
+                        if (tc.function?.arguments) existing.arguments += tc.function.arguments
+                        toolCallsMap.set(idx, existing)
+                      }
+                    }
+                  }
+                } catch {}
+              }
+            }
+
+            const rawToolCalls = Array.from(toolCallsMap.values())
+              .filter((tc) => tc.name)
+              .map((tc) => ({
+                id: tc.id || `call_${tc.name}_${Date.now()}`,
+                type: 'function' as const,
+                function: {
+                  name: tc.name,
+                  arguments: tc.arguments
+                }
+              }))
+
+            const { functionCalls, rawModelParts } = parseOpenAIToolCalls(rawToolCalls)
+
+            if (combinedText) {
+              rawModelParts.push({ text: combinedText })
+            }
+
+            return {
+              text: combinedText || undefined,
+              functionCalls: functionCalls.length > 0 ? functionCalls : undefined,
+              rawModelParts
+            }
+          } catch (streamErr: unknown) {
+            try {
+              await reader.cancel()
+            } catch {}
+            throw streamErr
+          } finally {
+            if (signal) {
+              signal.removeEventListener('abort', onStreamAbort)
+            }
+          }
+        }
+
+        // Standard non-streaming JSON response handling
         const data = await response.json()
         const choice = data.choices?.[0]
 
         if (!choice || !choice.message) {
+          if (data.error?.message) {
+            throw new Error(data.error.message)
+          }
           return { text: 'No response returned from OpenRouter.' }
         }
 
         const choiceMsg = choice.message
-        const functionCalls: { name: string; args: Record<string, unknown> }[] = []
-        const rawModelParts: LLMPart[] = []
-
-        if (choiceMsg.tool_calls && Array.isArray(choiceMsg.tool_calls)) {
-          for (const call of choiceMsg.tool_calls) {
-            let parsedArgs: Record<string, unknown> = {}
-            try {
-              parsedArgs =
-                typeof call.function.arguments === 'string'
-                  ? JSON.parse(call.function.arguments)
-                  : call.function.arguments || {}
-            } catch {
-              parsedArgs = {}
-            }
-
-            functionCalls.push({
-              name: call.function.name,
-              args: parsedArgs
-            })
-
-            rawModelParts.push({
-              functionCall: {
-                name: call.function.name,
-                args: parsedArgs
-              },
-              id: call.id,
-              tool_call_id: call.id
-            })
-          }
-        }
+        const { functionCalls, rawModelParts } = parseOpenAIToolCalls(choiceMsg.tool_calls)
 
         if (choiceMsg.content) {
           rawModelParts.push({
@@ -283,28 +391,37 @@ export class OpenRouterProvider implements IAIProvider {
         }
       } catch (networkOrTimeoutError: unknown) {
         clearTimeout(timer)
+        if (signal) {
+          signal.removeEventListener('abort', onUserAbort)
+        }
 
-        const isAbort =
-          networkOrTimeoutError instanceof Error &&
-          (networkOrTimeoutError.name === 'AbortError' ||
-            networkOrTimeoutError.message.toLowerCase().includes('abort'))
+        if (signal?.aborted) {
+          throw new Error('Request was stopped by user.')
+        }
 
-        const rawMessage = isAbort
-          ? `Request timed out after ${timeoutMs / 1000}s`
-          : networkOrTimeoutError instanceof Error
-          ? networkOrTimeoutError.message
-          : String(networkOrTimeoutError)
+        const classification = classifyProviderError(networkOrTimeoutError, {
+          signal,
+          isTimeout: timeoutFired,
+          providerName: this.name,
+          modelName
+        })
 
-        const isRetryable = isAbort || this.isRetryableError(0, rawMessage)
-        if (isRetryable && attempt < MAX_RETRIES) {
-          const backoffMs = (attempt + 1) * 1000
-          onRetry?.(attempt + 1, MAX_RETRIES, backoffMs, rawMessage)
-          await new Promise((resolve) => setTimeout(resolve, backoffMs))
+        if (classification.isUserCancellation) {
+          throw new Error('Request was stopped by user.')
+        }
+
+        if (classification.isRetryable && attempt < MAX_RETRIES) {
+          const delayMs = calculateRetryDelay(attempt, null, {
+            baseDelayMs: 1000,
+            minDelayMs: 500,
+            maxDelayMs: 30000
+          })
+          onRetry?.(attempt + 1, MAX_RETRIES, delayMs, classification.reason)
+          await this.cancellableSleep(delayMs, signal)
           continue
         }
 
-        const friendlyMsg = this.formatUserFriendlyError(0, rawMessage)
-        lastError = new Error(friendlyMsg)
+        lastError = new Error(classification.userFriendlyMessage)
         throw lastError
       }
     }

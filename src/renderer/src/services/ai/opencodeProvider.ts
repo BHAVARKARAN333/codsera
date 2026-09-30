@@ -2,9 +2,9 @@ import {
   FunctionDeclaration,
   IAIProvider,
   LLMMessage,
-  LLMPart,
   LLMRequestOptions,
-  LLMResponse
+  LLMResponse,
+  ProviderCapabilities
 } from './types'
 import {
   OpenCodeChatCompletionRequest,
@@ -14,6 +14,14 @@ import {
   OpenCodeModelItem,
   OpenCodeStreamChunkEvent
 } from '../../../../shared/types'
+import {
+  calculateRetryDelay,
+  cancellableSleep,
+  classifyProviderError,
+  parseOpenAIToolCalls,
+  serializeOpenAIMessages,
+  serializeOpenAITools
+} from './providerUtils'
 
 export interface OpenCodeProviderConfig {
   defaultModel?: string
@@ -28,6 +36,13 @@ export interface OpenCodeProviderConfig {
 export class OpenCodeProvider implements IAIProvider {
   readonly id = 'opencode'
   readonly name = 'OpenCode'
+
+  readonly capabilities: ProviderCapabilities = {
+    supportsStreaming: true,
+    supportsTools: true,
+    requiresApiKey: false,
+    supportsModelListing: true
+  }
 
   // Default verified working free model
   private defaultModel = 'space-bunny-free'
@@ -57,63 +72,6 @@ export class OpenCodeProvider implements IAIProvider {
       const detailsStr = details ? ` | ${JSON.stringify(details)}` : ''
       console.debug(`[OpenCodeProvider] Stage: ${stage}${detailsStr}`)
     }
-  }
-
-  private isRetryableError(status: number, message: string): boolean {
-    if (status === 429 || status === 500 || status === 502 || status === 503 || status === 504) {
-      return true
-    }
-
-    const lower = message.toLowerCase()
-    if (
-      lower.includes('rate limit') ||
-      lower.includes('too many requests') ||
-      lower.includes('high demand') ||
-      lower.includes('overloaded') ||
-      lower.includes('service unavailable') ||
-      lower.includes('temporarily unavailable') ||
-      lower.includes('timeout') ||
-      lower.includes('timed out') ||
-      lower.includes('try again')
-    ) {
-      return true
-    }
-
-    return false
-  }
-
-  private formatUserFriendlyError(
-    status: number,
-    rawMessage: string,
-    modelName: string
-  ): string {
-    const lower = rawMessage.toLowerCase()
-
-    if (lower.includes('freetiererror') || lower.includes('from within opencode')) {
-      return `The model "${modelName}" is restricted to official OpenCode client requests. Please switch to "space-bunny-free" or add a Console API key in Settings.`
-    }
-    if (
-      status === 401 ||
-      status === 403 ||
-      lower.includes('unauthorized') ||
-      lower.includes('invalid token')
-    ) {
-      return 'Invalid OpenCode Console API key. Please check your credentials in Settings, or clear the key to use free access.'
-    }
-    if (status === 404 || lower.includes('model not found') || lower.includes('unavailable')) {
-      return `The selected OpenCode model "${modelName}" is currently unavailable. Please fetch models in Settings to select an active free model.`
-    }
-    if (status === 429 || lower.includes('rate limit')) {
-      return 'OpenCode free inference rate limit reached. Please wait a moment and try again.'
-    }
-    if (lower.includes('timed out') || lower.includes('abort')) {
-      return `Request timed out after ${this.defaultTimeoutMs / 1000}s. The provider may be experiencing high demand.`
-    }
-
-    return (
-      rawMessage.replace(/^OpenCode API error:\s*/i, '').trim() ||
-      'The OpenCode AI provider is temporarily unavailable. Please try again.'
-    )
   }
 
   /**
@@ -183,158 +141,70 @@ export class OpenCodeProvider implements IAIProvider {
       systemInstruction,
       temperature = 0.2,
       timeoutMs = this.defaultTimeoutMs,
+      signal,
       onRetry
     } = options
+
+    if (signal?.aborted) {
+      throw new Error('Request was stopped by user.')
+    }
 
     const activeModel = modelName.trim() || this.defaultModel
     this.logDiagnostic('start', { model: activeModel, hasKey: !!apiKey?.trim() })
 
-    // Format messages for OpenAI-compatible Chat Completions API
-    const formattedMessages: Array<{
-      role: string
-      content: string | null
-      tool_calls?: Array<{
-        id: string
-        type: 'function'
-        function: {
-          name: string
-          arguments: string
-        }
-      }>
-      tool_call_id?: string
-      name?: string
-    }> = []
+    // Format messages and tools with shared serializers
+    const formattedMessages = serializeOpenAIMessages(messages, systemInstruction)
+    const formattedTools = serializeOpenAITools(tools)
 
-    if (systemInstruction) {
-      formattedMessages.push({
-        role: 'system',
-        content: systemInstruction
-      })
-    }
-
-    let lastToolCallId = 'call_list_files_1'
-
-    for (const msg of messages) {
-      if (msg.role === 'user') {
-        const text = msg.parts.map((p) => p.text || '').join('\n')
-        formattedMessages.push({
-          role: 'user',
-          content: text
-        })
-      } else if (msg.role === 'model') {
-        const toolCalls: Array<{
-          id: string
-          type: 'function'
-          function: {
-            name: string
-            arguments: string
-          }
-        }> = []
-        let textContent = ''
-
-        for (const part of msg.parts) {
-          if (part.functionCall) {
-            const toolCallId =
-              (part['id'] as string) ||
-              (part['tool_call_id'] as string) ||
-              `call_${part.functionCall.name}_${formattedMessages.length}`
-            part['id'] = toolCallId
-            part['tool_call_id'] = toolCallId
-            lastToolCallId = toolCallId
-
-            toolCalls.push({
-              id: toolCallId,
-              type: 'function',
-              function: {
-                name: part.functionCall.name,
-                arguments: JSON.stringify(part.functionCall.args || {})
-              }
-            })
-          }
-          if (part.text) {
-            textContent += part.text
-          }
-        }
-
-        const assistantMsg: {
-          role: string
-          content: string | null
-          tool_calls?: typeof toolCalls
-        } = {
-          role: 'assistant',
-          content: textContent || null
-        }
-
-        if (toolCalls.length > 0) {
-          assistantMsg.tool_calls = toolCalls
-        }
-
-        formattedMessages.push(assistantMsg)
-      } else if (msg.role === 'function') {
-        for (const part of msg.parts) {
-          if (part.functionResponse) {
-            const content = part.functionResponse.response.content
-            const contentStr =
-              typeof content === 'string'
-                ? content
-                : JSON.stringify(content, null, 2)
-
-            const toolCallId =
-              (part['tool_call_id'] as string) ||
-              (part['id'] as string) ||
-              lastToolCallId
-
-            formattedMessages.push({
-              role: 'tool',
-              tool_call_id: toolCallId,
-              name: part.functionResponse.name,
-              content: contentStr
-            })
-          }
-        }
-      }
-    }
-
-    const requestPayload: OpenCodeChatCompletionRequest = {
-      model: activeModel,
-      messages: formattedMessages,
-      temperature,
-      timeoutMs,
-      apiKey: apiKey?.trim() || undefined
-    }
-
-    if (tools && tools.length > 0) {
-      requestPayload.tools = tools.map((tool) => ({
-        type: 'function',
-        function: {
-          name: tool.name,
-          description: tool.description,
-          parameters: tool.parameters
-        }
-      }))
-      requestPayload.tool_choice = 'auto'
-    }
-
-    // Support streaming if onChunk callback provided in options
     const onChunkCallback = options.onChunk
     const isStreaming = typeof onChunkCallback === 'function'
-
-    if (isStreaming) {
-      requestPayload.stream = true
-      requestPayload.requestId = `opencode_req_${Math.random().toString(36).slice(2)}_${Date.now()}`
-    }
 
     const MAX_RETRIES = 2
     let lastError: Error | null = null
 
     for (let attempt = 0; attempt <= MAX_RETRIES; attempt++) {
+      if (signal?.aborted) {
+        throw new Error('Request was stopped by user.')
+      }
+
+      // Generate a fresh unique requestId for each attempt to prevent late-chunk bleed
+      const requestId = `opencode_${Date.now()}_${Math.random().toString(36).slice(2, 9)}_att${attempt}`
+
+      const requestPayload: OpenCodeChatCompletionRequest = {
+        model: activeModel,
+        messages: formattedMessages,
+        temperature,
+        timeoutMs,
+        apiKey: apiKey?.trim() || undefined,
+        requestId
+      }
+
+      if (formattedTools && formattedTools.length > 0) {
+        requestPayload.tools = formattedTools
+        requestPayload.tool_choice = 'auto'
+      }
+
+      if (isStreaming) {
+        requestPayload.stream = true
+      }
+
       let cleanupStreamListener: (() => void) | null = null
+      let accumulatedStreamText = ''
+      let attemptActive = true
+
+      const onAbort = () => {
+        if (typeof window !== 'undefined' && window.electronAPI?.cancelChatCompletion) {
+          window.electronAPI.cancelChatCompletion(requestId).catch(() => {})
+        }
+      }
+
+      if (signal) {
+        signal.addEventListener('abort', onAbort, { once: true })
+      }
 
       try {
-        let response: OpenCodeChatCompletionResponse
-
-        // Listen for streaming chunks if streaming is active
-        if (isStreaming && requestPayload.requestId) {
+        // Listen for streaming chunks strictly associated with this attempt's requestId
+        if (isStreaming) {
           const streamListener =
             this.streamListener ||
             (typeof window !== 'undefined' && window.electronAPI?.onOpenCodeStreamChunk
@@ -343,42 +213,78 @@ export class OpenCodeProvider implements IAIProvider {
 
           if (streamListener) {
             cleanupStreamListener = streamListener((event) => {
-              if (event.requestId === requestPayload.requestId && event.chunk) {
+              // Discard any chunk that arrives after attempt finishes or doesn't match this attempt's requestId
+              if (!attemptActive || event.requestId !== requestId) return
+              if (signal?.aborted) return
+
+              if (event.chunk) {
+                accumulatedStreamText += event.chunk
                 onChunkCallback(event.chunk)
               }
             })
           }
         }
 
-        // 1. Electron IPC dispatch (avoids Chromium CORS restrictions)
-        if (this.ipcCaller) {
-          this.logDiagnostic('sending_custom_ipc', { attempt, model: activeModel, stream: isStreaming })
-          response = await this.ipcCaller(requestPayload)
-        } else if (typeof window !== 'undefined' && window.electronAPI?.opencodeChatCompletion) {
-          this.logDiagnostic('sending_electron_ipc', { attempt, model: activeModel, stream: isStreaming })
-          response = await window.electronAPI.opencodeChatCompletion(requestPayload)
-        } else {
-          // 2. Direct Node / test harness fallback (direct fetch to OpenAI-compatible endpoint)
-          this.logDiagnostic('sending_direct_fetch', { attempt, model: activeModel, stream: isStreaming })
-          response = await this.sendDirectFetch(requestPayload, onChunkCallback)
+        let response: OpenCodeChatCompletionResponse
+
+        try {
+          if (this.ipcCaller) {
+            this.logDiagnostic('sending_custom_ipc', { attempt, model: activeModel, stream: isStreaming, requestId })
+            response = await this.ipcCaller(requestPayload)
+          } else if (typeof window !== 'undefined' && window.electronAPI?.opencodeChatCompletion) {
+            this.logDiagnostic('sending_electron_ipc', { attempt, model: activeModel, stream: isStreaming, requestId })
+            response = await window.electronAPI.opencodeChatCompletion(requestPayload)
+          } else {
+            // Direct Node / test harness fallback
+            this.logDiagnostic('sending_direct_fetch', { attempt, model: activeModel, stream: isStreaming, requestId })
+            response = await this.sendDirectFetch(requestPayload, onChunkCallback, signal)
+          }
+        } finally {
+          // Immediately mark attempt inactive and clean up stream listener so late chunks during retry sleep are dropped
+          attemptActive = false
+          if (cleanupStreamListener) {
+            cleanupStreamListener()
+            cleanupStreamListener = null
+          }
+        }
+
+        if (signal?.aborted) {
+          throw new Error('Request was stopped by user.')
         }
 
         if (!response.success) {
-          const status = response.status || 0
-          const rawMsg = response.errorDetails || response.error || 'Unknown error'
-          const isRetryable = this.isRetryableError(status, rawMsg)
+          const classification = classifyProviderError(
+            {
+              status: response.status,
+              message: response.errorDetails || response.error,
+              errorDetails: response.errorDetails,
+              isNetworkError: response.isNetworkError
+            },
+            {
+              signal,
+              providerName: this.name,
+              modelName: activeModel
+            }
+          )
 
-          if (isRetryable && attempt < MAX_RETRIES) {
-            const backoffMs = (attempt + 1) * 1000
-            this.logDiagnostic('retrying', { attempt: attempt + 1, backoffMs, status })
-            onRetry?.(attempt + 1, MAX_RETRIES, backoffMs, rawMsg)
-            await new Promise((resolve) => setTimeout(resolve, backoffMs))
+          if (classification.isUserCancellation) {
+            throw new Error('Request was stopped by user.')
+          }
+
+          if (classification.isRetryable && attempt < MAX_RETRIES) {
+            const delayMs = calculateRetryDelay(attempt, (response as any).retryAfter || null, {
+              baseDelayMs: 1000,
+              minDelayMs: 500,
+              maxDelayMs: 30000
+            })
+            this.logDiagnostic('retrying', { attempt: attempt + 1, delayMs, status: response.status })
+            onRetry?.(attempt + 1, MAX_RETRIES, delayMs, classification.reason)
+            await cancellableSleep(delayMs, signal)
             continue
           }
 
-          const friendlyError = this.formatUserFriendlyError(status, rawMsg, activeModel)
-          this.logDiagnostic('failed_final', { status, error: friendlyError })
-          throw new Error(friendlyError)
+          this.logDiagnostic('failed_final', { status: response.status, error: classification.userFriendlyMessage })
+          throw new Error(classification.userFriendlyMessage)
         }
 
         const choice = response.data?.choices?.[0]
@@ -387,68 +293,53 @@ export class OpenCodeProvider implements IAIProvider {
         }
 
         const choiceMsg = choice.message
-        const functionCalls: { name: string; args: Record<string, unknown> }[] = []
-        const rawModelParts: LLMPart[] = []
+        const { functionCalls, rawModelParts } = parseOpenAIToolCalls(choiceMsg.tool_calls)
 
-        if (choiceMsg.tool_calls && Array.isArray(choiceMsg.tool_calls)) {
-          for (const call of choiceMsg.tool_calls) {
-            let parsedArgs: Record<string, unknown> = {}
-            try {
-              parsedArgs =
-                typeof call.function.arguments === 'string'
-                  ? JSON.parse(call.function.arguments)
-                  : call.function.arguments || {}
-            } catch {
-              parsedArgs = {}
-            }
-
-            functionCalls.push({
-              name: call.function.name,
-              args: parsedArgs
-            })
-
-            rawModelParts.push({
-              functionCall: {
-                name: call.function.name,
-                args: parsedArgs
-              },
-              id: call.id,
-              tool_call_id: call.id
-            })
-          }
-        }
-
-        if (choiceMsg.content) {
-          rawModelParts.push({
-            text: choiceMsg.content
-          })
+        // Ensure final response matches stream deltas cleanly without duplicates
+        const finalText = (accumulatedStreamText || choiceMsg.content || '').trim() || undefined
+        if (finalText) {
+          rawModelParts.push({ text: finalText })
         }
 
         return {
-          text: choiceMsg.content || undefined,
+          text: finalText,
           functionCalls: functionCalls.length > 0 ? functionCalls : undefined,
           rawModelParts
         }
       } catch (err: unknown) {
-        const isAbort =
-          err instanceof Error &&
-          (err.name === 'AbortError' || err.message.toLowerCase().includes('abort'))
-        const rawMsg = isAbort ? `Request timed out after ${timeoutMs / 1000}s` : String(err)
-        const isRetryable = isAbort || this.isRetryableError(0, rawMsg)
+        if (signal?.aborted) {
+          throw new Error('Request was stopped by user.')
+        }
 
-        if (isRetryable && attempt < MAX_RETRIES) {
-          const backoffMs = (attempt + 1) * 1000
-          onRetry?.(attempt + 1, MAX_RETRIES, backoffMs, rawMsg)
-          await new Promise((resolve) => setTimeout(resolve, backoffMs))
+        const classification = classifyProviderError(err, {
+          signal,
+          providerName: this.name,
+          modelName: activeModel
+        })
+
+        if (classification.isUserCancellation) {
+          throw new Error('Request was stopped by user.')
+        }
+
+        if (classification.isRetryable && attempt < MAX_RETRIES) {
+          const delayMs = calculateRetryDelay(attempt, null, {
+            baseDelayMs: 1000,
+            minDelayMs: 500,
+            maxDelayMs: 30000
+          })
+          onRetry?.(attempt + 1, MAX_RETRIES, delayMs, classification.reason)
+          await cancellableSleep(delayMs, signal)
           continue
         }
 
-        const friendlyMsg = this.formatUserFriendlyError(0, rawMsg, activeModel)
-        lastError = new Error(friendlyMsg)
+        lastError = new Error(classification.userFriendlyMessage)
         throw lastError
       } finally {
         if (cleanupStreamListener) {
           cleanupStreamListener()
+        }
+        if (signal) {
+          signal.removeEventListener('abort', onAbort)
         }
       }
     }
@@ -461,12 +352,22 @@ export class OpenCodeProvider implements IAIProvider {
    */
   private async sendDirectFetch(
     req: OpenCodeChatCompletionRequest,
-    onChunk?: (chunk: string) => void
+    onChunk?: (chunk: string) => void,
+    signal?: AbortSignal
   ): Promise<OpenCodeChatCompletionResponse> {
     const fetchFunc = this.fetchImpl || fetch
     const timeoutMs = req.timeoutMs || this.defaultTimeoutMs
     const controller = new AbortController()
-    const timer = setTimeout(() => controller.abort(), timeoutMs)
+    let isTimedOut = false
+    const timer = setTimeout(() => {
+      isTimedOut = true
+      controller.abort()
+    }, timeoutMs)
+
+    const onSignalAbort = () => controller.abort()
+    if (signal) {
+      signal.addEventListener('abort', onSignalAbort, { once: true })
+    }
 
     const endpoint = 'https://opencode.ai/inference/openai/v1/chat/completions'
     const headers: Record<string, string> = {
@@ -498,6 +399,9 @@ export class OpenCodeProvider implements IAIProvider {
         signal: controller.signal
       })
       clearTimeout(timer)
+      if (signal) {
+        signal.removeEventListener('abort', onSignalAbort)
+      }
 
       if (!response.ok) {
         let errorDetails = `Status ${response.status} (${response.statusText})`
@@ -510,12 +414,14 @@ export class OpenCodeProvider implements IAIProvider {
           }
         } catch {}
 
+        const retryAfter = response.headers.get('retry-after')
         return {
           success: false,
           status: response.status,
           statusText: response.statusText,
           error: errorDetails,
-          errorDetails
+          errorDetails,
+          retryAfter: retryAfter || undefined
         }
       }
 
@@ -526,44 +432,64 @@ export class OpenCodeProvider implements IAIProvider {
         const toolCallsMap = new Map<number, { id: string; name: string; arguments: string }>()
 
         let buffer = ''
-        while (true) {
-          const { done, value } = await reader.read()
-          if (done) break
+        try {
+          while (true) {
+            if (controller.signal.aborted) break
 
-          buffer += decoder.decode(value, { stream: true })
-          const lines = buffer.split('\n')
-          buffer = lines.pop() || ''
+            const { done, value } = await reader.read()
+            if (done) break
 
-          for (const line of lines) {
-            const trimmed = line.trim()
-            if (!trimmed || !trimmed.startsWith('data:')) continue
-            const payload = trimmed.slice(5).trim()
-            if (payload === '[DONE]') continue
+            buffer += decoder.decode(value, { stream: true })
+            const lines = buffer.split('\n')
+            buffer = lines.pop() || ''
 
-            try {
-              const parsed = JSON.parse(payload)
-              const choice = parsed.choices?.[0]
-              if (!choice) continue
+            for (const line of lines) {
+              if (controller.signal.aborted) break
 
-              const delta = choice.delta
-              if (delta) {
-                if (delta.content) {
-                  accumulatedContent += delta.content
-                  onChunk?.(delta.content)
-                }
+              const trimmed = line.trim()
+              if (!trimmed || !trimmed.startsWith('data:')) continue
+              const payload = trimmed.slice(5).trim()
+              if (payload === '[DONE]') continue
 
-                if (delta.tool_calls && Array.isArray(delta.tool_calls)) {
-                  for (const tc of delta.tool_calls) {
-                    const idx = typeof tc.index === 'number' ? tc.index : toolCallsMap.size
-                    const existing = toolCallsMap.get(idx) || { id: '', name: '', arguments: '' }
-                    if (tc.id) existing.id = tc.id
-                    if (tc.function?.name) existing.name = tc.function.name
-                    if (tc.function?.arguments) existing.arguments += tc.function.arguments
-                    toolCallsMap.set(idx, existing)
+              try {
+                const parsed = JSON.parse(payload)
+                const choice = parsed.choices?.[0]
+                if (!choice) continue
+
+                const delta = choice.delta
+                if (delta) {
+                  if (delta.content) {
+                    accumulatedContent += delta.content
+                    onChunk?.(delta.content)
+                  }
+
+                  if (delta.tool_calls && Array.isArray(delta.tool_calls)) {
+                    for (const tc of delta.tool_calls) {
+                      const idx = typeof tc.index === 'number' ? tc.index : toolCallsMap.size
+                      const existing = toolCallsMap.get(idx) || { id: '', name: '', arguments: '' }
+                      if (tc.id) existing.id = tc.id
+                      if (tc.function?.name) existing.name += tc.function.name
+                      if (tc.function?.arguments) existing.arguments += tc.function.arguments
+                      toolCallsMap.set(idx, existing)
+                    }
                   }
                 }
-              }
-            } catch {}
+              } catch {}
+            }
+          }
+        } catch (streamErr: unknown) {
+          try {
+            await reader.cancel()
+          } catch {}
+          throw streamErr
+        }
+
+        if (controller.signal.aborted) {
+          return {
+            success: false,
+            isNetworkError: false,
+            error: 'Request was stopped by user.',
+            errorDetails: 'Request was stopped by user.'
           }
         }
 
@@ -605,13 +531,23 @@ export class OpenCodeProvider implements IAIProvider {
       }
     } catch (err: unknown) {
       clearTimeout(timer)
+      if (signal) {
+        signal.removeEventListener('abort', onSignalAbort)
+      }
+
+      const isUserCancel = (signal?.aborted || controller.signal.aborted) && !isTimedOut
       const isAbort =
         err instanceof Error &&
         (err.name === 'AbortError' || err.message.toLowerCase().includes('abort'))
-      const rawMsg = isAbort ? `Request timed out after ${timeoutMs / 1000}s` : String(err)
+      const rawMsg = isUserCancel
+        ? 'Request was stopped by user.'
+        : isAbort || isTimedOut
+        ? `Request timed out after ${timeoutMs / 1000}s`
+        : String(err)
+
       return {
         success: false,
-        isNetworkError: true,
+        isNetworkError: !isUserCancel,
         error: rawMsg,
         errorDetails: rawMsg
       }

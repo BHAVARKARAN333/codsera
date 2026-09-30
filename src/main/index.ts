@@ -973,12 +973,46 @@ function registerIpcHandlers(): void {
     }
   )
 
+  interface ActiveChatRequest {
+    requestId: string
+    provider: 'nvidia' | 'opencode'
+    controller: AbortController
+    reader?: ReadableStreamDefaultReader<Uint8Array>
+  }
+  const activeChatRequests = new Map<string, ActiveChatRequest>()
+
+  // Handle cancelling active in-flight AI completion requests
+  ipcMain.handle(
+    IPC_CHANNELS.CANCEL_CHAT_COMPLETION,
+    async (_event, requestId: string): Promise<{ success: boolean; canceled: boolean }> => {
+      if (!requestId || typeof requestId !== 'string') {
+        return { success: false, canceled: false }
+      }
+      const active = activeChatRequests.get(requestId)
+      if (active) {
+        activeChatRequests.delete(requestId)
+        try {
+          if (active.reader) {
+            active.reader.cancel('Request was stopped by user.').catch(() => {})
+          }
+        } catch {}
+        try {
+          active.controller.abort('Request was stopped by user.')
+        } catch {}
+        console.log(`[IPC] Successfully cancelled in-flight request: ${requestId} (${active.provider})`)
+        return { success: true, canceled: true }
+      }
+      return { success: true, canceled: false }
+    }
+  )
+
   // Handle NVIDIA NIM chat completions via Node.js fetch in main process (Bypasses Chromium CORS restrictions)
   ipcMain.handle(
     IPC_CHANNELS.NVIDIA_CHAT_COMPLETION,
     async (_event, request: NvidiaChatCompletionRequest): Promise<NvidiaChatCompletionResponse> => {
       const endpoint = 'https://integrate.api.nvidia.com/v1/chat/completions'
       const timeoutMs = request.timeoutMs && request.timeoutMs > 0 ? request.timeoutMs : 30000
+      const requestId = request.requestId
 
       if (!request || typeof request !== 'object') {
         console.log('[NVIDIA NIM IPC] Invalid request payload received')
@@ -1044,7 +1078,19 @@ function registerIpcHandlers(): void {
       }
 
       const controller = new AbortController()
-      const timer = setTimeout(() => controller.abort(), timeoutMs)
+      let isTimedOut = false
+      const timer = setTimeout(() => {
+        isTimedOut = true
+        controller.abort()
+      }, timeoutMs)
+
+      if (requestId) {
+        activeChatRequests.set(requestId, {
+          requestId,
+          provider: 'nvidia',
+          controller
+        })
+      }
 
       try {
         console.log(`[NVIDIA NIM IPC] Stage: connecting -> Dispatching HTTPS POST to ${endpoint}`)
@@ -1079,6 +1125,7 @@ function registerIpcHandlers(): void {
           }
 
           console.log(`[NVIDIA NIM IPC] HTTP Error response: ${errorDetails}`)
+          const retryAfter = response.headers.get('retry-after')
 
           return {
             success: false,
@@ -1086,6 +1133,7 @@ function registerIpcHandlers(): void {
             statusText: response.statusText,
             error: errorDetails,
             errorDetails,
+            retryAfter: retryAfter || undefined,
             stage: 'response_received'
           }
         }
@@ -1102,23 +1150,30 @@ function registerIpcHandlers(): void {
         }
       } catch (err: unknown) {
         clearTimeout(timer)
+        const isUserCancel = controller.signal.aborted && !isTimedOut
         const isAbort =
           err instanceof Error &&
           (err.name === 'AbortError' || err.message.toLowerCase().includes('abort'))
-        const rawMessage = isAbort
+        const rawMessage = isUserCancel
+          ? 'Request was stopped by user.'
+          : isAbort || isTimedOut
           ? `Request timed out after ${timeoutMs / 1000}s`
           : err instanceof Error
           ? err.message
           : String(err)
 
-        console.log(`[NVIDIA NIM IPC] Stage: failed -> Network/Runtime Error: ${rawMessage}`)
+        console.log(`[NVIDIA NIM IPC] Stage: ${isUserCancel ? 'cancelled' : 'failed'} -> Network/Runtime Error: ${rawMessage}`)
 
         return {
           success: false,
-          isNetworkError: true,
+          isNetworkError: !isUserCancel,
           error: rawMessage,
           errorDetails: rawMessage,
-          stage: 'failed'
+          stage: isUserCancel ? 'cancelled' : 'failed'
+        }
+      } finally {
+        if (requestId) {
+          activeChatRequests.delete(requestId)
         }
       }
     }
@@ -1290,7 +1345,19 @@ function registerIpcHandlers(): void {
       }
 
       const controller = new AbortController()
-      const timer = setTimeout(() => controller.abort(), timeoutMs)
+      let isTimedOut = false
+      const timer = setTimeout(() => {
+        isTimedOut = true
+        controller.abort()
+      }, timeoutMs)
+
+      if (requestId) {
+        activeChatRequests.set(requestId, {
+          requestId,
+          provider: 'opencode',
+          controller
+        })
+      }
 
       try {
         console.log(`[OpenCode IPC] Dispatching request to model: ${model}, stream: ${stream}, hasKey: ${!!apiKey}`)
@@ -1314,76 +1381,104 @@ function registerIpcHandlers(): void {
           } catch {}
 
           console.log(`[OpenCode IPC] HTTP error ${response.status}: ${errorDetails}`)
+          const retryAfter = response.headers.get('retry-after')
+
           return {
             success: false,
             status: response.status,
             statusText: response.statusText,
             error: errorDetails,
-            errorDetails
+            errorDetails,
+            retryAfter: retryAfter || undefined
           }
         }
 
         // If streaming is requested and response has a readable body stream
         if (stream && response.body) {
           const reader = response.body.getReader()
+          if (requestId) {
+            const active = activeChatRequests.get(requestId)
+            if (active) active.reader = reader
+          }
+
           const decoder = new TextDecoder()
           let accumulatedContent = ''
           const toolCallsMap = new Map<number, { id: string; name: string; arguments: string }>()
 
           let buffer = ''
-          while (true) {
-            const { done, value } = await reader.read()
-            if (done) break
+          try {
+            while (true) {
+              if (controller.signal.aborted) break
 
-            buffer += decoder.decode(value, { stream: true })
-            const lines = buffer.split('\n')
-            buffer = lines.pop() || ''
+              const { done, value } = await reader.read()
+              if (done) break
 
-            for (const line of lines) {
-              const trimmed = line.trim()
-              if (!trimmed || !trimmed.startsWith('data:')) continue
-              const payload = trimmed.slice(5).trim()
-              if (payload === '[DONE]') continue
+              buffer += decoder.decode(value, { stream: true })
+              const lines = buffer.split('\n')
+              buffer = lines.pop() || ''
 
-              try {
-                const parsed = JSON.parse(payload)
-                const choice = parsed.choices?.[0]
-                if (!choice) continue
+              for (const line of lines) {
+                if (controller.signal.aborted) break
 
-                const delta = choice.delta
-                if (delta) {
-                  if (delta.content) {
-                    accumulatedContent += delta.content
-                    if (requestId && !event.sender.isDestroyed()) {
-                      event.sender.send(IPC_CHANNELS.OPENCODE_STREAM_CHUNK, {
-                        requestId,
-                        chunk: delta.content
-                      })
+                const trimmed = line.trim()
+                if (!trimmed || !trimmed.startsWith('data:')) continue
+                const payload = trimmed.slice(5).trim()
+                if (payload === '[DONE]') continue
+
+                try {
+                  const parsed = JSON.parse(payload)
+                  const choice = parsed.choices?.[0]
+                  if (!choice) continue
+
+                  const delta = choice.delta
+                  if (delta) {
+                    if (delta.content) {
+                      accumulatedContent += delta.content
+                      if (!controller.signal.aborted && requestId && !event.sender.isDestroyed()) {
+                        event.sender.send(IPC_CHANNELS.OPENCODE_STREAM_CHUNK, {
+                          requestId,
+                          chunk: delta.content
+                        })
+                      }
+                    }
+
+                    if (delta.tool_calls && Array.isArray(delta.tool_calls)) {
+                      for (const tc of delta.tool_calls) {
+                        const idx = typeof tc.index === 'number' ? tc.index : toolCallsMap.size
+                        const existing = toolCallsMap.get(idx) || { id: '', name: '', arguments: '' }
+                        if (tc.id) existing.id = tc.id
+                        if (tc.function?.name) existing.name = tc.function.name
+                        if (tc.function?.arguments) existing.arguments += tc.function.arguments
+                        toolCallsMap.set(idx, existing)
+                      }
                     }
                   }
-
-                  if (delta.tool_calls && Array.isArray(delta.tool_calls)) {
-                    for (const tc of delta.tool_calls) {
-                      const idx = typeof tc.index === 'number' ? tc.index : toolCallsMap.size
-                      const existing = toolCallsMap.get(idx) || { id: '', name: '', arguments: '' }
-                      if (tc.id) existing.id = tc.id
-                      if (tc.function?.name) existing.name = tc.function.name
-                      if (tc.function?.arguments) existing.arguments += tc.function.arguments
-                      toolCallsMap.set(idx, existing)
-                    }
-                  }
+                } catch {
+                  // Ignore partial JSON parse chunks
                 }
-              } catch {
-                // Ignore partial JSON parse chunks
               }
             }
+
+            if (!controller.signal.aborted && requestId && !event.sender.isDestroyed()) {
+              event.sender.send(IPC_CHANNELS.OPENCODE_STREAM_CHUNK, {
+                requestId,
+                done: true
+              })
+            }
+          } catch (streamErr: unknown) {
+            try {
+              await reader.cancel()
+            } catch {}
+            throw streamErr
           }
 
-          if (requestId && !event.sender.isDestroyed()) {
-            event.sender.send(IPC_CHANNELS.OPENCODE_STREAM_CHUNK, {
-              requestId,
-              done: true
-            })
+          if (controller.signal.aborted) {
+            return {
+              success: false,
+              isNetworkError: false,
+              error: 'Request was stopped by user.',
+              errorDetails: 'Request was stopped by user.'
+            }
           }
 
           const finalToolCalls = Array.from(toolCallsMap.values())
@@ -1425,12 +1520,17 @@ function registerIpcHandlers(): void {
         }
       } catch (err: unknown) {
         clearTimeout(timer)
+        const isUserCancel = controller.signal.aborted && !isTimedOut
         const isAbort =
           err instanceof Error &&
           (err.name === 'AbortError' || err.message.toLowerCase().includes('abort'))
-        const rawMsg = isAbort ? `Request timed out after ${timeoutMs / 1000}s` : String(err)
+        const rawMsg = isUserCancel
+          ? 'Request was stopped by user.'
+          : isAbort || isTimedOut
+          ? `Request timed out after ${timeoutMs / 1000}s`
+          : String(err)
 
-        if (requestId && stream && !event.sender.isDestroyed()) {
+        if (!isUserCancel && requestId && stream && !event.sender.isDestroyed()) {
           event.sender.send(IPC_CHANNELS.OPENCODE_STREAM_CHUNK, {
             requestId,
             error: rawMsg,
@@ -1438,12 +1538,16 @@ function registerIpcHandlers(): void {
           })
         }
 
-        console.log(`[OpenCode IPC] Request failed: ${rawMsg}`)
+        console.log(`[OpenCode IPC] Request ${isUserCancel ? 'cancelled' : 'failed'}: ${rawMsg}`)
         return {
           success: false,
-          isNetworkError: true,
+          isNetworkError: !isUserCancel,
           error: rawMsg,
           errorDetails: rawMsg
+        }
+      } finally {
+        if (requestId) {
+          activeChatRequests.delete(requestId)
         }
       }
     }

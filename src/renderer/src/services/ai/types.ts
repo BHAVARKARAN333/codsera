@@ -55,9 +55,17 @@ export interface LLMResponse {
   rawModelParts?: LLMPart[]
 }
 
+export interface ProviderCapabilities {
+  supportsStreaming: boolean
+  supportsTools: boolean
+  requiresApiKey: boolean
+  supportsModelListing?: boolean
+}
+
 export interface IAIProvider {
   readonly id: string
   readonly name: string
+  readonly capabilities?: ProviderCapabilities
   sendMessage(
     messages: LLMMessage[],
     tools: FunctionDeclaration[],

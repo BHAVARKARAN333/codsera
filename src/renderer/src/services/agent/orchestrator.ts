@@ -20,6 +20,7 @@ export interface AgentRunOptions {
   workspaceRoot: string | null
   modelName?: string
   timeoutMs?: number
+  signal?: AbortSignal
   requestApproval?: (request: ToolApprovalRequest) => Promise<boolean>
   onFileCreated?: (path: string) => void
   onFileEdited?: (path: string, newContent: string) => void
@@ -237,6 +238,7 @@ export class AgentOrchestrator {
       workspaceRoot,
       modelName,
       timeoutMs,
+      signal,
       onStep,
       onChunk,
       requestApproval,
@@ -301,6 +303,21 @@ Rules for tool usage & failure handling:
     const runId = ++this.activeRunId
     const runController = new AbortController()
     this.abortController = runController
+
+    if (signal) {
+      if (signal.aborted) {
+        runController.abort()
+        throw new Error('Request was stopped by user.')
+      }
+      signal.addEventListener(
+        'abort',
+        () => {
+          runController.abort()
+        },
+        { once: true }
+      )
+    }
+
     const runSignal = runController.signal
 
     let isRunFinished = false
@@ -466,13 +483,18 @@ Rules for tool usage & failure handling:
         let response
         const providerStart = performance.now()
         try {
-          response = await this.provider.sendMessage(this.history, toolDeclarations, {
+          const supportsTools = this.provider.capabilities?.supportsTools !== false
+          const toolsToPass = supportsTools ? toolDeclarations : []
+          const supportsStreaming = this.provider.capabilities?.supportsStreaming !== false
+          const chunkHandler = supportsStreaming ? safeOnChunk : undefined
+
+          response = await this.provider.sendMessage(this.history, toolsToPass, {
             apiKey,
             modelName,
             systemInstruction: dynamicSystemInstruction,
             timeoutMs,
             signal: runSignal,
-            onChunk: safeOnChunk,
+            onChunk: chunkHandler,
             onRetry: (attempt, maxRetries, _delayMs, reason) => {
               const retryText = reason
                 ? `Temporary provider issue: ${reason} — retrying (${attempt}/${maxRetries})...`
