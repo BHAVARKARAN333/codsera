@@ -202,6 +202,53 @@ const COMMON_STOP_WORDS = new Set([
   'find'
 ])
 
+const COMMON_FILE_EXTENSIONS = new Set([
+  'ts',
+  'tsx',
+  'js',
+  'jsx',
+  'mjs',
+  'cjs',
+  'mts',
+  'cts',
+  'json',
+  'jsonc',
+  'css',
+  'scss',
+  'sass',
+  'less',
+  'html',
+  'htm',
+  'xml',
+  'svg',
+  'md',
+  'txt',
+  'yaml',
+  'yml',
+  'toml',
+  'env',
+  'sh',
+  'bash',
+  'ps1',
+  'cmd',
+  'bat',
+  'py',
+  'rb',
+  'rs',
+  'go',
+  'c',
+  'cpp',
+  'h',
+  'hpp',
+  'java',
+  'kt',
+  'sql',
+  'graphql',
+  'gql',
+  'vue',
+  'svelte'
+])
+
 /**
  * Safely extracts relative workspace path from an entry path, respecting OS platform casing
  * and enforcing strict path boundaries so sibling directories (e.g. C:/project-other)
@@ -256,7 +303,7 @@ export function toRelativeWorkspacePath(fullPath: string, workspaceRoot: string)
 }
 
 export class SmartContextEngine {
-  private config: Required<SmartContextEngineConfig>
+  public config: Required<SmartContextEngineConfig>
   private cache: ContextCache
   private budgetManager: ContextBudgetManager
   private deduplicator: ContextDeduplicator
@@ -306,6 +353,10 @@ export class SmartContextEngine {
       debug
     })
     this.codebaseIndex = new CodebaseIndex(this.dependencyAnalyzer, debug)
+  }
+
+  getConfig(): Required<SmartContextEngineConfig> {
+    return { ...this.config }
   }
 
   setDebug(enabled: boolean): void {
@@ -1618,18 +1669,22 @@ export class SmartContextEngine {
 
   /**
    * Tokenizes a text into meaningful lowercase words (splitting camelCase, kebab-case, snake_case).
+   * Strips file extensions and common stop words so filename tokens are cleanly matched.
    */
   tokenize(text: string): string[] {
     const splitCamel = text
       .replace(/([a-z\d])([A-Z])/g, '$1 $2')
       .replace(/([A-Z]+)([A-Z][a-z])/g, '$1 $2')
-    const words = splitCamel.toLowerCase().split(/[^a-z0-9_.-]+/)
+    const words = splitCamel.toLowerCase().split(/[^a-z0-9]+/)
     const cleanTokens: string[] = []
 
     for (const w of words) {
-      const stripped = w.replace(/^[._-]+|[._-]+$/g, '')
-      if (stripped.length >= 2 && !COMMON_STOP_WORDS.has(stripped)) {
-        cleanTokens.push(stripped)
+      if (
+        w.length >= 2 &&
+        !COMMON_STOP_WORDS.has(w) &&
+        !COMMON_FILE_EXTENSIONS.has(w)
+      ) {
+        cleanTokens.push(w)
       }
     }
 
@@ -1668,8 +1723,11 @@ export class SmartContextEngine {
     for (const relPath of filePaths) {
       const normalizedPath = relPath.replace(/\\/g, '/')
       const pathLower = normalizedPath.toLowerCase()
-      const segments = pathLower.split('/')
+      const segments = normalizedPath.split('/')
       const fileName = segments[segments.length - 1]
+      const fileNameLower = fileName.toLowerCase()
+      const baseName = fileName.replace(/\.[a-zA-Z0-9]+$/, '')
+      const baseNameLower = baseName.toLowerCase()
       const fileTokens = this.tokenize(fileName)
       const pathTokens = this.tokenize(normalizedPath)
 
@@ -1684,7 +1742,7 @@ export class SmartContextEngine {
           isExplicit = true
           reasons.push(`Exact path match ("${mention}")`)
           break
-        } else if (fileName === mention || fileName.startsWith(mention.split('.')[0])) {
+        } else if (fileNameLower === mention || fileNameLower.startsWith(mention.split('.')[0])) {
           score += 500
           isExplicit = true
           reasons.push(`Exact file name match ("${mention}")`)
@@ -1692,17 +1750,16 @@ export class SmartContextEngine {
         }
       }
 
-      const baseName = fileName.replace(/\.[a-zA-Z0-9]+$/, '')
       if (promptLower.includes(pathLower)) {
         score += 800
         isExplicit = true
         reasons.push('Full path appears in prompt')
-      } else if (promptLower.includes(fileName)) {
+      } else if (promptLower.includes(fileNameLower)) {
         score += 300
-        reasons.push(`File name "${fileName}" appears in prompt`)
-      } else if (baseName.length >= 4 && promptLower.includes(baseName)) {
+        reasons.push(`File name "${fileNameLower}" appears in prompt`)
+      } else if (baseNameLower.length >= 4 && promptLower.includes(baseNameLower)) {
         score += 250
-        reasons.push(`File base name "${baseName}" appears in prompt`)
+        reasons.push(`File base name "${baseNameLower}" appears in prompt`)
       }
 
       // 2. Token overlap
@@ -1765,12 +1822,12 @@ export class SmartContextEngine {
 
       if (isArchIntent) {
         const isEntryPoint =
-          fileName === 'package.json' ||
+          fileNameLower === 'package.json' ||
           pathLower === 'src/main/index.ts' ||
           pathLower === 'src/renderer/src/app.tsx' ||
           pathLower === 'src/renderer/src/main.tsx' ||
           pathLower === 'src/preload/index.ts' ||
-          fileName === 'tsconfig.json'
+          fileNameLower === 'tsconfig.json'
 
         if (isEntryPoint) {
           score += 100
@@ -1780,9 +1837,9 @@ export class SmartContextEngine {
 
       if (isConfigIntent) {
         if (
-          fileName === 'package.json' ||
-          fileName.includes('config') ||
-          fileName.includes('tsconfig')
+          fileNameLower === 'package.json' ||
+          fileNameLower.includes('config') ||
+          fileNameLower.includes('tsconfig')
         ) {
           score += 120
           reasons.push('Project configuration file')
@@ -1814,6 +1871,13 @@ export class SmartContextEngine {
           score += 100
           reasons.push('Matches specified OpenCode provider')
         }
+        if (
+          pathLower.includes('aichat') &&
+          (promptLower.includes('chat ui') || (promptLower.includes('chat') && promptLower.includes('ui')))
+        ) {
+          score += 100
+          reasons.push('Matches AI chat UI component')
+        }
       }
 
       const depth = segments.length
@@ -1829,7 +1893,7 @@ export class SmartContextEngine {
       }
     }
 
-    candidates.sort((a, b) => b.score - a.score)
+    candidates.sort((a, b) => (b.score - a.score) || a.path.localeCompare(b.path))
     return candidates.slice(0, this.config.maxCandidates)
   }
 
@@ -2119,12 +2183,20 @@ export class SmartContextEngine {
           content = cachedEntry.content
           source = 'cache'
         } else {
-          // Read from disk
+          // Read from disk with race-condition detection against concurrent editor save/invalidation
+          const preReadVersion = this.cache.getVersion(candidate.path)
           const readRes = await window.electronAPI.readWorkspaceFile(workspaceRoot, candidate.path)
-          if (readRes.success && typeof readRes.content === 'string') {
+          const freshCached = this.cache.get(candidate.path)
+
+          if (freshCached && this.cache.getVersion(candidate.path) !== preReadVersion) {
+            content = freshCached.content
+            source = 'cache'
+          } else if (readRes.success && typeof readRes.content === 'string') {
             content = readRes.content
             source = 'disk'
-            this.cache.set(candidate.path, content)
+            if (this.cache.getVersion(candidate.path) === preReadVersion) {
+              this.cache.set(candidate.path, content)
+            }
           } else {
             if (this.config.debug) {
               console.debug(`[SmartContextEngine] Failed to read candidate: ${candidate.path}`)

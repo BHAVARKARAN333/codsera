@@ -44,6 +44,7 @@ export interface LLMRequestOptions {
   systemInstruction?: string
   temperature?: number
   timeoutMs?: number
+  signal?: AbortSignal
   onRetry?: (attempt: number, maxRetries: number, delayMs: number, reason: string) => void
   onChunk?: (chunk: string) => void
 }

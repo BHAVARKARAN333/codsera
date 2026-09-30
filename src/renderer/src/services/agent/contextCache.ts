@@ -23,6 +23,7 @@ export interface ContextCacheEntry {
   contentHash: string
   lastReadTimestamp: number
   fileSize: number
+  version: number
 }
 
 export interface ContextCacheStats {
@@ -35,6 +36,7 @@ export interface ContextCacheStats {
 
 export class ContextCache {
   private cache: Map<string, ContextCacheEntry> = new Map()
+  private fileVersions: Map<string, number> = new Map()
   private hits = 0
   private misses = 0
   private invalidations = 0
@@ -84,17 +86,27 @@ export class ContextCache {
   }
 
   /**
+   * Gets the monotonic version for a file path (0 if never set).
+   */
+  getVersion(filePath: string): number {
+    return this.fileVersions.get(this.normalizeKey(filePath)) || 0
+  }
+
+  /**
    * Stores or updates a file in the cache.
    */
   set(filePath: string, content: string): ContextCacheEntry {
     const key = this.normalizeKey(filePath)
+    const nextVersion = (this.fileVersions.get(key) || 0) + 1
+    this.fileVersions.set(key, nextVersion)
     const hash = computeContentHash(content)
     const entry: ContextCacheEntry = {
       normalizedPath: key,
       content,
       contentHash: hash,
       lastReadTimestamp: Date.now(),
-      fileSize: content.length
+      fileSize: content.length,
+      version: nextVersion
     }
     this.cache.set(key, entry)
     return entry
@@ -112,6 +124,8 @@ export class ContextCache {
    */
   invalidate(filePath: string): boolean {
     const key = this.normalizeKey(filePath)
+    const nextVersion = (this.fileVersions.get(key) || 0) + 1
+    this.fileVersions.set(key, nextVersion)
     const existed = this.cache.delete(key)
     if (existed) {
       this.invalidations++
@@ -128,6 +142,7 @@ export class ContextCache {
   clear(): void {
     const count = this.cache.size
     this.cache.clear()
+    this.fileVersions.clear()
     this.hits = 0
     this.misses = 0
     this.invalidations = 0

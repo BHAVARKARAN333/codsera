@@ -12,6 +12,7 @@ export interface ToolApprovalRequest {
 
 export interface ToolContext {
   workspaceRoot: string | null
+  signal?: AbortSignal
   requestApproval?: (request: ToolApprovalRequest) => Promise<boolean>
   onFileCreated?: (path: string) => void
   onFileEdited?: (path: string, newContent: string) => void

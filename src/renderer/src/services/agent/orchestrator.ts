@@ -34,6 +34,7 @@ export class AgentOrchestrator {
   private tools: Map<string, ITool> = new Map()
   private history: LLMMessage[] = []
   private abortController: AbortController | null = null
+  private activeRunId = 0
   private processedToolCallIds: Set<string> = new Set()
   private smartContextEngine: SmartContextEngine = new SmartContextEngine()
   private agentPlanner: AgentPlanner = new AgentPlanner()
@@ -70,6 +71,14 @@ export class AgentOrchestrator {
     }))
   }
 
+  private getHistoryCharCount(): number {
+    let total = 0
+    for (const msg of this.history) {
+      total += JSON.stringify(msg).length
+    }
+    return total
+  }
+
   clearHistory(): void {
     this.history = []
     this.processedToolCallIds.clear()
@@ -80,7 +89,6 @@ export class AgentOrchestrator {
   stop(): void {
     if (this.abortController) {
       this.abortController.abort()
-      this.abortController = null
     }
     if (typeof window !== 'undefined' && window.electronAPI?.stopCommand) {
       window.electronAPI.stopCommand().catch(() => {})
@@ -206,8 +214,14 @@ Rules for tool usage & failure handling:
       return approved
     }
 
+    const runId = ++this.activeRunId
+    const runController = new AbortController()
+    this.abortController = runController
+    const runSignal = runController.signal
+
     const toolContext: ToolContext = {
       workspaceRoot,
+      signal: runSignal,
       requestApproval: wrappedRequestApproval,
       onFileCreated: wrappedOnFileCreated,
       onFileEdited: wrappedOnFileEdited,
@@ -226,253 +240,294 @@ Rules for tool usage & failure handling:
     let totalProviderTime = 0
     let totalToolTime = 0
 
-    this.abortController = new AbortController()
+    try {
+      while (iterations < MAX_TOOL_ITERATIONS) {
+        if (runSignal.aborted || this.activeRunId !== runId) {
+          throw new Error('Request was stopped by user.')
+        }
 
-    while (iterations < MAX_TOOL_ITERATIONS) {
-      if (this.abortController?.signal.aborted) {
-        throw new Error('Request was stopped by user.')
-      }
+        iterations++
+        onStep?.({ type: 'thinking' })
 
-      iterations++
-      onStep?.({ type: 'thinking' })
+        let response
+        const providerStart = performance.now()
+        try {
+          response = await this.provider.sendMessage(this.history, toolDeclarations, {
+            apiKey,
+            modelName,
+            systemInstruction: dynamicSystemInstruction,
+            timeoutMs,
+            signal: runSignal,
+            onChunk,
+            onRetry: (attempt, maxRetries) => {
+              onStep?.({
+                type: 'retrying',
+                text: `Temporary provider issue — retrying (${attempt}/${maxRetries})...`
+              })
+            }
+          })
+        } catch (err: unknown) {
+          const errorMsg = err instanceof Error ? err.message : String(err)
+          onStep?.({ type: 'error', error: errorMsg })
+          throw err
+        } finally {
+          totalProviderTime += performance.now() - providerStart
+        }
 
-      let response
-      const providerStart = performance.now()
-      try {
-        response = await this.provider.sendMessage(this.history, toolDeclarations, {
-          apiKey,
-          modelName,
-          systemInstruction: dynamicSystemInstruction,
-          timeoutMs,
-          onChunk,
-          onRetry: (attempt, maxRetries) => {
-            onStep?.({
-              type: 'retrying',
-              text: `Temporary provider issue — retrying (${attempt}/${maxRetries})...`
-            })
-          }
-        })
-      } catch (err: unknown) {
-        const errorMsg = err instanceof Error ? err.message : String(err)
-        onStep?.({ type: 'error', error: errorMsg })
-        throw err
-      } finally {
-        totalProviderTime += performance.now() - providerStart
-      }
+        if (runSignal.aborted || this.activeRunId !== runId) {
+          throw new Error('Request was stopped by user.')
+        }
 
-      // Check if model decided to call tools
-      if (response.functionCalls && response.functionCalls.length > 0) {
-        // Save complete model turn in history (preserving thoughtSignature and exact parts)
-        const modelParts =
-          response.rawModelParts && response.rawModelParts.length > 0
-            ? response.rawModelParts
-            : response.functionCalls.map((call) => ({ functionCall: call }))
+        // Check if model decided to call tools
+        if (response.functionCalls && response.functionCalls.length > 0) {
+          // Save complete model turn in history (preserving thoughtSignature and exact parts)
+          const modelParts =
+            response.rawModelParts && response.rawModelParts.length > 0
+              ? response.rawModelParts
+              : response.functionCalls.map((call) => ({ functionCall: call }))
 
-        this.history.push({
-          role: 'model',
-          parts: modelParts
-        })
-
-        for (let i = 0; i < response.functionCalls.length; i++) {
-          const call = response.functionCalls[i]
-          const rawPart = modelParts[i] as Record<string, unknown> | undefined
-          const toolCallId = (rawPart?.['id'] as string) || (rawPart?.['tool_call_id'] as string) || `call_${call.name}_${this.history.length}_${i}`
-
-          if (rawPart) {
-            rawPart['id'] = toolCallId
-            rawPart['tool_call_id'] = toolCallId
-          }
-
-          let toolResultOutput: string
-          let toolSuccess = false
-
-          if (this.processedToolCallIds.has(toolCallId)) {
-            // This exact tool call ID was already executed - skip execution
-            continue
-          }
-
-          this.processedToolCallIds.add(toolCallId)
-
-          onStep?.({
-            type: 'tool_call',
-            toolName: call.name,
-            toolArgs: call.args
+          this.history.push({
+            role: 'model',
+            parts: modelParts
           })
 
-          const activeStep = plan?.steps.find(
-            (s) => (s.status === 'running' || s.status === 'waiting_for_approval' || s.status === 'pending') && (!s.toolName || s.toolName === call.name)
-          )
-          if (activeStep && activeStep.status === 'pending') {
-            this.agentPlanner.startStep(activeStep.id)
-          }
-
-          const tool = this.tools.get(call.name)
-          if (!tool) {
-            toolResultOutput = `Error: Tool '${call.name}' is not recognized or available.`
-            toolSuccess = false
-            if (activeStep) {
-              this.agentPlanner.failStep(activeStep.id, toolResultOutput)
+          for (let i = 0; i < response.functionCalls.length; i++) {
+            if (runSignal.aborted || this.activeRunId !== runId) {
+              throw new Error('Request was stopped by user.')
             }
-          } else {
-            const toolStart = performance.now()
-            const execResult = await tool.execute(call.args, toolContext)
-            totalToolTime += performance.now() - toolStart
 
-            if (execResult.rejected) {
-              const rejectionText = execResult.output || 'Edit rejected — no changes were made.'
-              if (plan) {
-                this.agentPlanner.abortPlan(rejectionText)
+            const call = response.functionCalls[i]
+            const rawPart = modelParts[i] as Record<string, unknown> | undefined
+            const toolCallId =
+              (rawPart?.['id'] as string) ||
+              (rawPart?.['tool_call_id'] as string) ||
+              `call_${call.name}_${this.history.length}_${i}`
+
+            if (rawPart) {
+              rawPart['id'] = toolCallId
+              rawPart['tool_call_id'] = toolCallId
+            }
+
+            let toolResultOutput: string
+            let toolSuccess = false
+
+            if (this.processedToolCallIds.has(toolCallId)) {
+              // This exact tool call ID was already executed - skip execution
+              continue
+            }
+
+            this.processedToolCallIds.add(toolCallId)
+
+            onStep?.({
+              type: 'tool_call',
+              toolName: call.name,
+              toolArgs: call.args
+            })
+
+            const activeStep = plan?.steps.find(
+              (s) =>
+                (s.status === 'running' ||
+                  s.status === 'waiting_for_approval' ||
+                  s.status === 'pending') &&
+                (!s.toolName || s.toolName === call.name)
+            )
+            if (activeStep && activeStep.status === 'pending') {
+              this.agentPlanner.startStep(activeStep.id)
+            }
+
+            const tool = this.tools.get(call.name)
+            if (!tool) {
+              toolResultOutput = `Error: Tool '${call.name}' is not recognized or available.`
+              toolSuccess = false
+              if (activeStep) {
+                this.agentPlanner.failStep(activeStep.id, toolResultOutput)
               }
-              onStep?.({
-                type: 'tool_result',
-                toolName: call.name,
-                toolArgs: call.args,
-                toolOutput: rejectionText,
-                toolSuccess: false
-              })
+            } else {
+              const toolStart = performance.now()
+              const execResult = await tool.execute(call.args, toolContext)
+              totalToolTime += performance.now() - toolStart
 
-              this.history.push({
-                role: 'function',
-                parts: [
-                  {
-                    tool_call_id: toolCallId,
-                    functionResponse: {
-                      name: call.name,
-                      response: {
+              if (runSignal.aborted || this.activeRunId !== runId) {
+                throw new Error('Request was stopped by user.')
+              }
+
+              if (execResult.rejected) {
+                const rejectionText = execResult.output || 'Edit rejected — no changes were made.'
+                if (plan) {
+                  this.agentPlanner.abortPlan(rejectionText)
+                }
+                onStep?.({
+                  type: 'tool_result',
+                  toolName: call.name,
+                  toolArgs: call.args,
+                  toolOutput: rejectionText,
+                  toolSuccess: false
+                })
+
+                this.history.push({
+                  role: 'function',
+                  parts: [
+                    {
+                      tool_call_id: toolCallId,
+                      functionResponse: {
                         name: call.name,
-                        content: {
-                          success: false,
-                          status: 'rejected',
-                          output: rejectionText
+                        response: {
+                          name: call.name,
+                          content: {
+                            success: false,
+                            status: 'rejected',
+                            output: rejectionText
+                          }
                         }
                       }
                     }
+                  ]
+                })
+
+                this.history.push({
+                  role: 'model',
+                  parts: [{ text: rejectionText }]
+                })
+
+                onStep?.({ type: 'done', text: rejectionText })
+                return rejectionText
+              }
+
+              toolSuccess = execResult.success
+              toolResultOutput = execResult.output
+                ? execResult.output
+                : `Error executing ${call.name}: ${execResult.error} (State this failure clearly to the user. Do NOT invent file contents or call list_files as a fallback.)`
+
+              if (execResult.success && execResult.output) {
+                const deduplicator = this.smartContextEngine.getDeduplicator()
+                const argsKey = JSON.stringify(call.args || {})
+
+                if (deduplicator.isToolResultDuplicate(call.name, argsKey, execResult.output)) {
+                  toolResultOutput = `[Notice: Output of ${call.name} with identical arguments was already provided earlier in the conversation and is omitted to conserve context.]`
+                } else {
+                  deduplicator.markToolResult(call.name, argsKey, execResult.output)
+
+                  if (call.name === 'read_file') {
+                    try {
+                      const parsed = JSON.parse(execResult.output)
+                      if (parsed && typeof parsed.path === 'string' && typeof parsed.content === 'string') {
+                        this.smartContextEngine.getCache().set(parsed.path, parsed.content)
+                        this.smartContextEngine.getDeduplicator().markFileInContext(parsed.path, parsed.content)
+                      }
+                    } catch {
+                      // Plain string output
+                    }
+                  } else if (call.name === 'create_file') {
+                    const targetPath = (call.args.path as string) || ''
+                    this.agentPlanner.recordFileCreated(targetPath)
+                  } else if (call.name === 'edit_file') {
+                    const targetPath = (call.args.path as string) || ''
+                    this.agentPlanner.recordFileModified(targetPath)
+                  } else if (call.name === 'run_command') {
+                    const cmd = (call.args.command as string) || ''
+                    const passed =
+                      !execResult.output.includes('"exitCode": 1') &&
+                      !execResult.output.includes('"exitCode": 2') &&
+                      !execResult.output.includes('"exitCode": -1') &&
+                      !execResult.output.includes('Command failed')
+                    this.agentPlanner.recordVerification(cmd, passed && execResult.success)
                   }
-                ]
-              })
-
-              this.history.push({
-                role: 'model',
-                parts: [{ text: rejectionText }]
-              })
-
-              onStep?.({ type: 'done', text: rejectionText })
-              this.abortController = null
-              return rejectionText
-            }
-
-            toolSuccess = execResult.success
-            toolResultOutput = execResult.output
-              ? execResult.output
-              : `Error executing ${call.name}: ${execResult.error} (State this failure clearly to the user. Do NOT invent file contents or call list_files as a fallback.)`
-
-            if (execResult.success && execResult.output) {
-              if (call.name === 'read_file') {
-                try {
-                  const parsed = JSON.parse(execResult.output)
-                  if (parsed && typeof parsed.path === 'string' && typeof parsed.content === 'string') {
-                    this.smartContextEngine.getCache().set(parsed.path, parsed.content)
-                    this.smartContextEngine.getDeduplicator().markFileInContext(parsed.path, parsed.content)
-                  }
-                } catch {
-                  // Plain string output
                 }
-              } else if (call.name === 'create_file') {
-                const targetPath = (call.args.path as string) || ''
-                this.agentPlanner.recordFileCreated(targetPath)
-              } else if (call.name === 'edit_file') {
-                const targetPath = (call.args.path as string) || ''
-                this.agentPlanner.recordFileModified(targetPath)
-              } else if (call.name === 'run_command') {
-                const cmd = (call.args.command as string) || ''
-                const passed =
-                  !execResult.output.includes('"exitCode": 1') &&
-                  !execResult.output.includes('"exitCode": 2') &&
-                  !execResult.output.includes('"exitCode": -1') &&
-                  !execResult.output.includes('Command failed')
-                this.agentPlanner.recordVerification(cmd, passed && execResult.success)
-              }
 
-              this.smartContextEngine
-                .getDeduplicator()
-                .markToolResult(call.name, JSON.stringify(call.args || {}), execResult.output)
-
-              if (activeStep) {
-                this.agentPlanner.completeStep(activeStep.id, execResult.output)
+                if (activeStep) {
+                  this.agentPlanner.completeStep(activeStep.id, execResult.output)
+                }
+              } else if (!execResult.success && activeStep) {
+                this.agentPlanner.failStep(activeStep.id, execResult.error || 'Execution failed')
               }
-            } else if (!execResult.success && activeStep) {
-              this.agentPlanner.failStep(activeStep.id, execResult.error || 'Execution failed')
             }
-          }
 
-          onStep?.({
-            type: 'tool_result',
-            toolName: call.name,
-            toolArgs: call.args,
-            toolOutput: toolResultOutput,
-            toolSuccess
-          })
+            // Context budget ceiling enforcement: cap tool output to stay within maxTotalContextChars
+            const maxBudget = this.smartContextEngine.getConfig().maxTotalContextChars
+            const currentHistoryChars = this.getHistoryCharCount()
+            const remainingBudget = maxBudget - currentHistoryChars
+            const overhead = 300 // JSON wrapper overhead for function message part
 
-          // Save tool response back into conversation history with strictly paired tool_call_id
-          this.history.push({
-            role: 'function',
-            parts: [
-              {
-                tool_call_id: toolCallId,
-                functionResponse: {
-                  name: call.name,
-                  response: {
+            if (remainingBudget <= overhead + 100) {
+              toolResultOutput =
+                '[Notice: Context budget exhausted (maximum total context limit reached). Additional tool output truncated.]'
+            } else if (toolResultOutput.length > remainingBudget - overhead) {
+              const truncationNotice = '\n[... Output truncated to stay within total context budget ...]'
+              const maxAllowed = Math.max(100, remainingBudget - overhead - truncationNotice.length)
+              toolResultOutput = toolResultOutput.slice(0, maxAllowed) + truncationNotice
+            }
+
+            onStep?.({
+              type: 'tool_result',
+              toolName: call.name,
+              toolArgs: call.args,
+              toolOutput: toolResultOutput,
+              toolSuccess
+            })
+
+            // Save tool response back into conversation history with strictly paired tool_call_id
+            this.history.push({
+              role: 'function',
+              parts: [
+                {
+                  tool_call_id: toolCallId,
+                  functionResponse: {
                     name: call.name,
-                    content: {
-                      success: toolSuccess,
-                      output: toolResultOutput
+                    response: {
+                      name: call.name,
+                      content: {
+                        success: toolSuccess,
+                        output: toolResultOutput
+                      }
                     }
                   }
                 }
-              }
-            ]
-          })
+              ]
+            })
+          }
+          // Continue loop to let model produce final response
+          continue
         }
-        // Continue loop to let model produce final response
-        continue
-      }
 
-      // Final response produced by model
-      let finalText = response.text || 'Completed.'
+        // Final response produced by model
+        let finalText = response.text || 'Completed.'
+
+        if (plan && plan.status === 'executing') {
+          const allDone = plan.steps.every((s) => s.status === 'completed' || s.status === 'skipped')
+          if (allDone) {
+            plan.status = 'completed'
+          }
+        }
+
+        this.history.push({
+          role: 'model',
+          parts: [{ text: finalText }]
+        })
+
+        const totalRequestTime = performance.now() - requestStartTime
+        console.debug(
+          `[AgentTiming] Total: ${totalRequestTime.toFixed(1)}ms | LLM: ${totalProviderTime.toFixed(1)}ms | Tools: ${totalToolTime.toFixed(1)}ms`
+        )
+
+        onStep?.({ type: 'done', text: finalText })
+        return finalText
+      }
 
       if (plan && plan.status === 'executing') {
-        const allDone = plan.steps.every((s) => s.status === 'completed' || s.status === 'skipped')
-        if (allDone) {
-          plan.status = 'completed'
+        const activeStep = plan.steps.find((s) => s.status === 'running' || s.status === 'pending')
+        if (activeStep) {
+          this.agentPlanner.failStep(activeStep.id, 'Maximum tool execution iterations reached')
         }
+        this.agentPlanner.abortPlan('Maximum tool execution iterations reached')
       }
 
-      this.history.push({
-        role: 'model',
-        parts: [{ text: finalText }]
-      })
-
-      const totalRequestTime = performance.now() - requestStartTime
-      console.debug(
-        `[AgentTiming] Total: ${totalRequestTime.toFixed(1)}ms | LLM: ${totalProviderTime.toFixed(1)}ms | Tools: ${totalToolTime.toFixed(1)}ms`
-      )
-
-      onStep?.({ type: 'done', text: finalText })
-      this.abortController = null
-      return finalText
-    }
-
-    if (plan && plan.status === 'executing') {
-      const activeStep = plan.steps.find((s) => s.status === 'running' || s.status === 'pending')
-      if (activeStep) {
-        this.agentPlanner.failStep(activeStep.id, 'Maximum tool execution iterations reached')
+      const maxReachedText = 'Maximum tool execution iterations reached.'
+      onStep?.({ type: 'done', text: maxReachedText })
+      return maxReachedText
+    } finally {
+      if (this.abortController === runController) {
+        this.abortController = null
       }
-      this.agentPlanner.abortPlan('Maximum tool execution iterations reached')
     }
-
-    const maxReachedText = 'Maximum tool execution iterations reached.'
-    onStep?.({ type: 'done', text: maxReachedText })
-    this.abortController = null
-    return maxReachedText
   }
 }

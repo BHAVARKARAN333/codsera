@@ -37,6 +37,43 @@ export class ReadFileTool implements ITool {
       }
     }
 
+    if (context.signal?.aborted) {
+      return {
+        success: false,
+        output: '',
+        error: 'Tool execution was aborted by user.'
+      }
+    }
+
+    const MAX_FILE_CHARS = 12000
+    const TRUNCATION_NOTICE = '\n[... Truncated remainder of file to conserve budget ...]'
+
+    const formatContentOutput = (pathVal: string, rawContent: string): ToolExecutionResult => {
+      let content = rawContent
+      let truncated = false
+      const rawChars = rawContent.length
+
+      if (content.length > MAX_FILE_CHARS) {
+        content = content.slice(0, MAX_FILE_CHARS) + TRUNCATION_NOTICE
+        truncated = true
+      }
+
+      return {
+        success: true,
+        output: JSON.stringify(
+          {
+            path: pathVal,
+            content,
+            truncated,
+            charCount: content.length,
+            rawChars
+          },
+          null,
+          2
+        )
+      }
+    }
+
     try {
       if (!window?.electronAPI || typeof window.electronAPI.readWorkspaceFile !== 'function') {
         // Safe fallback to readFile if readWorkspaceFile is somehow not available
@@ -45,18 +82,17 @@ export class ReadFileTool implements ITool {
           const target = filePath.startsWith('/') || filePath.startsWith('\\') ? filePath.slice(1) : filePath
           const fullPath = `${context.workspaceRoot}${sep}${target}`
           const fallbackRes = await window.electronAPI.readFile(fullPath)
-          if (fallbackRes.success && fallbackRes.content !== undefined) {
+
+          if (context.signal?.aborted) {
             return {
-              success: true,
-              output: JSON.stringify(
-                {
-                  path: filePath,
-                  content: fallbackRes.content
-                },
-                null,
-                2
-              )
+              success: false,
+              output: '',
+              error: 'Tool execution was aborted by user.'
             }
+          }
+
+          if (fallbackRes.success && fallbackRes.content !== undefined) {
+            return formatContentOutput(filePath, fallbackRes.content)
           }
           return {
             success: false,
@@ -74,18 +110,16 @@ export class ReadFileTool implements ITool {
 
       const result = await window.electronAPI.readWorkspaceFile(context.workspaceRoot, filePath)
 
-      if (result.success && result.content !== undefined) {
+      if (context.signal?.aborted) {
         return {
-          success: true,
-          output: JSON.stringify(
-            {
-              path: result.path || filePath,
-              content: result.content
-            },
-            null,
-            2
-          )
+          success: false,
+          output: '',
+          error: 'Tool execution was aborted by user.'
         }
+      }
+
+      if (result.success && result.content !== undefined) {
+        return formatContentOutput(result.path || filePath, result.content)
       } else {
         return {
           success: false,
