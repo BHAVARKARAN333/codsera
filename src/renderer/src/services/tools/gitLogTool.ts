@@ -2,6 +2,7 @@ import { ITool, ToolContext, ToolExecutionResult } from './types'
 
 export class GitLogTool implements ITool {
   readonly name = 'git_log'
+  readonly requiresApproval = false
   readonly description =
     'Inspects recent Git commits in the workspace (hash, author, date, message). Strictly read-only.'
 

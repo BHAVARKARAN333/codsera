@@ -2,6 +2,7 @@ import { ITool, ToolContext, ToolExecutionResult } from './types'
 
 export class EditFileTool implements ITool {
   readonly name = 'edit_file'
+  readonly requiresApproval = true
   readonly description =
     'Proposes changes to an existing file in the workspace. Use this tool ONLY when the user explicitly asks to modify, update, or fix code in an existing file. The proposed changes will be displayed as a diff preview for explicit user approval before writing to disk. The file MUST already exist. Do NOT use this tool to create new files.'
 
@@ -34,8 +35,8 @@ export class EditFileTool implements ITool {
       }
     }
 
-    const filePath = typeof args.path === 'string' ? args.path.trim() : ''
-    const newContent = typeof args.newContent === 'string' ? args.newContent : ''
+    const filePath = args && typeof args.path === 'string' ? args.path.trim() : ''
+    const newContent = args && typeof args.newContent === 'string' ? args.newContent : ''
 
     if (!filePath) {
       return {
@@ -83,22 +84,38 @@ export class EditFileTool implements ITool {
 
     const oldContent = readResult.content ?? ''
 
-    // Step 2: Request explicit user approval with diff preview before modifying the file
-    if (context.requestApproval) {
-      const isApproved = await context.requestApproval({
-        toolName: 'edit_file',
-        path: filePath,
-        oldContent,
-        newContent
-      })
+    // Step 2: Request explicit user approval with diff preview before modifying the file (fail-safe if missing)
+    if (!context.requestApproval) {
+      return {
+        success: false,
+        rejected: true,
+        output: 'Edit rejected: approval handler is required but was not provided.',
+        error: 'Edit rejected: approval handler is required but was not provided.'
+      }
+    }
 
-      if (!isApproved) {
-        return {
-          success: false,
-          rejected: true,
-          output: 'Edit rejected — no changes were made.',
-          error: 'Edit rejected — no changes were made.'
-        }
+    const isApproved = await context.requestApproval({
+      toolName: 'edit_file',
+      path: filePath,
+      oldContent,
+      newContent
+    })
+
+    if (!isApproved) {
+      return {
+        success: false,
+        rejected: true,
+        output: 'Edit rejected — no changes were made.',
+        error: 'Edit rejected — no changes were made.'
+      }
+    }
+
+    if (context.signal?.aborted) {
+      return {
+        success: false,
+        rejected: true,
+        output: 'Operation cancelled by user — no file was edited.',
+        error: 'Operation cancelled by user.'
       }
     }
 

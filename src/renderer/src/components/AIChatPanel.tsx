@@ -251,6 +251,7 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
     }
 
     return () => {
+      orchestratorRef.current?.stop()
       if (import.meta.env.DEV && typeof window !== 'undefined') {
         delete window.__enableProfiling
         delete window.__getLastSmartContext
@@ -662,6 +663,8 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
     if (!customText) setInputPrompt('')
 
     const recordedSteps: AgentStepEvent[] = []
+    let lastToolResultCount = 0
+    let committedContentLength = 0
 
     try {
       if (!orchestratorRef.current) return
@@ -705,13 +708,24 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
 
             if (existingIdx >= 0) {
               const updated = [...prev]
+              let existingContent = updated[existingIdx].content
+              if (
+                existingContent &&
+                toolSteps.length > lastToolResultCount &&
+                !existingContent.endsWith('\n') &&
+                !chunk.startsWith('\n')
+              ) {
+                existingContent = `${existingContent}\n\n`
+              }
+              lastToolResultCount = toolSteps.length
               updated[existingIdx] = {
                 ...updated[existingIdx],
-                content: updated[existingIdx].content + chunk,
+                content: existingContent + chunk,
                 steps: toolSteps
               }
               return updated
             } else {
+              lastToolResultCount = toolSteps.length
               return [
                 ...prev,
                 {
@@ -728,13 +742,30 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
           if (currentRequestIdRef.current !== requestId) return
           recordedSteps.push(event)
           setCurrentStep(event)
-          if (event.type === 'tool_result') {
+          if (event.type === 'retrying') {
+            setMessages((prev) => {
+              const assistantMsgId = `${requestId}-res`
+              const existingIdx = prev.findIndex((m) => m.id === assistantMsgId)
+              if (existingIdx >= 0) {
+                const updated = [...prev]
+                const toolSteps = recordedSteps.filter((s) => s.type === 'tool_result')
+                updated[existingIdx] = {
+                  ...updated[existingIdx],
+                  content: updated[existingIdx].content.slice(0, committedContentLength),
+                  steps: toolSteps
+                }
+                return updated
+              }
+              return prev
+            })
+          } else if (event.type === 'tool_result') {
             setMessages((prev) => {
               const assistantMsgId = `${requestId}-res`
               const existingIdx = prev.findIndex((m) => m.id === assistantMsgId)
               const toolSteps = recordedSteps.filter((s) => s.type === 'tool_result')
               if (existingIdx >= 0) {
                 const updated = [...prev]
+                committedContentLength = updated[existingIdx].content.length
                 updated[existingIdx] = {
                   ...updated[existingIdx],
                   steps: toolSteps

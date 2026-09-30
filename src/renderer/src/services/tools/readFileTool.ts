@@ -2,6 +2,7 @@ import { ITool, ToolContext, ToolExecutionResult } from './types'
 
 export class ReadFileTool implements ITool {
   readonly name = 'read_file'
+  readonly requiresApproval = false
   readonly description =
     'Reads the contents of a specific file in the workspace. Use this tool ONLY when the user asks to inspect, explain, read, or analyze a specific file. Do NOT call this tool for greetings, general programming questions, or when only file names/structure are requested.'
 
@@ -28,7 +29,7 @@ export class ReadFileTool implements ITool {
       }
     }
 
-    const filePath = typeof args.path === 'string' ? args.path.trim() : ''
+    const filePath = args && typeof args.path === 'string' ? args.path.trim() : ''
     if (!filePath) {
       return {
         success: false,

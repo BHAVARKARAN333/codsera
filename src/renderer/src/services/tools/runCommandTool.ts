@@ -12,7 +12,8 @@ const DANGEROUS_PATTERNS = [
   /\bdiskpart\b/i,
   /\breg\s+delete\b/i,
   /\bRemove-Item\b/i,
-  /\bDrop-Database\b/i
+  /\bDrop-Database\b/i,
+  /\bgit\s+(?:clean\s+-[a-z]*f|reset\s+--hard)/i
 ]
 
 function isPotentiallyDangerous(cmd: string): boolean {
@@ -21,6 +22,7 @@ function isPotentiallyDangerous(cmd: string): boolean {
 
 export class RunCommandTool implements ITool {
   readonly name = 'run_command'
+  readonly requiresApproval = true
   readonly description =
     'Executes a terminal/shell command inside the currently opened workspace. Use this tool ONLY when the user explicitly requests running a command, executing tests, building the project, or running scripts. The command requires explicit user approval before execution. The working directory is strictly locked to the workspace root.'
 
@@ -48,7 +50,7 @@ export class RunCommandTool implements ITool {
       }
     }
 
-    const command = typeof args.command === 'string' ? args.command.trim() : ''
+    const command = args && typeof args.command === 'string' ? args.command.trim() : ''
 
     if (!command) {
       return {
@@ -58,28 +60,7 @@ export class RunCommandTool implements ITool {
       }
     }
 
-    const isDangerous = isPotentiallyDangerous(command)
-
-    // Step 1: Require explicit user approval before running any command
-    if (context.requestApproval) {
-      const isApproved = await context.requestApproval({
-        toolName: 'run_command',
-        path: context.workspaceRoot,
-        command,
-        isDangerous
-      })
-
-      if (!isApproved) {
-        return {
-          success: false,
-          rejected: true,
-          output: 'Command rejected — nothing was executed.',
-          error: 'Command rejected — nothing was executed.'
-        }
-      }
-    }
-
-    // Step 2: Safety Validation - Prevent workspace escape and path traversal
+    // Step 1: Pre-approval Safety Validation - Prevent workspace escape and path traversal
     const safetyCheck = validateCommandSafety(command, context.workspaceRoot)
     if (!safetyCheck.safe) {
       return {
@@ -88,6 +69,43 @@ export class RunCommandTool implements ITool {
         error:
           safetyCheck.error ||
           'Command rejected: working directory must remain inside the current workspace.'
+      }
+    }
+
+    const isDangerous = isPotentiallyDangerous(command)
+
+    // Step 2: Require explicit user approval before running any command (fail-safe if missing)
+    if (!context.requestApproval) {
+      return {
+        success: false,
+        rejected: true,
+        output: 'Command rejected: approval handler is required but was not provided.',
+        error: 'Command rejected: approval handler is required but was not provided.'
+      }
+    }
+
+    const isApproved = await context.requestApproval({
+      toolName: 'run_command',
+      path: context.workspaceRoot,
+      command,
+      isDangerous
+    })
+
+    if (!isApproved) {
+      return {
+        success: false,
+        rejected: true,
+        output: 'Command rejected — nothing was executed.',
+        error: 'Command rejected — nothing was executed.'
+      }
+    }
+
+    if (context.signal?.aborted) {
+      return {
+        success: false,
+        rejected: true,
+        output: 'Operation cancelled by user — no command was executed.',
+        error: 'Operation cancelled by user.'
       }
     }
 

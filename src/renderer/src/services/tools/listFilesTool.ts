@@ -2,6 +2,7 @@ import { ITool, ToolContext, ToolExecutionResult } from './types'
 
 export class ListFilesTool implements ITool {
   readonly name = 'list_files'
+  readonly requiresApproval = false
   readonly description =
     'Lists files and directories in the workspace. Use this tool ONLY when the user asks about the files, folders, or directory structure of the project. Do NOT call this tool for greetings, general programming questions, or conversational requests.'
 
@@ -31,8 +32,8 @@ export class ListFilesTool implements ITool {
       }
     }
 
-    const relativePath = typeof args.relativePath === 'string' ? args.relativePath : undefined
-    const maxDepth = typeof args.maxDepth === 'number' ? args.maxDepth : 4
+    const relativePath = args && typeof args.relativePath === 'string' ? args.relativePath : undefined
+    const maxDepth = args && typeof args.maxDepth === 'number' ? args.maxDepth : 4
 
     try {
       const result = await window.electronAPI.listFiles(context.workspaceRoot, {

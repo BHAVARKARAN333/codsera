@@ -1,7 +1,7 @@
 import { FunctionDeclaration, IAIProvider, LLMMessage } from '../ai/types'
-import { ITool, ToolApprovalRequest, ToolContext } from '../tools/types'
+import { ITool, ToolApprovalRequest, ToolContext, ToolExecutionResult } from '../tools/types'
 import { SmartContextEngine } from './smartContextEngine'
-import { AgentPlanner } from './agentPlanner'
+import { AgentPlan, AgentPlanner } from './agentPlanner'
 
 export interface AgentStepEvent {
   type: 'thinking' | 'tool_call' | 'tool_result' | 'retrying' | 'done' | 'error'
@@ -11,6 +11,8 @@ export interface AgentStepEvent {
   toolSuccess?: boolean
   text?: string
   error?: string
+  retryAttempt?: number
+  maxRetries?: number
 }
 
 export interface AgentRunOptions {
@@ -36,6 +38,7 @@ export class AgentOrchestrator {
   private abortController: AbortController | null = null
   private activeRunId = 0
   private processedToolCallIds: Set<string> = new Set()
+  private consecutiveToolFailures: Map<string, number> = new Map()
   private smartContextEngine: SmartContextEngine = new SmartContextEngine()
   private agentPlanner: AgentPlanner = new AgentPlanner()
 
@@ -82,10 +85,143 @@ export class AgentOrchestrator {
   clearHistory(): void {
     this.history = []
     this.processedToolCallIds.clear()
+    this.consecutiveToolFailures.clear()
     this.smartContextEngine.clearCache()
     this.agentPlanner.clearPlan()
   }
 
+  getHistory(): LLMMessage[] {
+    return JSON.parse(JSON.stringify(this.history))
+  }
+
+  /**
+   * Prunes older conversation turns from the beginning of history when total context
+   * exceeds maxTotalContextChars. Preserves the current/most recent user turn,
+   * ensures every model tool_call retains its paired function response, and guarantees
+   * that history always begins with a user turn.
+   */
+  private pruneHistoryToBudget(): void {
+    const maxBudget = this.smartContextEngine.getConfig().maxTotalContextChars
+    if (this.getHistoryCharCount() <= maxBudget) {
+      return
+    }
+
+    const getUserTurnIndices = (): number[] => {
+      const indices: number[] = []
+      for (let i = 0; i < this.history.length; i++) {
+        if (this.history[i].role === 'user') {
+          indices.push(i)
+        }
+      }
+      return indices
+    }
+
+    let userTurns = getUserTurnIndices()
+
+    // 1. Drop oldest completed rounds if multiple user turns exist
+    while (userTurns.length > 1 && this.getHistoryCharCount() > maxBudget) {
+      const nextTurnStart = userTurns[1]
+      this.history.splice(0, nextTurnStart)
+      userTurns = getUserTurnIndices()
+    }
+
+    // 2. If history is still over budget within the single active round, compress earlier tool outputs
+    if (this.getHistoryCharCount() > maxBudget) {
+      for (let i = 0; i < this.history.length - 1; i++) {
+        if (this.getHistoryCharCount() <= maxBudget) break
+        const msg = this.history[i]
+        if (msg.role === 'function') {
+          for (const part of msg.parts) {
+            const resp = part.functionResponse?.response as Record<string, unknown> | undefined
+            const content = resp?.content as Record<string, unknown> | undefined
+            if (content && typeof content.output === 'string' && content.output.length > 1200) {
+              const notice = '\n[... Earlier tool output compressed to preserve context budget ...]'
+              content.output = content.output.slice(0, 800) + notice
+            }
+          }
+        }
+      }
+    }
+  }
+
+  /**
+   * Sanitizes history when an execution halts prematurely (cancellation or unhandled error).
+   * Ensures every model functionCall has a corresponding function response,
+   * every user prompt has a closing model turn, and history remains structurally valid.
+   */
+  private sanitizeIncompleteTurns(reason: string, isAbort: boolean): void {
+    if (this.history.length === 0) return
+
+    // 1. Check if there are any model messages with unanswered tool calls
+    for (let i = 0; i < this.history.length; i++) {
+      if (this.history[i].role === 'model') {
+        const modelMsg = this.history[i]
+        const toolCallsInModel: Array<{ id: string; name: string }> = []
+
+        for (const part of modelMsg.parts) {
+          const raw = part as Record<string, unknown>
+          if (part.functionCall) {
+            const id = (raw['id'] as string) || (raw['tool_call_id'] as string) || part.functionCall.name
+            toolCallsInModel.push({ id, name: part.functionCall.name })
+          }
+        }
+
+        if (toolCallsInModel.length > 0) {
+          const answeredIds = new Set<string>()
+          let insertIdx = i + 1
+          while (insertIdx < this.history.length && this.history[insertIdx].role === 'function') {
+            for (const part of this.history[insertIdx].parts) {
+              const raw = part as Record<string, unknown>
+              const id = (raw['tool_call_id'] as string) || (part.functionResponse?.name)
+              if (id) answeredIds.add(id)
+            }
+            insertIdx++
+          }
+
+          for (const call of toolCallsInModel) {
+            if (!answeredIds.has(call.id)) {
+              this.history.splice(insertIdx, 0, {
+                role: 'function',
+                parts: [
+                  {
+                    tool_call_id: call.id,
+                    functionResponse: {
+                      name: call.name,
+                      response: {
+                        name: call.name,
+                        content: {
+                          success: false,
+                          status: isAbort ? 'cancelled' : 'failed',
+                          output: reason
+                        }
+                      }
+                    }
+                  }
+                ]
+              })
+              insertIdx++
+              answeredIds.add(call.id)
+            }
+          }
+        }
+      }
+    }
+
+    // 2. Ensure history ends with a model message so that alternating turns are preserved
+    const lastMsg = this.history[this.history.length - 1]
+    if (lastMsg && lastMsg.role !== 'model') {
+      this.history.push({
+        role: 'model',
+        parts: [{ text: isAbort ? 'Request was stopped by user.' : `Execution halted: ${reason}` }]
+      })
+    }
+  }
+
+  /**
+   * Stops the currently active run by aborting its AbortController and sending a process cleanup request.
+   * If called when no run is active, it halts any background processes that may be running via stopCommand.
+   * Calling run() afterwards always begins a fresh run with a new AbortController.
+   */
   stop(): void {
     if (this.abortController) {
       this.abortController.abort()
@@ -162,42 +298,81 @@ Rules for tool usage & failure handling:
 9. 'list_files': Use ONLY when project structure, directory tree, or file listing is explicitly requested. Do NOT call 'list_files' when the user requested Git information, file contents, or commands.
 10. If a request does NOT require inspecting, creating, or modifying local files, checking Git, or running terminal commands, answer directly WITHOUT calling any tool.`
 
-    // Resolve smart project context
-    const smartContext = await this.smartContextEngine.resolveContext(prompt, workspaceRoot)
+    const runId = ++this.activeRunId
+    const runController = new AbortController()
+    this.abortController = runController
+    const runSignal = runController.signal
 
-    // Generate multi-step execution plan if required
-    const plan = this.agentPlanner.createPlan(prompt, {
-      primaryFile: smartContext.readFiles[0]?.path,
-      candidateFiles: smartContext.selectedFiles.map((f) => f.path),
-      affectedFiles: smartContext.dependencyGraph?.potentiallyAffected,
-      likelyTests: smartContext.dependencyGraph?.likelyTests
-    })
+    let isRunFinished = false
+    let plan: AgentPlan | null = null
 
-    let dynamicSystemInstruction = systemInstruction
-    if (smartContext.required && smartContext.formattedContext) {
-      dynamicSystemInstruction += `\n\n${smartContext.formattedContext}\n\nNote: The relevant project files above have been pre-loaded by the Smart Context Engine. If these files provide all the information needed to answer the user's request, do NOT call 'read_file' or 'list_files' again for them. Answer directly or propose edits using 'edit_file' directly.`
-    } else if (!smartContext.required) {
-      dynamicSystemInstruction += `\n\nNote: This is a general, conceptual, or conversational query. Do NOT call any filesystem, terminal, or Git tools. Answer the user directly.`
-    }
+    try {
+      // Resolve smart project context
+      const smartContext = await this.smartContextEngine.resolveContext(prompt, workspaceRoot)
 
-    if (plan) {
-      dynamicSystemInstruction += `\n\n${this.agentPlanner.formatPlanContext(plan)}`
-    }
+      if (runSignal.aborted) {
+        throw new Error('Request was stopped by user.')
+      }
+
+      // Generate multi-step execution plan if required
+      plan = this.agentPlanner.createPlan(prompt, {
+        primaryFile: smartContext.readFiles[0]?.path,
+        candidateFiles: smartContext.selectedFiles.map((f) => f.path),
+        affectedFiles: smartContext.dependencyGraph?.potentiallyAffected,
+        likelyTests: smartContext.dependencyGraph?.likelyTests
+      })
+
+      if (runSignal.aborted) {
+        throw new Error('Request was stopped by user.')
+      }
+
+      let dynamicSystemInstruction = systemInstruction
+      if (smartContext.required && smartContext.formattedContext) {
+        dynamicSystemInstruction += `\n\n${smartContext.formattedContext}\n\nNote: The relevant project files above have been pre-loaded by the Smart Context Engine. If these files provide all the information needed to answer the user's request, do NOT call 'read_file' or 'list_files' again for them. Answer directly or propose edits using 'edit_file' directly.`
+      } else if (!smartContext.required) {
+        dynamicSystemInstruction += `\n\nNote: This is a general, conceptual, or conversational query. Do NOT call any filesystem, terminal, or Git tools. Answer the user directly.`
+      }
+
+      if (plan) {
+        dynamicSystemInstruction += `\n\n${this.agentPlanner.formatPlanContext(plan)}`
+      }
+
+    const safeOnChunk = onChunk
+      ? (chunk: string) => {
+          if (!chunk || runSignal.aborted || isRunFinished || this.activeRunId !== runId) return
+          onChunk(chunk)
+        }
+      : undefined
+
+    const safeOnStep = onStep
+      ? (event: AgentStepEvent) => {
+          if (runSignal.aborted || isRunFinished || this.activeRunId !== runId) return
+          onStep(event)
+        }
+      : undefined
 
     const wrappedOnFileCreated = (createdPath: string) => {
+      if (this.activeRunId !== runId) return
       this.smartContextEngine.invalidateFile(createdPath)
       this.agentPlanner.recordFileCreated(createdPath)
       onFileCreated?.(createdPath)
     }
 
     const wrappedOnFileEdited = (editedPath: string, newContent: string) => {
+      if (this.activeRunId !== runId) return
       this.smartContextEngine.invalidateFile(editedPath)
       this.agentPlanner.recordFileModified(editedPath)
       onFileEdited?.(editedPath, newContent)
     }
 
+    let toolApprovedForCurrentCall = false
+
     const wrappedRequestApproval = async (req: ToolApprovalRequest): Promise<boolean> => {
-      if (plan) {
+      if (this.activeRunId !== runId || runSignal.aborted) {
+        return false
+      }
+
+      if (plan && plan === this.agentPlanner.getActivePlan() && this.activeRunId === runId) {
         const matchingStep = plan.steps.find(
           (s) => s.status === 'running' || (s.status === 'pending' && s.toolName === req.toolName)
         )
@@ -206,18 +381,40 @@ Rules for tool usage & failure handling:
         }
       }
 
-      const approved = requestApproval ? await requestApproval(req) : false
-
-      if (!approved && plan) {
-        this.agentPlanner.abortPlan(`User rejected approval for ${req.toolName}`)
+      let approved = false
+      try {
+        approved = requestApproval ? await requestApproval(req) : false
+      } catch {
+        approved = false
       }
+
+      // Guard against approval resolving after cancellation or superseded run
+      if (this.activeRunId !== runId || runSignal.aborted) {
+        return false
+      }
+
+      if (approved) {
+        toolApprovedForCurrentCall = true
+        if (plan && plan === this.agentPlanner.getActivePlan() && this.activeRunId === runId) {
+          const matchingStep = plan.steps.find(
+            (s) =>
+              s.status === 'waiting_for_approval' && (!s.toolName || s.toolName === req.toolName)
+          )
+          if (matchingStep) {
+            this.agentPlanner.startStep(matchingStep.id)
+          }
+        }
+      } else {
+        if (plan && plan === this.agentPlanner.getActivePlan() && this.activeRunId === runId) {
+          const rejectReason = requestApproval
+            ? `User rejected approval for ${req.toolName}`
+            : `Approval required for ${req.toolName} but no approval handler was provided`
+          this.agentPlanner.abortPlan(rejectReason)
+        }
+      }
+
       return approved
     }
-
-    const runId = ++this.activeRunId
-    const runController = new AbortController()
-    this.abortController = runController
-    const runSignal = runController.signal
 
     const toolContext: ToolContext = {
       workspaceRoot,
@@ -229,25 +426,42 @@ Rules for tool usage & failure handling:
     }
     const toolDeclarations = this.getToolDeclarations()
 
+    // Context budget ceiling enforcement for user prompt: cap if exceedingly large
+    const maxBudget = this.smartContextEngine.getConfig().maxTotalContextChars
+    let promptText = prompt
+    const maxPromptChars = Math.max(1000, maxBudget - 2000)
+    if (promptText.length > maxPromptChars) {
+      const truncationNotice = '\n\n[... User prompt truncated to fit context budget ...]'
+      promptText = promptText.slice(0, maxPromptChars - truncationNotice.length) + truncationNotice
+    }
+
     // Add user message to conversation history
     this.history.push({
       role: 'user',
-      parts: [{ text: prompt }]
+      parts: [{ text: promptText }]
     })
+
+    this.pruneHistoryToBudget()
 
     const MAX_TOOL_ITERATIONS = 12
     let iterations = 0
     let totalProviderTime = 0
     let totalToolTime = 0
 
-    try {
-      while (iterations < MAX_TOOL_ITERATIONS) {
+    while (iterations < MAX_TOOL_ITERATIONS) {
         if (runSignal.aborted || this.activeRunId !== runId) {
           throw new Error('Request was stopped by user.')
         }
 
         iterations++
-        onStep?.({ type: 'thinking' })
+        safeOnStep?.({ type: 'thinking' })
+
+        if (runSignal.aborted || this.activeRunId !== runId) {
+          throw new Error('Request was stopped by user.')
+        }
+
+        // Ensure history adheres to total context budget before sending to provider
+        this.pruneHistoryToBudget()
 
         let response
         const providerStart = performance.now()
@@ -258,17 +472,29 @@ Rules for tool usage & failure handling:
             systemInstruction: dynamicSystemInstruction,
             timeoutMs,
             signal: runSignal,
-            onChunk,
-            onRetry: (attempt, maxRetries) => {
-              onStep?.({
+            onChunk: safeOnChunk,
+            onRetry: (attempt, maxRetries, _delayMs, reason) => {
+              const retryText = reason
+                ? `Temporary provider issue: ${reason} — retrying (${attempt}/${maxRetries})...`
+                : `Temporary provider issue — retrying (${attempt}/${maxRetries})...`
+              safeOnStep?.({
                 type: 'retrying',
-                text: `Temporary provider issue — retrying (${attempt}/${maxRetries})...`
+                text: retryText,
+                retryAttempt: attempt,
+                maxRetries
               })
             }
           })
         } catch (err: unknown) {
-          const errorMsg = err instanceof Error ? err.message : String(err)
-          onStep?.({ type: 'error', error: errorMsg })
+          const isAbort =
+            runSignal.aborted ||
+            this.activeRunId !== runId ||
+            (err instanceof Error &&
+              (err.name === 'AbortError' || err.message === 'Request was stopped by user.'))
+          if (!isAbort) {
+            const errorMsg = err instanceof Error ? err.message : String(err)
+            safeOnStep?.({ type: 'error', error: errorMsg })
+          }
           throw err
         } finally {
           totalProviderTime += performance.now() - providerStart
@@ -284,7 +510,10 @@ Rules for tool usage & failure handling:
           const modelParts =
             response.rawModelParts && response.rawModelParts.length > 0
               ? response.rawModelParts
-              : response.functionCalls.map((call) => ({ functionCall: call }))
+              : [
+                  ...(response.text ? [{ text: response.text }] : []),
+                  ...response.functionCalls.map((call) => ({ functionCall: call }))
+                ]
 
           this.history.push({
             role: 'model',
@@ -292,6 +521,7 @@ Rules for tool usage & failure handling:
           })
 
           for (let i = 0; i < response.functionCalls.length; i++) {
+            toolApprovedForCurrentCall = false
             if (runSignal.aborted || this.activeRunId !== runId) {
               throw new Error('Request was stopped by user.')
             }
@@ -301,7 +531,7 @@ Rules for tool usage & failure handling:
             const toolCallId =
               (rawPart?.['id'] as string) ||
               (rawPart?.['tool_call_id'] as string) ||
-              `call_${call.name}_${this.history.length}_${i}`
+              `call_${call.name}_r${runId}_i${iterations}_${i}`
 
             if (rawPart) {
               rawPart['id'] = toolCallId
@@ -318,7 +548,7 @@ Rules for tool usage & failure handling:
 
             this.processedToolCallIds.add(toolCallId)
 
-            onStep?.({
+            safeOnStep?.({
               type: 'tool_call',
               toolName: call.name,
               toolArgs: call.args
@@ -343,20 +573,57 @@ Rules for tool usage & failure handling:
                 this.agentPlanner.failStep(activeStep.id, toolResultOutput)
               }
             } else {
+              let execResult: ToolExecutionResult
               const toolStart = performance.now()
-              const execResult = await tool.execute(call.args, toolContext)
-              totalToolTime += performance.now() - toolStart
-
-              if (runSignal.aborted || this.activeRunId !== runId) {
-                throw new Error('Request was stopped by user.')
+              const safeArgs =
+                call.args && typeof call.args === 'object' ? call.args : {}
+              try {
+                execResult = await tool.execute(safeArgs, toolContext)
+              } catch (toolErr: unknown) {
+                const errorMsg = toolErr instanceof Error ? toolErr.message : String(toolErr)
+                if (activeStep && plan && plan === this.agentPlanner.getActivePlan() && this.activeRunId === runId) {
+                  this.agentPlanner.failStep(activeStep.id, errorMsg)
+                }
+                if (plan && plan === this.agentPlanner.getActivePlan() && this.activeRunId === runId) {
+                  this.agentPlanner.abortPlan(`Tool execution error: ${errorMsg}`)
+                }
+                throw toolErr
+              } finally {
+                totalToolTime += performance.now() - toolStart
               }
 
+              // Normalize tool execution result to ensure non-null object
+              if (!execResult || typeof execResult !== 'object') {
+                execResult = {
+                  success: false,
+                  output: `Error executing ${call.name}: Tool returned invalid result (expected ToolExecutionResult object).`,
+                  error: `Invalid tool result from ${call.name}`
+                }
+              }
+
+              // Guardrail check: if tool declares requiresApproval: true, it MUST have been approved via wrappedRequestApproval
+              if (tool.requiresApproval === true && !toolApprovedForCurrentCall && execResult.success) {
+                execResult = {
+                  success: false,
+                  rejected: true,
+                  output: `Security violation: Tool '${tool.name}' requires explicit approval but executed without obtaining approval.`,
+                  error: `Security violation: Tool '${tool.name}' requires explicit approval but executed without obtaining approval.`
+                }
+              }
+
+              // Handle rejection first so rejection reason and plan cleanup are preserved even if stop() was triggered
               if (execResult.rejected) {
                 const rejectionText = execResult.output || 'Edit rejected — no changes were made.'
-                if (plan) {
+                if (plan && plan === this.agentPlanner.getActivePlan() && this.activeRunId === runId) {
                   this.agentPlanner.abortPlan(rejectionText)
                 }
-                onStep?.({
+
+                // If cancellation also occurred, throw stopped error with plan already cleaned up
+                if (runSignal.aborted || this.activeRunId !== runId) {
+                  throw new Error('Request was stopped by user.')
+                }
+
+                safeOnStep?.({
                   type: 'tool_result',
                   toolName: call.name,
                   toolArgs: call.args,
@@ -389,8 +656,13 @@ Rules for tool usage & failure handling:
                   parts: [{ text: rejectionText }]
                 })
 
-                onStep?.({ type: 'done', text: rejectionText })
+                safeOnStep?.({ type: 'done', text: rejectionText })
                 return rejectionText
+              }
+
+              // Check cancellation signal after tool execution
+              if (runSignal.aborted || this.activeRunId !== runId) {
+                throw new Error('Request was stopped by user.')
               }
 
               toolSuccess = execResult.success
@@ -399,6 +671,9 @@ Rules for tool usage & failure handling:
                 : `Error executing ${call.name}: ${execResult.error} (State this failure clearly to the user. Do NOT invent file contents or call list_files as a fallback.)`
 
               if (execResult.success && execResult.output) {
+                const successKey = `${call.name}:${JSON.stringify(call.args || {})}`
+                this.consecutiveToolFailures.delete(successKey)
+
                 const deduplicator = this.smartContextEngine.getDeduplicator()
                 const argsKey = JSON.stringify(call.args || {})
 
@@ -418,13 +693,13 @@ Rules for tool usage & failure handling:
                       // Plain string output
                     }
                   } else if (call.name === 'create_file') {
-                    const targetPath = (call.args.path as string) || ''
+                    const targetPath = (call.args?.path as string) || ''
                     this.agentPlanner.recordFileCreated(targetPath)
                   } else if (call.name === 'edit_file') {
-                    const targetPath = (call.args.path as string) || ''
+                    const targetPath = (call.args?.path as string) || ''
                     this.agentPlanner.recordFileModified(targetPath)
                   } else if (call.name === 'run_command') {
-                    const cmd = (call.args.command as string) || ''
+                    const cmd = (call.args?.command as string) || ''
                     const passed =
                       !execResult.output.includes('"exitCode": 1') &&
                       !execResult.output.includes('"exitCode": 2') &&
@@ -437,8 +712,16 @@ Rules for tool usage & failure handling:
                 if (activeStep) {
                   this.agentPlanner.completeStep(activeStep.id, execResult.output)
                 }
-              } else if (!execResult.success && activeStep) {
-                this.agentPlanner.failStep(activeStep.id, execResult.error || 'Execution failed')
+              } else if (!execResult.success) {
+                const failKey = `${call.name}:${JSON.stringify(call.args || {})}`
+                const failCount = (this.consecutiveToolFailures.get(failKey) || 0) + 1
+                this.consecutiveToolFailures.set(failKey, failCount)
+                if (failCount > 1) {
+                  toolResultOutput += `\n[Notice: Tool '${call.name}' with identical arguments has failed ${failCount} times. Do NOT call '${call.name}' with these identical failing arguments again. Please diagnose the failure or report it to the user.]`
+                }
+                if (activeStep) {
+                  this.agentPlanner.failStep(activeStep.id, execResult.error || 'Execution failed')
+                }
               }
             }
 
@@ -457,7 +740,7 @@ Rules for tool usage & failure handling:
               toolResultOutput = toolResultOutput.slice(0, maxAllowed) + truncationNotice
             }
 
-            onStep?.({
+            safeOnStep?.({
               type: 'tool_result',
               toolName: call.name,
               toolArgs: call.args,
@@ -484,6 +767,8 @@ Rules for tool usage & failure handling:
                 }
               ]
             })
+
+            this.pruneHistoryToBudget()
           }
           // Continue loop to let model produce final response
           continue
@@ -509,11 +794,11 @@ Rules for tool usage & failure handling:
           `[AgentTiming] Total: ${totalRequestTime.toFixed(1)}ms | LLM: ${totalProviderTime.toFixed(1)}ms | Tools: ${totalToolTime.toFixed(1)}ms`
         )
 
-        onStep?.({ type: 'done', text: finalText })
+        safeOnStep?.({ type: 'done', text: finalText })
         return finalText
       }
 
-      if (plan && plan.status === 'executing') {
+      if (plan && plan.status === 'executing' && plan === this.agentPlanner.getActivePlan() && this.activeRunId === runId) {
         const activeStep = plan.steps.find((s) => s.status === 'running' || s.status === 'pending')
         if (activeStep) {
           this.agentPlanner.failStep(activeStep.id, 'Maximum tool execution iterations reached')
@@ -522,9 +807,28 @@ Rules for tool usage & failure handling:
       }
 
       const maxReachedText = 'Maximum tool execution iterations reached.'
-      onStep?.({ type: 'done', text: maxReachedText })
+      safeOnStep?.({ type: 'done', text: maxReachedText })
       return maxReachedText
+    } catch (err: unknown) {
+      if (this.activeRunId === runId) {
+        const isAbort =
+          runSignal.aborted ||
+          (err instanceof Error && err.message === 'Request was stopped by user.')
+        const abortReason = isAbort
+          ? 'Request was stopped by user.'
+          : (err instanceof Error ? err.message : String(err))
+
+        if (plan && plan === this.agentPlanner.getActivePlan()) {
+          if (plan.status === 'executing' || plan.status === 'planning') {
+            this.agentPlanner.abortPlan(abortReason)
+          }
+        }
+
+        this.sanitizeIncompleteTurns(abortReason, isAbort)
+      }
+      throw err
     } finally {
+      isRunFinished = true
       if (this.abortController === runController) {
         this.abortController = null
       }

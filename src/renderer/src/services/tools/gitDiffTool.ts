@@ -2,6 +2,7 @@ import { ITool, ToolContext, ToolExecutionResult } from './types'
 
 export class GitDiffTool implements ITool {
   readonly name = 'git_diff'
+  readonly requiresApproval = false
   readonly description =
     'Inspects the current Git diff in the workspace, including unstaged and staged changes. Strictly read-only.'
 

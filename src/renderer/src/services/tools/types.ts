@@ -33,6 +33,7 @@ export interface ITool {
   readonly name: string
   readonly description: string
   readonly parameters: FunctionDeclaration['parameters']
+  readonly requiresApproval?: boolean
 
   execute(
     args: Record<string, unknown>,

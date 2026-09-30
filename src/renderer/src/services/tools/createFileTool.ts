@@ -2,6 +2,7 @@ import { ITool, ToolContext, ToolExecutionResult } from './types'
 
 export class CreateFileTool implements ITool {
   readonly name = 'create_file'
+  readonly requiresApproval = true
   readonly description =
     'Creates a new file in the workspace. Use this tool ONLY when the user explicitly asks to create or add a new file. The user will be asked to preview and approve the file content before it is created. Do NOT use this tool to overwrite or modify existing files.'
 
@@ -33,8 +34,8 @@ export class CreateFileTool implements ITool {
       }
     }
 
-    const filePath = typeof args.path === 'string' ? args.path.trim() : ''
-    const fileContent = typeof args.content === 'string' ? args.content : ''
+    const filePath = args && typeof args.path === 'string' ? args.path.trim() : ''
+    const fileContent = args && typeof args.content === 'string' ? args.content : ''
 
     if (!filePath) {
       return {
@@ -44,21 +45,37 @@ export class CreateFileTool implements ITool {
       }
     }
 
-    // Require explicit user approval before writing to disk
-    if (context.requestApproval) {
-      const isApproved = await context.requestApproval({
-        toolName: 'create_file',
-        path: filePath,
-        content: fileContent
-      })
+    // Require explicit user approval before writing to disk (fail-safe if missing)
+    if (!context.requestApproval) {
+      return {
+        success: false,
+        rejected: true,
+        output: 'File creation rejected: approval handler is required but was not provided.',
+        error: 'File creation rejected: approval handler is required but was not provided.'
+      }
+    }
 
-      if (!isApproved) {
-        return {
-          success: false,
-          rejected: true,
-          output: 'File creation rejected — no changes were made.',
-          error: 'File creation rejected — no changes were made.'
-        }
+    const isApproved = await context.requestApproval({
+      toolName: 'create_file',
+      path: filePath,
+      content: fileContent
+    })
+
+    if (!isApproved) {
+      return {
+        success: false,
+        rejected: true,
+        output: 'File creation rejected — no changes were made.',
+        error: 'File creation rejected — no changes were made.'
+      }
+    }
+
+    if (context.signal?.aborted) {
+      return {
+        success: false,
+        rejected: true,
+        output: 'Operation cancelled by user — no file was created.',
+        error: 'Operation cancelled by user.'
       }
     }
 

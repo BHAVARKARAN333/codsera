@@ -2,6 +2,7 @@ import { ITool, ToolContext, ToolExecutionResult } from './types'
 
 export class GitStatusTool implements ITool {
   readonly name = 'git_status'
+  readonly requiresApproval = false
   readonly description =
     'Inspects the current Git repository status in the workspace, including current branch, staged files, unstaged changes, untracked files, and conflicts. Strictly read-only.'
 
