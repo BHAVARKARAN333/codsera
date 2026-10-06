@@ -1,10 +1,10 @@
-import { app, BrowserWindow, dialog, ipcMain, shell } from 'electron'
+import { app, BrowserWindow, dialog, ipcMain, shell, session } from 'electron'
 import { join } from 'path'
 import * as fs from 'fs/promises'
 import * as path from 'path'
 import * as crypto from 'crypto'
 import { watch, FSWatcher } from 'fs'
-import { spawn, ChildProcess, exec } from 'child_process'
+import { spawn, exec } from 'child_process'
 import {
   FileEntry,
   IPC_CHANNELS,
@@ -14,8 +14,25 @@ import {
   CreateWorkspaceFileResult,
   EditWorkspaceFileResult,
   WriteFileResult,
+  CreateFileResult,
+  CreateDirectoryResult,
+  RenamePathResult,
+  DeletePathOptions,
+  DeletePathResult,
   RunCommandResult,
   GitStatusResult,
+  GitFileStatus,
+  GitFileChangeStatus,
+  GitStageResult,
+  GitUnstageResult,
+  GitStageAllResult,
+  GitUnstageAllResult,
+  GitCommitResult,
+  GitBranchListResult,
+  GitBranchCreateResult,
+  GitBranchCheckoutResult,
+  GitFileDiffResult,
+  GitDiscardFileResult,
   GitDiffResult,
   GitLogResult,
   GitCommitInfo,
@@ -34,9 +51,33 @@ import {
   OpenCodeChatCompletionResponse,
   OpenCodeListModelsRequest,
   OpenCodeListModelsResponse,
-  OpenCodeModelItem
+  OpenCodeModelItem,
+  TerminalSpawnOptions,
+  TerminalSpawnResult,
+  TerminalWriteInputResult,
+  TerminalKillResult,
+  TerminalKillAllResult,
+  TerminalListSessionsResult,
+  TerminalStreamDataEvent,
+  TerminalSessionExitEvent
 } from '../shared/types'
+import { TerminalSessionManager } from './terminalSessionManager'
 import { validateCommandSafety } from '../shared/commandValidator'
+import { encryptSecret, decryptSecret, isEncryptionAvailable } from './safeStorage'
+import {
+  getSettingsFilePath,
+  loadSettings,
+  saveSettings,
+  cleanupOrphanSettingsTempFiles
+} from './settingsPersistence'
+import {
+  isSafeString,
+  isSafePath,
+  isSafeExternalUrl,
+  clampTimeout,
+  buildCspDirectives,
+  isValidBranchName
+} from '../shared/securityUtils'
 
 // Ignore common non-essential folders to keep explorer performant and clean
 const IGNORED_FOLDERS = new Set(['.git', 'node_modules', 'dist', 'out', '.vscode', '.idea'])
@@ -57,6 +98,26 @@ const WATCHER_IGNORED_DIRS = new Set([
 let currentWatcher: FSWatcher | null = null
 let watchedWorkspaceRoot: string | null = null
 
+const terminalSessionManager = new TerminalSessionManager()
+
+// Broadcast terminal streaming chunks to all active application windows
+terminalSessionManager.on('data', (evt: TerminalStreamDataEvent) => {
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (!win.isDestroyed()) {
+      win.webContents.send(IPC_CHANNELS.TERMINAL_STREAM_DATA, evt)
+    }
+  }
+})
+
+// Broadcast terminal session exit events to all active application windows
+terminalSessionManager.on('exit', (evt: TerminalSessionExitEvent) => {
+  for (const win of BrowserWindow.getAllWindows()) {
+    if (!win.isDestroyed()) {
+      win.webContents.send(IPC_CHANNELS.TERMINAL_SESSION_EXIT, evt)
+    }
+  }
+})
+
 function stopWorkspaceWatcher(): void {
   if (currentWatcher) {
     try {
@@ -71,7 +132,7 @@ function stopWorkspaceWatcher(): void {
 
 function startWorkspaceWatcher(workspaceRoot: string): { success: boolean; error?: string } {
   try {
-    if (!workspaceRoot || typeof workspaceRoot !== 'string') {
+    if (!workspaceRoot || !isSafePath(workspaceRoot)) {
       return { success: false, error: 'Invalid workspace path.' }
     }
 
@@ -102,7 +163,7 @@ function startWorkspaceWatcher(workspaceRoot: string): { success: boolean; error
         }
 
         // Filter out ignored folders
-        const parts = rel.split(path.sep)
+        const parts = rel.split(/[/\\]/)
         if (parts.some((part) => WATCHER_IGNORED_DIRS.has(part))) {
           return
         }
@@ -117,28 +178,27 @@ function startWorkspaceWatcher(workspaceRoot: string): { success: boolean; error
           return
         }
 
-        // Determine event type
+        // Determine event type and whether target is a directory
         let changeType: WorkspaceFileChangeType = 'change'
+        let isDir = false
         try {
           const stat = await fs.stat(targetAbs)
-          if (stat.isDirectory()) {
-            // We ignore directory events, focus on file events
-            return
-          }
+          isDir = stat.isDirectory()
           if (eventType === 'rename') {
             changeType = 'add'
           } else {
             changeType = 'change'
           }
         } catch {
-          // If stat fails, file was deleted
+          // If stat fails, file or folder was deleted
           changeType = 'unlink'
         }
 
         const payload: WorkspaceFileChangeEvent = {
           workspaceRoot: normalizedRoot.replace(/\\/g, '/'),
           relativePath: rel.replace(/\\/g, '/'),
-          eventType: changeType
+          eventType: changeType,
+          isDirectory: isDir
         }
 
         // Broadcast to all open BrowserWindows
@@ -185,7 +245,7 @@ async function safeWriteWorkspaceIndex(
   data: unknown
 ): Promise<SaveWorkspaceIndexResult> {
   try {
-    if (!workspaceRoot || typeof workspaceRoot !== 'string' || !workspaceRoot.trim()) {
+    if (!workspaceRoot || !isSafePath(workspaceRoot)) {
       return { success: false, error: 'Invalid workspace path.' }
     }
     if (!data || typeof data !== 'object') {
@@ -241,7 +301,7 @@ async function safeLoadWorkspaceIndex(
   workspaceRoot: string
 ): Promise<LoadWorkspaceIndexResult> {
   try {
-    if (!workspaceRoot || typeof workspaceRoot !== 'string' || !workspaceRoot.trim()) {
+    if (!workspaceRoot || !isSafePath(workspaceRoot)) {
       return { success: false, error: 'Invalid workspace path.' }
     }
 
@@ -299,7 +359,7 @@ async function safeClearWorkspaceIndex(
   workspaceRoot: string
 ): Promise<ClearWorkspaceIndexResult> {
   try {
-    if (!workspaceRoot || typeof workspaceRoot !== 'string' || !workspaceRoot.trim()) {
+    if (!workspaceRoot || !isSafePath(workspaceRoot)) {
       return { success: false, error: 'Invalid workspace path.' }
     }
     const filePath = getWorkspaceIndexFilePath(workspaceRoot)
@@ -370,18 +430,32 @@ async function readDirectoryTree(dirPath: string, maxDepth = 8, currentDepth = 0
   }
 }
 
+function setupContentSecurityPolicy(): void {
+  const isDev = Boolean(process.env['ELECTRON_RENDERER_URL']) || !app.isPackaged
+  const csp = buildCspDirectives(isDev)
+
+  session.defaultSession.webRequest.onHeadersReceived((details, callback) => {
+    callback({
+      responseHeaders: {
+        ...details.responseHeaders,
+        'Content-Security-Policy': [csp]
+      }
+    })
+  })
+}
+
 function createWindow(): void {
   const mainWindow = new BrowserWindow({
     width: 1280,
     height: 820,
     minWidth: 800,
     minHeight: 600,
-    show: true,
+    show: false,
     autoHideMenuBar: true,
     title: 'AI IDE',
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
-      sandbox: false,
+      sandbox: true,
       contextIsolation: true,
       nodeIntegration: false
     }
@@ -392,10 +466,48 @@ function createWindow(): void {
     mainWindow.focus()
   })
 
+  mainWindow.webContents.on('did-fail-load', (_event, errorCode, errorDescription, validatedURL) => {
+    console.error(`[Renderer Load Failure] code: ${errorCode}, desc: ${errorDescription}, url: ${validatedURL}`)
+  })
+
+  mainWindow.webContents.on('render-process-gone', (_event, details) => {
+    console.error('[Renderer Crashed]', details)
+  })
+
+  const devUrl = process.env['ELECTRON_RENDERER_URL']
+
+  // Prevent navigation inside Electron window to external/arbitrary origins
+  mainWindow.webContents.on('will-navigate', (event, navigationUrl) => {
+    // Allow internal navigation to the dev server in development
+    if (devUrl && navigationUrl.startsWith(devUrl)) {
+      return
+    }
+
+    event.preventDefault()
+    if (isSafeExternalUrl(navigationUrl)) {
+      shell.openExternal(navigationUrl)
+    }
+  })
+
+  // Prevent opening arbitrary protocols/links, allow only safe external URLs (http/https) in system browser
   mainWindow.webContents.setWindowOpenHandler((details) => {
-    shell.openExternal(details.url)
+    if (isSafeExternalUrl(details.url)) {
+      shell.openExternal(details.url)
+    }
     return { action: 'deny' }
   })
+
+  // In production builds, block DevTools keyboard shortcuts (F12, Ctrl+Shift+I)
+  if (app.isPackaged) {
+    mainWindow.webContents.on('before-input-event', (event, input) => {
+      const isDevToolsShortcut =
+        (input.control && input.shift && input.key.toLowerCase() === 'i') ||
+        input.key === 'F12'
+      if (isDevToolsShortcut) {
+        event.preventDefault()
+      }
+    })
+  }
 
   // Load URL in dev, or local index.html in production
   if (process.env['ELECTRON_RENDERER_URL']) {
@@ -405,75 +517,69 @@ function createWindow(): void {
   }
 }
 
-function getSettingsFilePath(): string {
-  return path.join(app.getPath('userData'), 'settings.json')
+// Note: getSettingsFilePath, loadSettings, and saveSettings are imported from ./settingsPersistence
+
+interface SafeWorkspaceTargetSuccess {
+  success: true
+  normalizedRoot: string
+  normalizedTarget: string
+  relativePath: string
 }
 
-async function loadSettings(): Promise<AppSettings> {
-  try {
-    const filePath = getSettingsFilePath()
-    const data = await fs.readFile(filePath, 'utf-8')
-    return JSON.parse(data)
-  } catch {
-    return {}
+interface SafeWorkspaceTargetFailure {
+  success: false
+  error: string
+}
+
+type SafeWorkspaceTargetResult = SafeWorkspaceTargetSuccess | SafeWorkspaceTargetFailure
+
+function resolveSafeWorkspaceTarget(
+  workspaceRoot: unknown,
+  targetPath: unknown
+): SafeWorkspaceTargetResult {
+  if (!workspaceRoot || !isSafePath(workspaceRoot)) {
+    return { success: false, error: 'Invalid or missing workspace root.' }
+  }
+  if (!targetPath || !isSafePath(targetPath)) {
+    return { success: false, error: 'Invalid or missing target path.' }
+  }
+
+  const normalizedRoot = path.resolve(workspaceRoot)
+
+  let cleanPath = targetPath.trim()
+  if (!/^[a-zA-Z]:[/\\]/.test(cleanPath)) {
+    cleanPath = cleanPath.replace(/^[/\\]+/, '')
+  }
+
+  const normalizedTarget = path.isAbsolute(cleanPath)
+    ? path.resolve(cleanPath)
+    : path.resolve(normalizedRoot, cleanPath)
+
+  const rel = path.relative(normalizedRoot, normalizedTarget)
+  const isOutside = rel.startsWith('..') || path.isAbsolute(rel)
+
+  if (isOutside) {
+    return {
+      success: false,
+      error: `Access denied: Path '${targetPath}' is outside the current workspace.`
+    }
+  }
+
+  return {
+    success: true,
+    normalizedRoot,
+    normalizedTarget,
+    relativePath: rel.replace(/\\/g, '/')
   }
 }
 
-async function saveSettings(partial: Partial<AppSettings>): Promise<void> {
-  try {
-    const current = await loadSettings()
-    const updated: AppSettings = { ...current }
-
-    if (partial.openRouterApiKey !== undefined) {
-      if (typeof partial.openRouterApiKey === 'string' && partial.openRouterApiKey.trim()) {
-        updated.openRouterApiKey = partial.openRouterApiKey.trim()
-      } else {
-        delete updated.openRouterApiKey
-      }
-    }
-
-    if (partial.geminiApiKey !== undefined) {
-      if (typeof partial.geminiApiKey === 'string' && partial.geminiApiKey.trim()) {
-        updated.geminiApiKey = partial.geminiApiKey.trim()
-      } else {
-        delete updated.geminiApiKey
-      }
-    }
-
-    if (partial.nvidiaApiKey !== undefined) {
-      if (typeof partial.nvidiaApiKey === 'string' && partial.nvidiaApiKey.trim()) {
-        updated.nvidiaApiKey = partial.nvidiaApiKey.trim()
-      } else {
-        delete updated.nvidiaApiKey
-      }
-    }
-
-    if (partial.nvidiaModelId !== undefined) {
-      if (typeof partial.nvidiaModelId === 'string' && partial.nvidiaModelId.trim()) {
-        updated.nvidiaModelId = partial.nvidiaModelId.trim()
-      } else {
-        delete updated.nvidiaModelId
-      }
-    }
-
-    if (partial.selectedProvider !== undefined) {
-      updated.selectedProvider = partial.selectedProvider
-    }
-
-    if (partial.lastWorkspaceRoot !== undefined) {
-      if (typeof partial.lastWorkspaceRoot === 'string' && partial.lastWorkspaceRoot.trim()) {
-        updated.lastWorkspaceRoot = partial.lastWorkspaceRoot.trim()
-      } else {
-        delete updated.lastWorkspaceRoot
-      }
-    }
-
-    const filePath = getSettingsFilePath()
-    await fs.mkdir(path.dirname(filePath), { recursive: true })
-    await fs.writeFile(filePath, JSON.stringify(updated, null, 2), 'utf-8')
-  } catch (err) {
-    console.error('Failed to save settings:', err)
+function sanitizeFsError(err: unknown, normalizedTarget?: string, relativePath?: string): string {
+  if (!(err instanceof Error)) return String(err)
+  let msg = err.message
+  if (normalizedTarget && relativePath !== undefined) {
+    msg = msg.split(normalizedTarget).join(relativePath || 'target')
   }
+  return msg
 }
 
 function registerIpcHandlers(): void {
@@ -492,7 +598,9 @@ function registerIpcHandlers(): void {
       const tree = await readDirectoryTree(rootPath)
 
       // Persist last opened workspace path locally
-      await saveSettings({ lastWorkspaceRoot: rootPath })
+      await saveSettings({ lastWorkspaceRoot: rootPath }).catch((err) => {
+        console.error('Failed to persist last workspace root setting:', err)
+      })
 
       return {
         success: true,
@@ -541,13 +649,22 @@ function registerIpcHandlers(): void {
     IPC_CHANNELS.READ_TREE,
     async (_event, rootPath: string): Promise<OpenDirectoryResult> => {
       try {
-        if (!rootPath || typeof rootPath !== 'string') {
-          return { success: false, error: 'No workspace folder specified.' }
+        if (!rootPath || !isSafePath(rootPath)) {
+          return { success: false, error: 'No workspace folder specified or path is invalid.' }
         }
-        const tree = await readDirectoryTree(rootPath)
+        const resolved = path.resolve(rootPath)
+        try {
+          const stat = await fs.stat(resolved)
+          if (!stat.isDirectory()) {
+            return { success: false, error: 'Specified path is not a directory.' }
+          }
+        } catch {
+          return { success: false, error: 'Specified workspace folder does not exist.' }
+        }
+        const tree = await readDirectoryTree(resolved)
         return {
           success: true,
-          rootPath,
+          rootPath: resolved,
           tree
         }
       } catch (err: unknown) {
@@ -562,11 +679,24 @@ function registerIpcHandlers(): void {
     IPC_CHANNELS.READ_FILE,
     async (_event, filePath: string): Promise<ReadFileResult> => {
       try {
-        const content = await fs.readFile(filePath, 'utf-8')
+        if (!filePath || !isSafePath(filePath)) {
+          return { success: false, error: 'Invalid or missing file path.' }
+        }
+        const normalized = path.resolve(filePath)
+        let stat
+        try {
+          stat = await fs.stat(normalized)
+        } catch {
+          return { success: false, error: `File not found: '${filePath}'` }
+        }
+        if (stat.isDirectory()) {
+          return { success: false, error: `Cannot read '${filePath}': Target path is a directory, not a file.` }
+        }
+        const content = await fs.readFile(normalized, 'utf-8')
         return { success: true, content }
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err)
-        return { success: false, error: message }
+        return { success: false, error: `Failed to read file: ${message}` }
       }
     }
   )
@@ -577,10 +707,10 @@ function registerIpcHandlers(): void {
     IPC_CHANNELS.READ_WORKSPACE_FILE,
     async (_event, rootPath: string, targetPath: string): Promise<ReadWorkspaceFileResult> => {
       try {
-        if (!rootPath || typeof rootPath !== 'string') {
-          return { success: false, error: 'No workspace folder is currently open.' }
+        if (!rootPath || !isSafePath(rootPath)) {
+          return { success: false, error: 'No workspace folder is currently open or path is invalid.' }
         }
-        if (!targetPath || typeof targetPath !== 'string' || !targetPath.trim()) {
+        if (!targetPath || !isSafePath(targetPath)) {
           return { success: false, error: 'Missing or invalid file path.' }
         }
 
@@ -654,10 +784,10 @@ function registerIpcHandlers(): void {
       content: string
     ): Promise<CreateWorkspaceFileResult> => {
       try {
-        if (!rootPath || typeof rootPath !== 'string') {
-          return { success: false, error: 'No workspace folder is currently open.' }
+        if (!rootPath || !isSafePath(rootPath)) {
+          return { success: false, error: 'No workspace folder is currently open or path is invalid.' }
         }
-        if (!targetPath || typeof targetPath !== 'string' || !targetPath.trim()) {
+        if (!targetPath || !isSafePath(targetPath)) {
           return { success: false, error: 'Missing or invalid file path.' }
         }
 
@@ -729,10 +859,10 @@ function registerIpcHandlers(): void {
       expectedOldContent?: string
     ): Promise<EditWorkspaceFileResult> => {
       try {
-        if (!rootPath || typeof rootPath !== 'string') {
-          return { success: false, error: 'No workspace folder is currently open.' }
+        if (!rootPath || !isSafePath(rootPath)) {
+          return { success: false, error: 'No workspace folder is currently open or path is invalid.' }
         }
-        if (!targetPath || typeof targetPath !== 'string' || !targetPath.trim()) {
+        if (!targetPath || !isSafePath(targetPath)) {
           return { success: false, error: 'Missing or invalid file path.' }
         }
 
@@ -811,7 +941,7 @@ function registerIpcHandlers(): void {
     IPC_CHANNELS.WRITE_FILE,
     async (_event, filePath: string, content: string): Promise<WriteFileResult> => {
       try {
-        if (!filePath || typeof filePath !== 'string' || !filePath.trim()) {
+        if (!filePath || !isSafePath(filePath)) {
           return { success: false, error: 'Invalid or missing file path.' }
         }
         if (typeof content !== 'string') {
@@ -819,12 +949,291 @@ function registerIpcHandlers(): void {
         }
 
         const normalizedTarget = path.resolve(filePath)
+        try {
+          const stat = await fs.stat(normalizedTarget)
+          if (stat.isDirectory()) {
+            return { success: false, error: `Cannot write to '${filePath}': Target path is a directory.` }
+          }
+        } catch {
+          // File does not exist yet, proceed with write
+        }
+
         await fs.mkdir(path.dirname(normalizedTarget), { recursive: true })
         await fs.writeFile(normalizedTarget, content, 'utf-8')
         return { success: true }
       } catch (err: unknown) {
         const message = err instanceof Error ? err.message : String(err)
-        return { success: false, error: message }
+        return { success: false, error: `Failed to write file: ${message}` }
+      }
+    }
+  )
+
+  // Handle creating a new file in workspace (User CRUD)
+  ipcMain.handle(
+    IPC_CHANNELS.FS_CREATE_FILE,
+    async (
+      _event,
+      workspaceRoot: string,
+      relativePath: string,
+      content?: string
+    ): Promise<CreateFileResult> => {
+      try {
+        const res = resolveSafeWorkspaceTarget(workspaceRoot, relativePath)
+        if (!res.success) {
+          return { success: false, error: res.error }
+        }
+        if (res.relativePath === '') {
+          return { success: false, error: 'Cannot create a file as the workspace root.' }
+        }
+
+        // Validate workspace root exists and is a directory
+        try {
+          const rootStat = await fs.stat(res.normalizedRoot)
+          if (!rootStat.isDirectory()) {
+            return { success: false, error: 'Workspace root is not a directory.' }
+          }
+        } catch {
+          return { success: false, error: 'Workspace root does not exist.' }
+        }
+
+        // Overwrite protection: check if file or directory already exists at target
+        try {
+          await fs.access(res.normalizedTarget)
+          return {
+            success: false,
+            error: `File or directory already exists: '${res.relativePath}'.`
+          }
+        } catch {
+          // Target does not exist, proceed
+        }
+
+        // Validate content if provided
+        let fileContent = ''
+        if (content !== undefined && content !== null) {
+          if (typeof content !== 'string') {
+            return { success: false, error: 'Invalid file content provided.' }
+          }
+          if (content.length > 50 * 1024 * 1024) {
+            return { success: false, error: 'File content exceeds maximum permitted size (50MB).' }
+          }
+          fileContent = content
+        }
+
+        // Ensure parent directory exists
+        const parentDir = path.dirname(res.normalizedTarget)
+        await fs.mkdir(parentDir, { recursive: true })
+
+        // Write file
+        await fs.writeFile(res.normalizedTarget, fileContent, 'utf-8')
+
+        return {
+          success: true,
+          path: res.relativePath
+        }
+      } catch (err: unknown) {
+        const message = sanitizeFsError(err)
+        return { success: false, error: `Failed to create file: ${message}` }
+      }
+    }
+  )
+
+  // Handle creating a new directory in workspace (User CRUD)
+  ipcMain.handle(
+    IPC_CHANNELS.FS_CREATE_DIRECTORY,
+    async (
+      _event,
+      workspaceRoot: string,
+      relativePath: string
+    ): Promise<CreateDirectoryResult> => {
+      try {
+        const res = resolveSafeWorkspaceTarget(workspaceRoot, relativePath)
+        if (!res.success) {
+          return { success: false, error: res.error }
+        }
+        if (res.relativePath === '') {
+          return { success: false, error: 'Cannot create directory: target is the workspace root.' }
+        }
+
+        // Validate workspace root exists and is a directory
+        try {
+          const rootStat = await fs.stat(res.normalizedRoot)
+          if (!rootStat.isDirectory()) {
+            return { success: false, error: 'Workspace root is not a directory.' }
+          }
+        } catch {
+          return { success: false, error: 'Workspace root does not exist.' }
+        }
+
+        // Check if target already exists
+        try {
+          const targetStat = await fs.stat(res.normalizedTarget)
+          if (targetStat.isDirectory()) {
+            return {
+              success: false,
+              error: `Directory already exists: '${res.relativePath}'.`
+            }
+          } else {
+            return {
+              success: false,
+              error: `Cannot create directory: A file already exists at '${res.relativePath}'.`
+            }
+          }
+        } catch {
+          // Target does not exist, proceed
+        }
+
+        await fs.mkdir(res.normalizedTarget, { recursive: true })
+
+        return {
+          success: true,
+          path: res.relativePath
+        }
+      } catch (err: unknown) {
+        const message = sanitizeFsError(err)
+        return { success: false, error: `Failed to create directory: ${message}` }
+      }
+    }
+  )
+
+  // Handle renaming or moving a path in workspace (User CRUD)
+  ipcMain.handle(
+    IPC_CHANNELS.FS_RENAME_PATH,
+    async (
+      _event,
+      workspaceRoot: string,
+      oldRelativePath: string,
+      newRelativePath: string
+    ): Promise<RenamePathResult> => {
+      try {
+        const oldRes = resolveSafeWorkspaceTarget(workspaceRoot, oldRelativePath)
+        if (!oldRes.success) {
+          return { success: false, error: `Invalid source path: ${oldRes.error}` }
+        }
+        const newRes = resolveSafeWorkspaceTarget(workspaceRoot, newRelativePath)
+        if (!newRes.success) {
+          return { success: false, error: `Invalid destination path: ${newRes.error}` }
+        }
+
+        if (oldRes.relativePath === '') {
+          return { success: false, error: 'Cannot rename the workspace root directory.' }
+        }
+        if (newRes.relativePath === '') {
+          return { success: false, error: 'Destination cannot be the workspace root directory.' }
+        }
+
+        // Check source exists
+        let oldStat
+        try {
+          oldStat = await fs.lstat(oldRes.normalizedTarget)
+        } catch {
+          return { success: false, error: `Source path not found: '${oldRes.relativePath}'.` }
+        }
+
+        // If paths are identical string match
+        if (oldRes.normalizedTarget === newRes.normalizedTarget) {
+          return {
+            success: true,
+            oldPath: oldRes.relativePath,
+            newPath: newRes.relativePath
+          }
+        }
+
+        // Prevent moving a directory into itself or one of its descendants
+        if (oldStat.isDirectory()) {
+          const normOld = path.resolve(oldRes.normalizedTarget).toLowerCase()
+          const normNew = path.resolve(newRes.normalizedTarget).toLowerCase()
+          const relSub = path.relative(normOld, normNew)
+          if (!relSub.startsWith('..') && !path.isAbsolute(relSub)) {
+            return {
+              success: false,
+              error: 'Cannot move a directory into itself or one of its descendants.'
+            }
+          }
+        }
+
+        // Check destination conflict
+        try {
+          await fs.access(newRes.normalizedTarget)
+          // Destination exists. Check if this is a case-only rename on a case-insensitive filesystem
+          const isCaseOnly =
+            oldRes.normalizedTarget.toLowerCase() === newRes.normalizedTarget.toLowerCase()
+          if (!isCaseOnly) {
+            return {
+              success: false,
+              error: `Destination already exists: '${newRes.relativePath}'.`
+            }
+          }
+        } catch {
+          // Destination does not exist, proceed
+        }
+
+        // Ensure parent directory of destination exists
+        const parentDir = path.dirname(newRes.normalizedTarget)
+        await fs.mkdir(parentDir, { recursive: true })
+
+        await fs.rename(oldRes.normalizedTarget, newRes.normalizedTarget)
+
+        return {
+          success: true,
+          oldPath: oldRes.relativePath,
+          newPath: newRes.relativePath
+        }
+      } catch (err: unknown) {
+        const message = sanitizeFsError(err)
+        return { success: false, error: `Failed to rename path: ${message}` }
+      }
+    }
+  )
+
+  // Handle deleting a file or directory in workspace (User CRUD)
+  ipcMain.handle(
+    IPC_CHANNELS.FS_DELETE_PATH,
+    async (
+      _event,
+      workspaceRoot: string,
+      relativePath: string,
+      options?: DeletePathOptions
+    ): Promise<DeletePathResult> => {
+      try {
+        const res = resolveSafeWorkspaceTarget(workspaceRoot, relativePath)
+        if (!res.success) {
+          return { success: false, error: res.error }
+        }
+        if (res.relativePath === '') {
+          return { success: false, error: 'Cannot delete the workspace root directory.' }
+        }
+
+        // Verify target exists
+        let targetStat
+        try {
+          targetStat = await fs.lstat(res.normalizedTarget)
+        } catch {
+          return { success: false, error: `Path not found: '${res.relativePath}'.` }
+        }
+
+        if (targetStat.isDirectory()) {
+          const isRecursive = Boolean(options && typeof options === 'object' && options.recursive === true)
+          if (!isRecursive) {
+            const entries = await fs.readdir(res.normalizedTarget)
+            if (entries.length > 0) {
+              return {
+                success: false,
+                error: `Directory is not empty: '${res.relativePath}'. Set recursive to true to delete.`
+              }
+            }
+          }
+          await fs.rm(res.normalizedTarget, { recursive: true, force: false })
+        } else {
+          await fs.unlink(res.normalizedTarget)
+        }
+
+        return {
+          success: true,
+          path: res.relativePath
+        }
+      } catch (err: unknown) {
+        const message = sanitizeFsError(err)
+        return { success: false, error: `Failed to delete path: ${message}` }
       }
     }
   )
@@ -834,11 +1243,41 @@ function registerIpcHandlers(): void {
     IPC_CHANNELS.LIST_FILES,
     async (_event, rootPath: string, options?: { maxDepth?: number; relativePath?: string }) => {
       try {
-        const targetPath = options?.relativePath
-          ? path.resolve(rootPath, options.relativePath)
-          : rootPath
+        if (!rootPath || !isSafePath(rootPath)) {
+          return { success: false, error: 'Invalid or missing workspace root path.' }
+        }
 
-        const maxDepth = options?.maxDepth ?? 5
+        const normalizedRoot = path.resolve(rootPath)
+        let targetPath = normalizedRoot
+
+        const safeOptions = options && typeof options === 'object' ? options : undefined
+
+        if (safeOptions?.relativePath) {
+          if (!isSafePath(safeOptions.relativePath)) {
+            return { success: false, error: 'Invalid relative path provided.' }
+          }
+          const resolvedTarget = path.resolve(normalizedRoot, safeOptions.relativePath)
+          const rel = path.relative(normalizedRoot, resolvedTarget)
+          if (rel.startsWith('..') || path.isAbsolute(rel)) {
+            return { success: false, error: 'Access denied: target path is outside the workspace root.' }
+          }
+          targetPath = resolvedTarget
+        }
+
+        let stat
+        try {
+          stat = await fs.stat(targetPath)
+        } catch {
+          return { success: false, error: `Directory not found: '${safeOptions?.relativePath || rootPath}'` }
+        }
+        if (!stat.isDirectory()) {
+          return { success: false, error: `Path is not a directory: '${safeOptions?.relativePath || rootPath}'` }
+        }
+
+        const rawMaxDepth = typeof safeOptions?.maxDepth === 'number' && Number.isFinite(safeOptions.maxDepth)
+          ? safeOptions.maxDepth
+          : 5
+        const maxDepth = Math.max(1, Math.min(Math.floor(rawMaxDepth), 20))
         let totalFiles = 0
         let totalDirs = 0
 
@@ -1642,9 +2081,10 @@ function registerIpcHandlers(): void {
     }
   )
 
-  let activeChildProcess: ChildProcess | null = null
+  // Track most recent active legacy/user session for backward-compatible STOP_COMMAND targeting
+  let activeLegacySessionId: string | null = null
 
-  // Handle running shell commands safely in workspace working directory
+  // Handle running shell commands safely in workspace working directory (backward-compatible session wrapper)
   ipcMain.handle(
     IPC_CHANNELS.RUN_COMMAND,
     async (
@@ -1653,20 +2093,32 @@ function registerIpcHandlers(): void {
       targetCwd?: string,
       timeoutMs: number = 60000
     ): Promise<RunCommandResult> => {
-      if (!command || typeof command !== 'string' || !command.trim()) {
+      if (!command || !isSafeString(command)) {
         return {
           success: false,
           stdout: '',
           stderr: '',
           exitCode: null,
           timedOut: false,
-          error: 'No command specified.'
+          error: 'No command specified or command contains invalid characters.'
         }
       }
 
+      const clampedTimeout = clampTimeout(timeoutMs, 60000, 1000, 600000)
+
       // Ensure valid cwd
       let resolvedCwd = process.cwd()
-      if (targetCwd && typeof targetCwd === 'string') {
+      if (typeof targetCwd === 'string' && targetCwd.trim().length > 0) {
+        if (!isSafePath(targetCwd)) {
+          return {
+            success: false,
+            stdout: '',
+            stderr: '',
+            exitCode: null,
+            timedOut: false,
+            error: 'Invalid working directory path.'
+          }
+        }
         try {
           const stat = await fs.stat(targetCwd)
           if (stat.isDirectory()) {
@@ -1691,6 +2143,15 @@ function registerIpcHandlers(): void {
             error: `Working directory does not exist: '${targetCwd}'`
           }
         }
+      } else if (targetCwd !== undefined && targetCwd !== null) {
+        return {
+          success: false,
+          stdout: '',
+          stderr: '',
+          exitCode: null,
+          timedOut: false,
+          error: 'Invalid working directory path.'
+        }
       }
 
       // Safety Validation: Prevent workspace escape, traversal, or unauthorized directory changes
@@ -1708,129 +2169,172 @@ function registerIpcHandlers(): void {
         }
       }
 
-      return new Promise<RunCommandResult>((resolve) => {
-        let stdoutBuffer = ''
-        let stderrBuffer = ''
-        let isFinished = false
-        let timer: NodeJS.Timeout | null = null
+      return new Promise<RunCommandResult>(async (resolve) => {
+        const sessionId = terminalSessionManager.generateSessionId('legacy')
+        activeLegacySessionId = sessionId
 
-        const maxBufferLength = 50000
+        const onExit = (evt: TerminalSessionExitEvent) => {
+          if (evt.sessionId === sessionId) {
+            terminalSessionManager.off('exit', onExit)
+            if (activeLegacySessionId === sessionId) {
+              activeLegacySessionId = null
+            }
+            const session = terminalSessionManager.getSession(sessionId)
+            const stdout = session ? session.retainedStdout : (evt.stdout || '')
+            const stderr = session ? session.retainedStderr : (evt.stderr || '')
+            const finalError = evt.error || (evt.timedOut ? `Execution timed out after ${clampedTimeout / 1000} seconds.` : undefined)
 
-        try {
-          const child = spawn(command, {
-            cwd: resolvedCwd,
-            shell: true,
-            windowsHide: true,
-            env: { ...process.env }
-          })
+            // Safely prune completed transient session from memory
+            terminalSessionManager.removeCompletedSession(sessionId)
 
-          activeChildProcess = child
-
-          if (timeoutMs > 0) {
-            timer = setTimeout(() => {
-              if (!isFinished) {
-                isFinished = true
-                try {
-                  if (child.pid) {
-                    if (process.platform === 'win32') {
-                      exec(`taskkill /pid ${child.pid} /T /F`)
-                    } else {
-                      child.kill('SIGTERM')
-                    }
-                  }
-                } catch {
-                  // ignore
-                }
-                activeChildProcess = null
-                resolve({
-                  success: false,
-                  stdout: stdoutBuffer,
-                  stderr: stderrBuffer + `\nCommand timed out after ${timeoutMs / 1000}s.`,
-                  exitCode: null,
-                  timedOut: true,
-                  error: `Execution timed out after ${timeoutMs / 1000} seconds.`
-                })
-              }
-            }, timeoutMs)
+            resolve({
+              success: evt.exitCode === 0 && !evt.timedOut,
+              stdout,
+              stderr: evt.timedOut ? stderr + `\nCommand timed out after ${clampedTimeout / 1000}s.` : stderr,
+              exitCode: evt.exitCode,
+              timedOut: evt.timedOut,
+              error: finalError
+            })
           }
+        }
 
-          child.stdout?.on('data', (data) => {
-            const str = data.toString()
-            if (stdoutBuffer.length < maxBufferLength) {
-              stdoutBuffer += str.slice(0, maxBufferLength - stdoutBuffer.length)
-            }
-          })
+        terminalSessionManager.on('exit', onExit)
 
-          child.stderr?.on('data', (data) => {
-            const str = data.toString()
-            if (stderrBuffer.length < maxBufferLength) {
-              stderrBuffer += str.slice(0, maxBufferLength - stderrBuffer.length)
-            }
-          })
+        const spawnRes = await terminalSessionManager.spawnSession({
+          sessionId,
+          command,
+          cwd: resolvedCwd,
+          workspaceRoot: resolvedCwd,
+          source: 'transient',
+          timeoutMs: clampedTimeout
+        })
 
-          child.on('error', (err) => {
-            if (timer) clearTimeout(timer)
-            if (!isFinished) {
-              isFinished = true
-              activeChildProcess = null
-              resolve({
-                success: false,
-                stdout: stdoutBuffer,
-                stderr: stderrBuffer,
-                exitCode: null,
-                timedOut: false,
-                error: err.message
-              })
-            }
-          })
-
-          child.on('close', (code) => {
-            if (timer) clearTimeout(timer)
-            if (!isFinished) {
-              isFinished = true
-              activeChildProcess = null
-              resolve({
-                success: code === 0,
-                stdout: stdoutBuffer,
-                stderr: stderrBuffer,
-                exitCode: code,
-                timedOut: false
-              })
-            }
-          })
-        } catch (spawnErr: unknown) {
-          if (timer) clearTimeout(timer)
-          activeChildProcess = null
-          const msg = spawnErr instanceof Error ? spawnErr.message : String(spawnErr)
+        if (!spawnRes.success) {
+          terminalSessionManager.off('exit', onExit)
+          if (activeLegacySessionId === sessionId) {
+            activeLegacySessionId = null
+          }
           resolve({
             success: false,
             stdout: '',
             stderr: '',
             exitCode: null,
             timedOut: false,
-            error: msg
+            error: spawnRes.error || 'Failed to spawn process.'
           })
         }
       })
     }
   )
 
-  // Handle stopping active child command
-  ipcMain.handle(IPC_CHANNELS.STOP_COMMAND, async (): Promise<{ success: boolean }> => {
-    try {
-      if (activeChildProcess && activeChildProcess.pid) {
-        if (process.platform === 'win32') {
-          exec(`taskkill /pid ${activeChildProcess.pid} /T /F`)
-        } else {
-          activeChildProcess.kill('SIGTERM')
+  // Handle stopping active child command (backward-compatible scoped mechanism)
+  ipcMain.handle(
+    IPC_CHANNELS.STOP_COMMAND,
+    async (_event, sessionId?: string): Promise<{ success: boolean; error?: string }> => {
+      try {
+        if (typeof sessionId === 'string' && sessionId.trim().length > 0) {
+          const killRes = await terminalSessionManager.killSession(sessionId.trim())
+          return { success: killRes.success, error: killRes.error }
         }
-        activeChildProcess = null
+
+        if (activeLegacySessionId) {
+          const killRes = await terminalSessionManager.killSession(activeLegacySessionId)
+          activeLegacySessionId = null
+          return { success: killRes.success, error: killRes.error }
+        }
+
+        // Scoped fallback: only stop active user or transient sessions, avoiding AI agent processes
+        const sessions = terminalSessionManager.listSessions()
+        const runningTargets = sessions.filter(
+          (s) => s.running && (s.source === 'user' || s.source === 'transient')
+        )
+        if (runningTargets.length > 0) {
+          const target = runningTargets[runningTargets.length - 1]
+          const killRes = await terminalSessionManager.killSession(target.sessionId)
+          return { success: killRes.success, error: killRes.error }
+        }
+
+        return { success: true }
+      } catch (err: unknown) {
+        const msg = err instanceof Error ? err.message : String(err)
+        return { success: false, error: msg }
       }
-      return { success: true }
-    } catch {
-      return { success: false }
     }
-  })
+  )
+
+  // Handle spawning a new isolated terminal session
+  ipcMain.handle(
+    IPC_CHANNELS.TERMINAL_SPAWN,
+    async (event, options: TerminalSpawnOptions): Promise<TerminalSpawnResult> => {
+      if (!event.sender || event.sender.isDestroyed()) {
+        return { success: false, error: 'Unauthorized or destroyed IPC sender.' }
+      }
+      return terminalSessionManager.spawnSession(options)
+    }
+  )
+
+  // Handle writing to a terminal session stdin
+  ipcMain.handle(
+    IPC_CHANNELS.TERMINAL_WRITE_INPUT,
+    async (event, sessionId: string, inputData: string): Promise<TerminalWriteInputResult> => {
+      if (!event.sender || event.sender.isDestroyed()) {
+        return { success: false, error: 'Unauthorized or destroyed IPC sender.' }
+      }
+      return terminalSessionManager.writeInput(sessionId, inputData)
+    }
+  )
+
+  // Handle resizing a terminal session (cols, rows)
+  ipcMain.handle(
+    IPC_CHANNELS.TERMINAL_RESIZE,
+    async (
+      event,
+      sessionId: string,
+      cols: number,
+      rows: number
+    ): Promise<import('../shared/types').TerminalResizeResult> => {
+      if (!event.sender || event.sender.isDestroyed()) {
+        return { success: false, error: 'Unauthorized or destroyed IPC sender.' }
+      }
+      return terminalSessionManager.resizeSession(sessionId, cols, rows)
+    }
+  )
+
+  // Handle killing a specific terminal session
+  ipcMain.handle(
+    IPC_CHANNELS.TERMINAL_KILL,
+    async (event, sessionId: string): Promise<TerminalKillResult> => {
+      if (!event.sender || event.sender.isDestroyed()) {
+        return { success: false, error: 'Unauthorized or destroyed IPC sender.' }
+      }
+      return terminalSessionManager.killSession(sessionId)
+    }
+  )
+
+  // Handle killing all terminal sessions
+  ipcMain.handle(
+    IPC_CHANNELS.TERMINAL_KILL_ALL,
+    async (event): Promise<TerminalKillAllResult> => {
+      if (!event.sender || event.sender.isDestroyed()) {
+        return { success: false, killedCount: 0, error: 'Unauthorized or destroyed IPC sender.' }
+      }
+      return terminalSessionManager.killAllSessions()
+    }
+  )
+
+  // Handle listing all tracked terminal sessions
+  ipcMain.handle(
+    IPC_CHANNELS.TERMINAL_LIST_SESSIONS,
+    async (event): Promise<TerminalListSessionsResult> => {
+      if (!event.sender || event.sender.isDestroyed()) {
+        return { success: false, sessions: [], error: 'Unauthorized or destroyed IPC sender.' }
+      }
+      return {
+        success: true,
+        sessions: terminalSessionManager.listSessions()
+      }
+    }
+  )
 
   interface GitExecutionResult {
     success: boolean
@@ -1958,7 +2462,7 @@ function registerIpcHandlers(): void {
   ipcMain.handle(
     IPC_CHANNELS.GIT_STATUS,
     async (_event, rootPath: string): Promise<GitStatusResult> => {
-      if (!rootPath || typeof rootPath !== 'string') {
+      if (!rootPath || !isSafePath(rootPath)) {
         return {
           success: false,
           isRepository: false,
@@ -1968,7 +2472,7 @@ function registerIpcHandlers(): void {
           untracked: [],
           conflicted: [],
           clean: false,
-          error: 'No workspace folder is currently open.'
+          error: 'No workspace folder is currently open or path is invalid.'
         }
       }
 
@@ -2007,6 +2511,7 @@ function registerIpcHandlers(): void {
       const unstaged: string[] = []
       const untracked: string[] = []
       const conflicted: string[] = []
+      const files: GitFileStatus[] = []
 
       const lines = gitRes.stdout.split(/\r?\n/)
       for (const line of lines) {
@@ -2032,20 +2537,40 @@ function registerIpcHandlers(): void {
 
         if (x === '?' && y === '?') {
           untracked.push(filePath)
+          files.push({ path: filePath, status: 'untracked', staged: false })
         } else if (
           (x === 'U' || y === 'U') ||
           (x === 'A' && y === 'A') ||
           (x === 'D' && y === 'D')
         ) {
           conflicted.push(filePath)
+          files.push({ path: filePath, status: 'conflicted', staged: false })
         } else {
           // Check staged status (X)
           if (x !== ' ' && x !== '?') {
             staged.push(`${x} ${filePath}`)
+            let changeStatus: GitFileChangeStatus = 'modified'
+            let fileRel = filePath
+            let oldRel: string | undefined = undefined
+            if (x === 'A') changeStatus = 'added'
+            else if (x === 'D') changeStatus = 'deleted'
+            else if (x === 'R') {
+              changeStatus = 'renamed'
+              if (filePath.includes(' -> ')) {
+                const parts = filePath.split(' -> ')
+                oldRel = parts[0].trim()
+                fileRel = parts[1].trim()
+              }
+            }
+            files.push({ path: fileRel, status: changeStatus, staged: true, oldPath: oldRel })
           }
           // Check unstaged status (Y)
           if (y !== ' ' && y !== '?') {
             unstaged.push(`${y} ${filePath}`)
+            let changeStatus: GitFileChangeStatus = 'modified'
+            let fileRel = filePath
+            if (y === 'D') changeStatus = 'deleted'
+            files.push({ path: fileRel, status: changeStatus, staged: false })
           }
         }
       }
@@ -2064,7 +2589,8 @@ function registerIpcHandlers(): void {
         unstaged,
         untracked,
         conflicted,
-        clean
+        clean,
+        files
       }
     }
   )
@@ -2073,13 +2599,13 @@ function registerIpcHandlers(): void {
   ipcMain.handle(
     IPC_CHANNELS.GIT_DIFF,
     async (_event, rootPath: string): Promise<GitDiffResult> => {
-      if (!rootPath || typeof rootPath !== 'string') {
+      if (!rootPath || !isSafePath(rootPath)) {
         return {
           success: false,
           isRepository: false,
           unstagedDiff: '',
           stagedDiff: '',
-          error: 'No workspace folder is currently open.'
+          error: 'No workspace folder is currently open or path is invalid.'
         }
       }
 
@@ -2140,16 +2666,16 @@ function registerIpcHandlers(): void {
   ipcMain.handle(
     IPC_CHANNELS.GIT_LOG,
     async (_event, rootPath: string, maxCount = 10): Promise<GitLogResult> => {
-      if (!rootPath || typeof rootPath !== 'string') {
+      if (!rootPath || !isSafePath(rootPath)) {
         return {
           success: false,
           isRepository: false,
           commits: [],
-          error: 'No workspace folder is currently open.'
+          error: 'No workspace folder is currently open or path is invalid.'
         }
       }
 
-      const count = Math.min(Math.max(1, typeof maxCount === 'number' ? maxCount : 10), 25)
+      const count = Math.min(Math.max(1, typeof maxCount === 'number' && Number.isFinite(maxCount) ? Math.floor(maxCount) : 10), 25)
       const gitRes = await executeGitCommand(
         ['log', `-${count}`, '--pretty=format:%H%x09%an%x09%ad%x09%s', '--date=short', '--no-color'],
         rootPath
@@ -2195,20 +2721,552 @@ function registerIpcHandlers(): void {
       }
     }
   )
+
+  // Handle Staging a Single File
+  ipcMain.handle(
+    IPC_CHANNELS.GIT_STAGE_FILE,
+    async (_event, workspaceRoot: string, relativePath: string): Promise<GitStageResult> => {
+      const targetRes = resolveSafeWorkspaceTarget(workspaceRoot, relativePath)
+      if (!targetRes.success) {
+        return { success: false, error: targetRes.error }
+      }
+
+      if (!targetRes.relativePath || targetRes.relativePath === '.' || targetRes.relativePath === '*') {
+        return {
+          success: false,
+          error: 'Cannot stage entire directory with single-file stage. Use stage all instead.'
+        }
+      }
+
+      const gitRes = await executeGitCommand(['add', '--', targetRes.relativePath], targetRes.normalizedRoot)
+      if (gitRes.notInstalled) {
+        return { success: false, error: 'Git is not installed or could not be executed.' }
+      }
+      if (!gitRes.isRepo) {
+        return { success: false, error: 'This workspace is not a Git repository.' }
+      }
+      if (!gitRes.success) {
+        return { success: false, error: gitRes.error || gitRes.stderr || 'Failed to stage file.' }
+      }
+
+      return { success: true, path: targetRes.relativePath }
+    }
+  )
+
+  // Handle Unstaging a Single File
+  ipcMain.handle(
+    IPC_CHANNELS.GIT_UNSTAGE_FILE,
+    async (_event, workspaceRoot: string, relativePath: string): Promise<GitUnstageResult> => {
+      const targetRes = resolveSafeWorkspaceTarget(workspaceRoot, relativePath)
+      if (!targetRes.success) {
+        return { success: false, error: targetRes.error }
+      }
+
+      if (!targetRes.relativePath || targetRes.relativePath === '.' || targetRes.relativePath === '*') {
+        return {
+          success: false,
+          error: 'Cannot unstage entire directory with single-file unstage. Use unstage all instead.'
+        }
+      }
+
+      // Try modern git restore --staged first, fallback to git reset HEAD if needed
+      let gitRes = await executeGitCommand(['restore', '--staged', '--', targetRes.relativePath], targetRes.normalizedRoot)
+      if (gitRes.notInstalled) {
+        return { success: false, error: 'Git is not installed or could not be executed.' }
+      }
+      if (!gitRes.isRepo) {
+        return { success: false, error: 'This workspace is not a Git repository.' }
+      }
+      if (!gitRes.success && (gitRes.stderr.includes('unknown option') || gitRes.stderr.includes('not a git command'))) {
+        gitRes = await executeGitCommand(['reset', 'HEAD', '--', targetRes.relativePath], targetRes.normalizedRoot)
+      }
+      if (!gitRes.success) {
+        return { success: false, error: gitRes.error || gitRes.stderr || 'Failed to unstage file.' }
+      }
+
+      return { success: true, path: targetRes.relativePath }
+    }
+  )
+
+  // Handle Staging All Changes
+  ipcMain.handle(
+    IPC_CHANNELS.GIT_STAGE_ALL,
+    async (_event, workspaceRoot: string): Promise<GitStageAllResult> => {
+      if (!workspaceRoot || !isSafePath(workspaceRoot)) {
+        return { success: false, error: 'Invalid or missing workspace root.' }
+      }
+
+      const normalizedRoot = path.resolve(workspaceRoot)
+      const gitRes = await executeGitCommand(['add', '-A', '--', '.'], normalizedRoot)
+      if (gitRes.notInstalled) {
+        return { success: false, error: 'Git is not installed or could not be executed.' }
+      }
+      if (!gitRes.isRepo) {
+        return { success: false, error: 'This workspace is not a Git repository.' }
+      }
+      if (!gitRes.success) {
+        return { success: false, error: gitRes.error || gitRes.stderr || 'Failed to stage all changes.' }
+      }
+
+      return { success: true }
+    }
+  )
+
+  // Handle Unstaging All Changes
+  ipcMain.handle(
+    IPC_CHANNELS.GIT_UNSTAGE_ALL,
+    async (_event, workspaceRoot: string): Promise<GitUnstageAllResult> => {
+      if (!workspaceRoot || !isSafePath(workspaceRoot)) {
+        return { success: false, error: 'Invalid or missing workspace root.' }
+      }
+
+      const normalizedRoot = path.resolve(workspaceRoot)
+      let gitRes = await executeGitCommand(['restore', '--staged', '--', '.'], normalizedRoot)
+      if (gitRes.notInstalled) {
+        return { success: false, error: 'Git is not installed or could not be executed.' }
+      }
+      if (!gitRes.isRepo) {
+        return { success: false, error: 'This workspace is not a Git repository.' }
+      }
+      if (!gitRes.success && (gitRes.stderr.includes('unknown option') || gitRes.stderr.includes('not a git command'))) {
+        gitRes = await executeGitCommand(['reset', 'HEAD', '--', '.'], normalizedRoot)
+      }
+      if (!gitRes.success) {
+        return { success: false, error: gitRes.error || gitRes.stderr || 'Failed to unstage all changes.' }
+      }
+
+      return { success: true }
+    }
+  )
+
+  // Handle Creating a Commit
+  ipcMain.handle(
+    IPC_CHANNELS.GIT_COMMIT,
+    async (_event, workspaceRoot: string, message: string): Promise<GitCommitResult> => {
+      if (!workspaceRoot || !isSafePath(workspaceRoot)) {
+        return { success: false, error: 'Invalid or missing workspace root.' }
+      }
+
+      if (typeof message !== 'string' || !message.trim()) {
+        return { success: false, error: 'Commit message cannot be empty.' }
+      }
+
+      if (message.length > 10000) {
+        return { success: false, error: 'Commit message exceeds maximum length (10,000 characters).' }
+      }
+
+      const normalizedRoot = path.resolve(workspaceRoot)
+
+      // First check if any staged changes exist
+      const statusRes = await executeGitCommand(['status', '--porcelain=v1'], normalizedRoot)
+      if (statusRes.notInstalled) {
+        return { success: false, error: 'Git is not installed or could not be executed.' }
+      }
+      if (!statusRes.isRepo) {
+        return { success: false, error: 'This workspace is not a Git repository.' }
+      }
+
+      const statusLines = statusRes.stdout.split(/\r?\n/).filter(Boolean)
+      const hasStaged = statusLines.some((l) => {
+        const x = l[0]
+        return x !== ' ' && x !== '?'
+      })
+
+      if (!hasStaged) {
+        return { success: false, error: 'No staged changes to commit. Please stage changes first.' }
+      }
+
+      const gitRes = await executeGitCommand(['commit', '-m', message.trim()], normalizedRoot)
+      if (!gitRes.success) {
+        const combinedErr = (gitRes.stderr + '\n' + gitRes.stdout).toLowerCase()
+        if (
+          combinedErr.includes('author identity unknown') ||
+          combinedErr.includes('please tell me who you are') ||
+          combinedErr.includes('*** please tell me who you are')
+        ) {
+          return {
+            success: false,
+            error:
+              'Git author identity is not configured. Please configure your name and email using:\ngit config --global user.name "Your Name"\ngit config --global user.email "you@example.com"'
+          }
+        }
+        if (combinedErr.includes('conflict') || combinedErr.includes('fix conflicts')) {
+          return {
+            success: false,
+            error: 'Cannot commit while in a conflicted merge state. Resolve conflicts first.'
+          }
+        }
+        return { success: false, error: gitRes.error || gitRes.stderr || 'Commit failed.' }
+      }
+
+      // Extract commit hash
+      const hashRes = await executeGitCommand(['rev-parse', '--short', 'HEAD'], normalizedRoot)
+      const commitHash = hashRes.success ? hashRes.stdout.trim() : undefined
+      const summary = gitRes.stdout.split(/\r?\n/).find((l) => l.trim().length > 0) || undefined
+
+      return {
+        success: true,
+        commitHash,
+        summary
+      }
+    }
+  )
+
+  // Handle Listing Local Branches
+  ipcMain.handle(
+    IPC_CHANNELS.GIT_BRANCH_LIST,
+    async (_event, workspaceRoot: string): Promise<GitBranchListResult> => {
+      if (!workspaceRoot || !isSafePath(workspaceRoot)) {
+        return {
+          success: false,
+          isRepository: false,
+          currentBranch: null,
+          branches: [],
+          error: 'Invalid or missing workspace root.'
+        }
+      }
+
+      const normalizedRoot = path.resolve(workspaceRoot)
+      const gitRes = await executeGitCommand(['branch', '--list', '--no-color'], normalizedRoot)
+      if (gitRes.notInstalled) {
+        return {
+          success: false,
+          isRepository: false,
+          currentBranch: null,
+          branches: [],
+          error: 'Git is not installed or could not be executed.'
+        }
+      }
+      if (!gitRes.isRepo) {
+        return {
+          success: true,
+          isRepository: false,
+          currentBranch: null,
+          branches: [],
+          error: 'This workspace is not a Git repository.'
+        }
+      }
+
+      let currentBranch: string | null = null
+      const branches: string[] = []
+
+      const lines = gitRes.stdout.split(/\r?\n/)
+      for (const line of lines) {
+        if (!line.trim()) continue
+        const isCurrent = line.startsWith('* ')
+        const bName = line.slice(2).trim()
+        if (isCurrent) {
+          if (bName.startsWith('(HEAD detached')) {
+            currentBranch = 'HEAD (detached)'
+          } else {
+            currentBranch = bName
+          }
+        }
+        if (!bName.startsWith('(HEAD detached')) {
+          branches.push(bName)
+        }
+      }
+
+      return {
+        success: true,
+        isRepository: true,
+        currentBranch,
+        branches
+      }
+    }
+  )
+
+  // Handle Creating and Checking out a New Branch
+  ipcMain.handle(
+    IPC_CHANNELS.GIT_BRANCH_CREATE,
+    async (_event, workspaceRoot: string, branchName: string): Promise<GitBranchCreateResult> => {
+      if (!workspaceRoot || !isSafePath(workspaceRoot)) {
+        return { success: false, error: 'Invalid or missing workspace root.' }
+      }
+
+      const validation = isValidBranchName(branchName)
+      if (!validation.valid) {
+        return { success: false, error: validation.error || 'Invalid branch name.' }
+      }
+
+      const cleanBranch = (branchName as string).trim()
+      const normalizedRoot = path.resolve(workspaceRoot)
+
+      // Validate with Git's check-ref-format
+      const checkRes = await executeGitCommand(['check-ref-format', '--branch', cleanBranch], normalizedRoot)
+      if (checkRes.notInstalled) {
+        return { success: false, error: 'Git is not installed or could not be executed.' }
+      }
+      if (!checkRes.isRepo) {
+        return { success: false, error: 'This workspace is not a Git repository.' }
+      }
+      if (!checkRes.success) {
+        return { success: false, error: `Invalid branch name format: '${cleanBranch}'.` }
+      }
+
+      const gitRes = await executeGitCommand(['checkout', '-b', cleanBranch], normalizedRoot)
+      if (!gitRes.success) {
+        if (gitRes.stderr.includes('already exists')) {
+          return { success: false, error: `A branch named '${cleanBranch}' already exists.` }
+        }
+        return { success: false, error: gitRes.error || gitRes.stderr || 'Failed to create branch.' }
+      }
+
+      return { success: true, branch: cleanBranch }
+    }
+  )
+
+  // Handle Switching to an Existing Branch
+  ipcMain.handle(
+    IPC_CHANNELS.GIT_BRANCH_CHECKOUT,
+    async (_event, workspaceRoot: string, branchName: string): Promise<GitBranchCheckoutResult> => {
+      if (!workspaceRoot || !isSafePath(workspaceRoot)) {
+        return { success: false, error: 'Invalid or missing workspace root.' }
+      }
+
+      const validation = isValidBranchName(branchName)
+      if (!validation.valid) {
+        return { success: false, error: validation.error || 'Invalid branch name.' }
+      }
+
+      const cleanBranch = (branchName as string).trim()
+      const normalizedRoot = path.resolve(workspaceRoot)
+
+      const gitRes = await executeGitCommand(['checkout', cleanBranch], normalizedRoot)
+      if (gitRes.notInstalled) {
+        return { success: false, error: 'Git is not installed or could not be executed.' }
+      }
+      if (!gitRes.isRepo) {
+        return { success: false, error: 'This workspace is not a Git repository.' }
+      }
+      if (!gitRes.success) {
+        if (gitRes.stderr.includes('would be overwritten by checkout')) {
+          return {
+            success: false,
+            error: 'Cannot switch branch: your uncommitted changes would be overwritten. Please commit or stash them first.'
+          }
+        }
+        if (gitRes.stderr.includes('did not match any file(s) known to git')) {
+          return { success: false, error: `Branch '${cleanBranch}' not found.` }
+        }
+        return { success: false, error: gitRes.error || gitRes.stderr || 'Failed to switch branch.' }
+      }
+
+      return { success: true, branch: cleanBranch }
+    }
+  )
+
+  // Handle Retrieving Staged and Unstaged Diff for a Single File
+  ipcMain.handle(
+    IPC_CHANNELS.GIT_FILE_DIFF,
+    async (_event, workspaceRoot: string, relativePath: string): Promise<GitFileDiffResult> => {
+      const targetRes = resolveSafeWorkspaceTarget(workspaceRoot, relativePath)
+      if (!targetRes.success) {
+        return {
+          success: false,
+          isRepository: false,
+          path: typeof relativePath === 'string' ? relativePath : '',
+          unstagedDiff: '',
+          stagedDiff: '',
+          error: targetRes.error
+        }
+      }
+
+      const normalizedRoot = targetRes.normalizedRoot
+      const targetRel = targetRes.relativePath
+
+      const unstagedRes = await executeGitCommand(['diff', '--no-color', '--', targetRel], normalizedRoot)
+      if (unstagedRes.notInstalled) {
+        return {
+          success: false,
+          isRepository: false,
+          path: targetRel,
+          unstagedDiff: '',
+          stagedDiff: '',
+          error: 'Git is not installed or could not be executed.'
+        }
+      }
+      if (!unstagedRes.isRepo) {
+        return {
+          success: true,
+          isRepository: false,
+          path: targetRel,
+          unstagedDiff: '',
+          stagedDiff: '',
+          error: 'This workspace is not a Git repository.'
+        }
+      }
+
+      const stagedRes = await executeGitCommand(['diff', '--cached', '--no-color', '--', targetRel], normalizedRoot)
+
+      let unstagedDiff = unstagedRes.stdout || ''
+      let stagedDiff = stagedRes.stdout || ''
+
+      // If both standard diffs are empty, check if the file is untracked in working tree
+      if (!unstagedDiff && !stagedDiff) {
+        const statusRes = await executeGitCommand(['status', '--porcelain=v1', '--', targetRel], normalizedRoot)
+        if (statusRes.stdout.includes('?? ')) {
+          const untrackedRes = await executeGitCommand(
+            ['diff', '--no-index', '--no-color', '--', '/dev/null', targetRel],
+            normalizedRoot
+          )
+          unstagedDiff = untrackedRes.stdout || ''
+        }
+      }
+
+      const isBinary =
+        unstagedRes.stdout.includes('Binary files differ') ||
+        stagedRes.stdout.includes('Binary files differ') ||
+        unstagedDiff.includes('Binary files differ')
+
+      const MAX_DIFF = 50000
+      let truncated = false
+
+      if (unstagedDiff.length > MAX_DIFF) {
+        unstagedDiff = unstagedDiff.slice(0, MAX_DIFF) + '\n\n[...diff truncated at 50,000 characters]'
+        truncated = true
+      }
+
+      if (stagedDiff.length > MAX_DIFF) {
+        stagedDiff = stagedDiff.slice(0, MAX_DIFF) + '\n\n[...diff truncated at 50,000 characters]'
+        truncated = true
+      }
+
+      return {
+        success: true,
+        isRepository: true,
+        path: targetRel,
+        unstagedDiff,
+        stagedDiff,
+        isBinary,
+        truncated
+      }
+    }
+  )
+
+  // Handle Discarding Changes for One Single Explicitly Validated File
+  ipcMain.handle(
+    IPC_CHANNELS.GIT_DISCARD_FILE,
+    async (_event, workspaceRoot: string, relativePath: string): Promise<GitDiscardFileResult> => {
+      const targetRes = resolveSafeWorkspaceTarget(workspaceRoot, relativePath)
+      if (!targetRes.success) {
+        return { success: false, error: targetRes.error }
+      }
+
+      const targetRel = targetRes.relativePath
+      if (!targetRel || targetRel === '.' || targetRel === '*') {
+        return {
+          success: false,
+          error: 'Discard operation requires one explicitly specified file path. Discarding all files is not permitted.'
+        }
+      }
+
+      const normalizedRoot = targetRes.normalizedRoot
+      const targetAbs = targetRes.normalizedTarget
+
+      // Check current file status
+      const statusRes = await executeGitCommand(['status', '--porcelain=v1', '--', targetRel], normalizedRoot)
+      if (statusRes.notInstalled) {
+        return { success: false, error: 'Git is not installed or could not be executed.' }
+      }
+      if (!statusRes.isRepo) {
+        return { success: false, error: 'This workspace is not a Git repository.' }
+      }
+
+      const statusLine = statusRes.stdout.split(/\r?\n/).find((l) => l.includes(targetRel))
+
+      // If file is untracked (??), safely unlink it
+      if (statusLine && statusLine.startsWith('??')) {
+        try {
+          await fs.unlink(targetAbs)
+          return { success: true, path: targetRel }
+        } catch (err: unknown) {
+          const msg = err instanceof Error ? err.message : String(err)
+          return { success: false, error: `Failed to remove untracked file: ${msg}` }
+        }
+      }
+
+      // If file was added in index (A  ), unstage and remove
+      if (statusLine && statusLine.startsWith('A ')) {
+        const rmRes = await executeGitCommand(['rm', '-f', '--', targetRel], normalizedRoot)
+        if (!rmRes.success) {
+          await executeGitCommand(['restore', '--staged', '--', targetRel], normalizedRoot)
+          try {
+            await fs.unlink(targetAbs)
+          } catch {}
+        }
+        return { success: true, path: targetRel }
+      }
+
+      // Tracked file with modifications: restore from HEAD (restores both index and working tree)
+      let restoreRes = await executeGitCommand(['restore', '--source=HEAD', '--staged', '--worktree', '--', targetRel], normalizedRoot)
+      if (!restoreRes.success) {
+        restoreRes = await executeGitCommand(['checkout', 'HEAD', '--', targetRel], normalizedRoot)
+      }
+
+      if (!restoreRes.success) {
+        return { success: false, error: restoreRes.error || restoreRes.stderr || 'Failed to discard changes.' }
+      }
+
+      return { success: true, path: targetRel }
+    }
+  )
   console.log('[IPC] All main process IPC handlers registered successfully (including NVIDIA NIM)')
 }
 
-app.whenReady().then(() => {
-  registerIpcHandlers()
-  createWindow()
+export {
+  registerIpcHandlers,
+  setupContentSecurityPolicy,
+  terminalSessionManager,
+  encryptSecret,
+  decryptSecret,
+  isEncryptionAvailable,
+  getSettingsFilePath,
+  loadSettings,
+  saveSettings,
+  cleanupOrphanSettingsTempFiles
+}
 
-  app.on('activate', () => {
-    if (BrowserWindow.getAllWindows().length === 0) createWindow()
+const gotTheLock = app.requestSingleInstanceLock()
+
+if (!gotTheLock) {
+  console.log('[App] Another instance is already running. Quitting...')
+  app.quit()
+} else {
+  app.on('second-instance', () => {
+    const windows = BrowserWindow.getAllWindows()
+    if (windows.length > 0) {
+      const mainWindow = windows[0]
+      if (mainWindow.isMinimized()) mainWindow.restore()
+      mainWindow.show()
+      mainWindow.focus()
+    }
   })
-})
 
-app.on('window-all-closed', () => {
-  if (process.platform !== 'darwin') {
-    app.quit()
-  }
-})
+  app.whenReady().then(() => {
+    cleanupOrphanSettingsTempFiles().catch((err) => {
+      console.warn('[Settings] Failed to cleanup orphan settings temp files on startup:', err)
+    })
+    setupContentSecurityPolicy()
+    registerIpcHandlers()
+    createWindow()
+
+    app.on('activate', () => {
+      if (BrowserWindow.getAllWindows().length === 0) createWindow()
+    })
+  })
+
+  app.on('before-quit', async () => {
+    try {
+      await terminalSessionManager.killAllSessions()
+    } catch (err) {
+      console.error('[Terminal] Error during before-quit session cleanup:', err)
+    }
+  })
+
+  app.on('window-all-closed', () => {
+    if (process.platform !== 'darwin') {
+      app.quit()
+    }
+  })
+}

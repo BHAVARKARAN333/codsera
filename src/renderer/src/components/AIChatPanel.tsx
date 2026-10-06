@@ -30,19 +30,24 @@ import {
 import { providerRegistry } from '../services/ai/providerRegistry'
 import { ListFilesTool } from '../services/tools/listFilesTool'
 import { ReadFileTool } from '../services/tools/readFileTool'
+import { ReadFileRangeTool } from '../services/tools/readFileRangeTool'
 import { CreateFileTool } from '../services/tools/createFileTool'
 import { EditFileTool } from '../services/tools/editFileTool'
 import { RunCommandTool } from '../services/tools/runCommandTool'
 import { GitStatusTool } from '../services/tools/gitStatusTool'
 import { GitDiffTool } from '../services/tools/gitDiffTool'
 import { GitLogTool } from '../services/tools/gitLogTool'
-import { AgentOrchestrator, AgentStepEvent } from '../services/agent/orchestrator'
+import { AgentOrchestrator, AgentStepEvent, ActiveEditorContext } from '../services/agent/orchestrator'
+import { AgentWorkerClient } from '../services/agent/agentWorkerClient'
+import type { ShadowBuffer } from '../services/agent/shadowBuffer'
 import { MarkdownMessage } from './MarkdownMessage'
 import { DiffPreview } from './DiffPreview'
 import { AppSettings } from '../../../shared/types'
 
 interface AIChatPanelProps {
   workspaceRoot: string | null
+  currentBranch?: string | null
+  activeEditorContext?: ActiveEditorContext | null | (() => ActiveEditorContext | null)
   onFileCreated?: (path: string) => void
   onFileEdited?: (path: string, newContent: string) => void
   onCommandExecuted?: (
@@ -50,6 +55,8 @@ interface AIChatPanelProps {
     result: { stdout: string; stderr: string; exitCode: number | null }
   ) => void
   onClose?: () => void
+  shadowBuffer?: ShadowBuffer
+  onShadowUpdated?: (path: string, content: string, revision: number) => void
 }
 
 interface ChatMessage {
@@ -64,10 +71,14 @@ type ProviderType = 'gemini' | 'openrouter' | 'nvidia' | 'opencode'
 
 export const AIChatPanel: React.FC<AIChatPanelProps> = ({
   workspaceRoot,
+  currentBranch,
+  activeEditorContext,
   onFileCreated,
   onFileEdited,
   onCommandExecuted,
-  onClose
+  onClose,
+  shadowBuffer,
+  onShadowUpdated
 }) => {
   const [messages, setMessages] = useState<ChatMessage[]>([])
   const [inputPrompt, setInputPrompt] = useState('')
@@ -129,7 +140,7 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
 
   const isRunningRef = useRef<boolean>(false)
   const currentRequestIdRef = useRef<string | null>(null)
-  const orchestratorRef = useRef<AgentOrchestrator | null>(null)
+  const orchestratorRef = useRef<AgentWorkerClient | AgentOrchestrator | null>(null)
   const messagesEndRef = useRef<HTMLDivElement>(null)
 
   const activeApiKey =
@@ -152,11 +163,12 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
   // Initialize orchestrator and load persisted settings & keys
   useEffect(() => {
     const initialProvider = providerRegistry.get('gemini')
-    const orchestrator = new AgentOrchestrator(initialProvider)
+    const orchestrator = new AgentWorkerClient(initialProvider)
     orchestrator.registerTool(new ListFilesTool())
     orchestrator.registerTool(new ReadFileTool())
+    orchestrator.registerTool(new ReadFileRangeTool())
     orchestrator.registerTool(new CreateFileTool())
-    orchestrator.registerTool(new EditFileTool())
+    orchestrator.registerTool(new EditFileTool(shadowBuffer))
     orchestrator.registerTool(new RunCommandTool())
     orchestrator.registerTool(new GitStatusTool())
     orchestrator.registerTool(new GitDiffTool())
@@ -236,6 +248,13 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
 
     return () => {
       orchestratorRef.current?.stop()
+      if (
+        orchestratorRef.current &&
+        'terminate' in orchestratorRef.current &&
+        typeof (orchestratorRef.current as any).terminate === 'function'
+      ) {
+        ;(orchestratorRef.current as any).terminate()
+      }
       if (import.meta.env.DEV && typeof window !== 'undefined') {
         delete window.__enableProfiling
         delete window.__getLastSmartContext
@@ -654,10 +673,17 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
     try {
       if (!orchestratorRef.current) return
 
+      const resolvedEditorContext =
+        typeof activeEditorContext === 'function' ? activeEditorContext() : activeEditorContext
+
       const finalResponse = await orchestratorRef.current.run(textToSend, {
         apiKey: activeApiKey,
         modelName: activeModelName,
         workspaceRoot,
+        currentBranch,
+        activeEditorContext: resolvedEditorContext,
+        shadowBuffer,
+        onShadowUpdated,
         requestApproval: (req) => {
           return new Promise<boolean>((resolve) => {
             setPendingApproval({
@@ -782,17 +808,9 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
             const updated = [...prev]
             const existingContent = updated[existingIdx].content
 
-            // Prevent duplicate text when finalResponse is received
+            // Use authoritative finalResponse (which includes failure handling and anti-fabrication guards)
             let reconciledContent = existingContent
-            if (!existingContent) {
-              reconciledContent = finalResponse
-            } else if (
-              finalResponse &&
-              !existingContent.includes(finalResponse) &&
-              !finalResponse.includes(existingContent)
-            ) {
-              reconciledContent = `${existingContent}\n\n${finalResponse}`
-            } else if (finalResponse && finalResponse.length > existingContent.length) {
+            if (!existingContent || finalResponse) {
               reconciledContent = finalResponse
             }
 
@@ -1383,7 +1401,7 @@ export const AIChatPanel: React.FC<AIChatPanelProps> = ({
                   {msg.steps.map((step, idx) => {
                     const stepId = `${msg.id}-step-${idx}`
                     const isExpanded = !!expandedToolResults[stepId]
-                    const isFileRead = step.toolName === 'read_file'
+                    const isFileRead = step.toolName === 'read_file' || step.toolName === 'read_file_range'
                     const isFileCreate = step.toolName === 'create_file'
                     const isFileEdit = step.toolName === 'edit_file'
                     const isRunCommand = step.toolName === 'run_command'

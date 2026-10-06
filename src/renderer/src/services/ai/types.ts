@@ -47,6 +47,9 @@ export interface LLMRequestOptions {
   signal?: AbortSignal
   onRetry?: (attempt: number, maxRetries: number, delayMs: number, reason: string) => void
   onChunk?: (chunk: string) => void
+  staticPromptKey?: string
+  staticPromptVersion?: string
+  cacheHit?: boolean
 }
 
 export interface LLMResponse {

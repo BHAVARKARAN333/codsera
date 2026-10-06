@@ -2,7 +2,7 @@
   "compilerOptions": {
     "composite": true,
     "target": "ES2022",
-    "lib": ["ES2022"],
+    "lib": ["ES2022", "DOM"],
     "module": "ESNext",
     "moduleResolution": "bundler",
     "types": ["node"],
@@ -10,11 +10,13 @@
     "skipLibCheck": true,
     "baseUrl": ".",
     "paths": {
-      "@shared/*": ["src/shared/*"]
+      "@shared/*": ["src/shared/*"],
+      "@renderer/*": ["src/renderer/src/*"]
     }
   },
   "include": [
     "electron.vite.config.*",
+    "vitest.config.*",
     "src/main/**/*",
     "src/preload/**/*",
     "src/shared/**/*"

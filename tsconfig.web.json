@@ -26,6 +26,9 @@
   "include": [
     "src/renderer/src/**/*",
     "src/renderer/src/env.d.ts",
-    "src/shared/**/*"
+    "src/shared/**/*",
+    "src/main/**/*",
+    "src/preload/**/*",
+    "tests/**/*"
   ]
 }

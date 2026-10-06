@@ -3,6 +3,7 @@ import {
   WorkspaceFileChangeEvent,
   WorkspaceFileChangeType
 } from '../../../../shared/types'
+import { sliceContentLines } from '../../../../shared/diffUtils'
 import { ContextCache, ContextCacheStats, computeContentHash } from './contextCache'
 import { ContextBudgetManager, DroppedContextFile } from './contextBudgetManager'
 import { ContextDeduplicator } from './contextDeduplicator'
@@ -18,9 +19,116 @@ import {
   IndexingProfileSummary,
   IndexingHooks
 } from './indexingProfiler'
+import {
+  TreeSitterParserService,
+  ExtractedSymbol,
+  SymbolIndex,
+  RepoMapGenerator,
+  RepoMapOptions,
+  RepoMapResult,
+  DependencyEdge,
+  SymbolSearchOptions,
+  FileRelevanceScore,
+  CodeSearchOptions,
+  CodeSearchResult,
+  HybridSearchWeights,
+  RRFSearchOptions,
+  RRFFusedResult,
+  RRFSourceWeights
+} from '@shared/parser'
+import {
+  ContextBudgetOptimizer,
+  CandidateContextItem,
+  ContextBudgetOptions,
+  OptimizedContextResult,
+  SelectedContextItem,
+  RejectedContextItem,
+  ContextBudgetTier,
+  BUDGET_TIERS,
+  DEFAULT_PRIORITY_WEIGHTS,
+  PriorityWeights,
+  estimateTokens
+} from './contextBudgetOptimizer'
 
+export type {
+  RepoMapOptions,
+  RepoMapResult,
+  DependencyEdge,
+  SymbolSearchOptions,
+  FileRelevanceScore,
+  CodeSearchOptions,
+  CodeSearchResult,
+  HybridSearchWeights,
+  RRFSearchOptions,
+  RRFFusedResult,
+  RRFSourceWeights,
+  CandidateContextItem,
+  ContextBudgetOptions,
+  OptimizedContextResult,
+  SelectedContextItem,
+  RejectedContextItem,
+  ContextBudgetTier,
+  PriorityWeights
+}
 export type { IndexingProfileSummary, IndexingHooks }
-export { IndexingProfiler, ProfilingSession }
+export {
+  IndexingProfiler,
+  ProfilingSession,
+  ContextBudgetOptimizer,
+  BUDGET_TIERS,
+  DEFAULT_PRIORITY_WEIGHTS,
+  estimateTokens
+}
+
+export interface ActiveEditorContext {
+  filePath?: string | null
+  cursorLine?: number | null
+  cursorColumn?: number | null
+  visibleRange?: {
+    startLine: number
+    endLine: number
+  } | null
+}
+
+export interface LineRangeSpec {
+  startLine: number
+  endLine: number
+}
+
+/**
+ * Extracts explicit line range specifications from the prompt, e.g.:
+ * "lines 10-50", "lines 10 to 50", "line 42", "L10-L50", "lines 10..50"
+ */
+export function extractLineRangeFromPrompt(prompt: string): LineRangeSpec | null {
+  if (!prompt || typeof prompt !== 'string') return null
+
+  // Pattern 1: "lines 10-50", "lines 10 to 50", "line 10 through 50", "lines 10..50", "L10-L50"
+  const rangeMatch = prompt.match(
+    /\b(?:lines?|l)\s*(\d+)\s*(?:-|to|through|\.\.)\s*(?:lines?|l)?\s*(\d+)\b/i
+  )
+  if (rangeMatch) {
+    const start = parseInt(rangeMatch[1], 10)
+    const end = parseInt(rangeMatch[2], 10)
+    if (start >= 1 && end >= start) {
+      return { startLine: start, endLine: end }
+    }
+  }
+
+  // Pattern 2: "line 42" or "line: 42" (single line request)
+  const singleMatch = prompt.match(/\bline\s*[:#]?\s*(\d+)\b/i)
+  if (singleMatch) {
+    const line = parseInt(singleMatch[1], 10)
+    if (line >= 1) {
+      // Small bounded context window around single line (+/- 15 lines)
+      return {
+        startLine: Math.max(1, line - 15),
+        endLine: line + 15
+      }
+    }
+  }
+
+  return null
+}
 
 export interface RankedCandidate {
   path: string
@@ -312,6 +420,10 @@ export class SmartContextEngine {
   private currentWorkspaceRoot: string | null = null
   private isProfilingEnabled: boolean = false
   private profiler: IndexingProfiler | null = null
+  private parserService: TreeSitterParserService = new TreeSitterParserService()
+  private symbolIndex: SymbolIndex = new SymbolIndex(this.parserService)
+  private repoMapGenerator: RepoMapGenerator = new RepoMapGenerator(this.symbolIndex)
+  private contextOptimizer: ContextBudgetOptimizer
 
   constructor(config?: SmartContextEngineConfig) {
     const maxCandidates = config?.maxCandidates ?? 15
@@ -348,6 +460,7 @@ export class SmartContextEngine {
       minScoreThreshold
     })
     this.deduplicator = new ContextDeduplicator(debug)
+    this.contextOptimizer = new ContextBudgetOptimizer(this.deduplicator)
     this.dependencyAnalyzer = new DependencyAnalyzer({
       maxDependencyCandidates,
       debug
@@ -405,6 +518,188 @@ export class SmartContextEngine {
 
   getCodebaseIndex(): CodebaseIndex {
     return this.codebaseIndex
+  }
+
+  /**
+   * Returns the multi-language Tree-sitter parser service instance.
+   */
+  getParserService(): TreeSitterParserService {
+    return this.parserService
+  }
+
+  /**
+   * Returns the SymbolIndex instance.
+   */
+  getSymbolIndex(): SymbolIndex {
+    return this.symbolIndex
+  }
+
+  /**
+   * Generates a compact, deterministic Repo Map with key symbols and dependencies.
+   */
+  getRepoMap(options?: RepoMapOptions): RepoMapResult {
+    return this.repoMapGenerator.generateRepoMap(options)
+  }
+
+  /**
+   * Ranks workspace files based on query, active file, and PageRank graph centrality.
+   */
+  rankFiles(options?: RepoMapOptions): FileRelevanceScore[] {
+    return this.repoMapGenerator.rankFiles(options)
+  }
+
+  /**
+   * Searches indexed symbols across the workspace with deterministic ordering.
+   */
+  searchSymbols(query: string, options?: SymbolSearchOptions): ExtractedSymbol[] {
+    return this.symbolIndex.searchSymbols(query, options)
+  }
+
+  /**
+   * Executes a hybrid code search combining BM25 lexical relevance, SymbolIndex AST definitions,
+   * path/filename relevance, and PageRank graph centrality.
+   */
+  searchCode(query: string, options?: CodeSearchOptions): CodeSearchResult[] {
+    return this.symbolIndex.searchCode(query, options)
+  }
+
+  /**
+   * Executes Reciprocal Rank Fusion (RRF) across BM25 lexical search, AST symbols,
+   * PageRank centrality, and active editor context into a unified fused ranking.
+   */
+  searchCodeRRF(query: string, options?: RRFSearchOptions): RRFFusedResult[] {
+    return this.symbolIndex.searchCodeRRF(query, options)
+  }
+
+  /**
+   * Returns the ContextBudgetOptimizer instance (Phase 12.0).
+   */
+  getContextOptimizer(): ContextBudgetOptimizer {
+    return this.contextOptimizer
+  }
+
+  /**
+   * Optimizes a collection of candidate context items to fit strictly within a token budget.
+   */
+  optimizeContext(
+    candidates: CandidateContextItem[],
+    options?: ContextBudgetOptions
+  ): OptimizedContextResult {
+    return this.contextOptimizer.optimize(candidates, {
+      deduplicator: this.deduplicator,
+      ...options
+    })
+  }
+
+  /**
+   * Resolves smart project context using the Context Budget Optimizer (Phase 12.0).
+   * Retrieves candidates via RRF, SymbolIndex, BM25, and surgical slicing, then
+   * selects the optimal set fitting strictly within the specified token budget.
+   */
+  async resolveOptimizedContext(
+    prompt: string,
+    workspaceRoot: string | null,
+    options?: {
+      activeEditorContext?: ActiveEditorContext | null
+      budgetOptions?: ContextBudgetOptions
+    }
+  ): Promise<{
+    smartContext: SmartContextResult
+    optimizedResult: OptimizedContextResult
+  }> {
+    const smartContext = await this.resolveContext(prompt, workspaceRoot, {
+      activeEditorContext: options?.activeEditorContext
+    })
+
+    const candidates: CandidateContextItem[] = []
+
+    // 1. Gather candidates from readFiles (surgical line slices or full files)
+    const explicitRange = extractLineRangeFromPrompt(prompt)
+    for (const file of smartContext.readFiles) {
+      if (explicitRange && (file.isExplicit || smartContext.readFiles.length === 1)) {
+        candidates.push(
+          ContextBudgetOptimizer.createCandidateFromSlice(
+            file.path,
+            explicitRange.startLine,
+            explicitRange.endLine,
+            file.content,
+            {
+              relevanceScore: file.score / 100,
+              isExplicit: file.isExplicit,
+              source: 'surgical_slice'
+            }
+          )
+        )
+      } else {
+        candidates.push({
+          id: `${file.path}:full`,
+          filePath: file.path,
+          content: file.content,
+          kind: 'file_slice',
+          relevanceScore: file.score / 100,
+          isExplicit: file.isExplicit,
+          source: file.source || 'smart_context'
+        })
+      }
+    }
+
+    // 2. Gather candidates from active editor symbols if active file is present
+    if (options?.activeEditorContext?.filePath) {
+      const activePath = options.activeEditorContext.filePath
+      const activeSymbols = this.getFileSymbols(activePath)
+      const cachedContent = this.cache.get(activePath)?.content
+
+      if (cachedContent && activeSymbols.length > 0) {
+        for (const sym of activeSymbols.slice(0, 5)) {
+          candidates.push(
+            ContextBudgetOptimizer.createCandidateFromSymbol(sym, cachedContent, {
+              relevanceScore: 0.9,
+              source: 'active_symbol'
+            })
+          )
+        }
+      }
+    }
+
+    const budgetOptions: ContextBudgetOptions = {
+      activeFilePath: options?.activeEditorContext?.filePath ?? undefined,
+      cursorLine: options?.activeEditorContext?.cursorLine ?? undefined,
+      ...options?.budgetOptions
+    }
+
+    const optimizedResult = this.optimizeContext(candidates, budgetOptions)
+
+    return {
+      smartContext,
+      optimizedResult
+    }
+  }
+
+  /**
+   * Returns outgoing dependencies for a file.
+   */
+  getFileDependencies(filePath: string): DependencyEdge[] {
+    return this.symbolIndex.getDependencies(filePath)
+  }
+
+  /**
+   * Returns incoming dependents for a file.
+   */
+  getFileDependents(filePath: string): DependencyEdge[] {
+    return this.symbolIndex.getDependents(filePath)
+  }
+
+  /**
+   * Extracts code symbols for a specified file path and optional content.
+   * Updates the internal SymbolIndex if content is provided.
+   */
+  getFileSymbols(filePath: string, content?: string): ExtractedSymbol[] {
+    const fileContent = content ?? this.cache.get(filePath)?.content ?? ''
+    if (!fileContent) {
+      return this.symbolIndex.getFileSymbols(filePath)
+    }
+    const indexed = this.symbolIndex.indexFile(filePath, fileContent)
+    return indexed.symbols
   }
 
   private activeIndexingSession = 0
@@ -502,6 +797,7 @@ export class SmartContextEngine {
     this.deduplicator.reset()
     this.dependencyAnalyzer.clearCache()
     this.codebaseIndex.clear()
+    this.symbolIndex.clear()
     this.indexedWorkspaceRoot = null
     this.restoredWorkspaceRoot = null
     this.isIndexRestored = false
@@ -1282,6 +1578,11 @@ export class SmartContextEngine {
       return
     }
 
+    // SmartContext only indexes code files, ignore directory nodes
+    if (event.isDirectory) {
+      return
+    }
+
     // Filter out binary/asset/cache extensions (e.g. .tsbuildinfo, .png)
     const ext = cleanRel.split('.').pop()?.toLowerCase() || ''
     if (BINARY_AND_ASSET_EXTS.has(ext)) {
@@ -1391,6 +1692,7 @@ export class SmartContextEngine {
           this.cache.invalidate(relativePath)
           this.deduplicator.invalidateFile(relativePath)
           this.dependencyAnalyzer.invalidateFile(relativePath)
+          this.symbolIndex.removeFile(relativePath)
           const removed = this.codebaseIndex.removeFile(relativePath)
           if (removed) {
             allPaths = allPaths.filter((p) => p.toLowerCase() !== key)
@@ -1403,6 +1705,7 @@ export class SmartContextEngine {
         this.cache.invalidate(relativePath)
         this.deduplicator.invalidateFile(relativePath)
         this.dependencyAnalyzer.invalidateFile(relativePath)
+        this.symbolIndex.invalidateFile(relativePath)
 
         if (typeof window !== 'undefined' && window.electronAPI) {
           try {
@@ -2085,7 +2388,8 @@ export class SmartContextEngine {
    */
   async resolveContext(
     prompt: string,
-    workspaceRoot: string | null
+    workspaceRoot: string | null,
+    options?: { activeEditorContext?: ActiveEditorContext | null }
   ): Promise<SmartContextResult> {
     this.onWorkspaceChange(workspaceRoot)
 
@@ -2173,6 +2477,7 @@ export class SmartContextEngine {
       // Fetch file contents (via cache with smart refresh)
       const rawCandidatesToAllocate = []
       const fileSourceMap = new Map<string, 'cache' | 'disk'>()
+      const explicitRange = extractLineRangeFromPrompt(prompt)
 
       for (const candidate of filesToRead) {
         let content: string | null = null
@@ -2205,6 +2510,12 @@ export class SmartContextEngine {
         }
 
         if (content !== null) {
+          // Surgical code slicing: prefer relevant line slice if explicit range requested
+          if (explicitRange && (candidate.isExplicit || filesToRead.length === 1)) {
+            const sliced = sliceContentLines(content, explicitRange.startLine, explicitRange.endLine)
+            content = `// Lines ${sliced.startLine}-${sliced.endLine} of ${sliced.totalLines}\n${sliced.content}`
+          }
+
           fileSourceMap.set(candidate.path, source)
           rawCandidatesToAllocate.push({
             path: candidate.path,
@@ -2424,6 +2735,18 @@ export class SmartContextEngine {
         }
       } else if (isExplicitSingleFile && singleFileDetection.targetMention) {
         formattedContext = `[Project Context]: Explicitly requested file "${singleFileDetection.targetMention}" was not found in workspace.`
+      }
+
+      if (options?.activeEditorContext?.filePath) {
+        const ed = options.activeEditorContext
+        let edLine = `\n\n[Active Editor Context]:\n- Active File: ${ed.filePath}`
+        if (typeof ed.cursorLine === 'number') {
+          edLine += `\n- Cursor Position: line ${ed.cursorLine}${typeof ed.cursorColumn === 'number' ? `, col ${ed.cursorColumn}` : ''}`
+        }
+        if (ed.visibleRange) {
+          edLine += `\n- Visible Viewport: lines ${ed.visibleRange.startLine}-${ed.visibleRange.endLine}`
+        }
+        formattedContext += edLine
       }
 
       const res: SmartContextResult = {

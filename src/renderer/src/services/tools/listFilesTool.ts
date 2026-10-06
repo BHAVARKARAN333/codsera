@@ -35,13 +35,25 @@ export class ListFilesTool implements ITool {
     const relativePath = args && typeof args.relativePath === 'string' ? args.relativePath : undefined
     const maxDepth = args && typeof args.maxDepth === 'number' ? args.maxDepth : 4
 
+    if (
+      typeof window === 'undefined' ||
+      !window?.electronAPI ||
+      typeof window.electronAPI.listFiles !== 'function'
+    ) {
+      return {
+        success: false,
+        output: '',
+        error: 'File listing API is not available in this window.'
+      }
+    }
+
     try {
       const result = await window.electronAPI.listFiles(context.workspaceRoot, {
         relativePath,
         maxDepth
       })
 
-      if (result.success && result.treeString !== undefined) {
+      if (result && result.success && typeof result.treeString === 'string') {
         return {
           success: true,
           output: `Project Tree (${result.totalFiles || 0} files, ${result.totalDirs || 0} folders):\n${result.treeString}`
@@ -50,7 +62,7 @@ export class ListFilesTool implements ITool {
         return {
           success: false,
           output: '',
-          error: result.error || 'Failed to list directory contents.'
+          error: (result && result.error) || 'Failed to list directory contents.'
         }
       }
     } catch (err: unknown) {

@@ -1,32 +1,84 @@
 {
   "name": "ai-ide",
-  "version": "0.1.0",
+  "version": "0.1.0-rc2",
   "description": "Production-oriented AI Coding IDE - Phase 1 Foundation",
   "main": "./out/main/index.js",
   "author": "Antigravity",
   "license": "MIT",
   "scripts": {
-    "dev": "electron-vite dev",
+    "dev": "electron-vite dev --watch",
     "build": "electron-vite build",
     "preview": "electron-vite preview",
-    "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json"
+    "typecheck": "tsc --noEmit -p tsconfig.node.json && tsc --noEmit -p tsconfig.web.json",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "test:e2e": "playwright test -c playwright.config.ts",
+    "test:e2e:packaged": "playwright test -c playwright.packaged.config.ts",
+    "generate:icons": "node scripts/generateIcon.cjs",
+    "verify:version": "node scripts/verifyReleaseVersion.cjs",
+    "verify:signing": "node scripts/verifySigningEnvironment.cjs",
+    "package:win": "npm run build && electron-builder --win --dir",
+    "package:win:dir": "electron-builder --win --dir",
+    "dist:win": "npm run build && electron-builder --win"
   },
   "dependencies": {
     "@monaco-editor/react": "^4.7.0",
+    "@xterm/addon-fit": "^0.11.0",
+    "@xterm/xterm": "^6.0.0",
     "lucide-react": "^1.16.0",
+    "monaco-editor": "^0.57.0",
+    "node-pty": "^1.1.0",
     "react": "^18.3.1",
     "react-dom": "^18.3.1",
     "react-markdown": "^10.1.0",
     "remark-gfm": "^4.0.1"
   },
   "devDependencies": {
+    "@playwright/test": "^1.63.0",
+    "@testing-library/jest-dom": "^7.0.1",
+    "@testing-library/react": "^16.3.3",
+    "@testing-library/user-event": "^14.6.7",
     "@types/node": "^20.14.9",
     "@types/react": "^18.3.3",
     "@types/react-dom": "^18.3.0",
     "@vitejs/plugin-react": "^4.3.1",
     "electron": "^31.0.2",
+    "electron-builder": "^26.15.3",
     "electron-vite": "^2.3.0",
+    "happy-dom": "^20.14.5",
     "typescript": "^5.5.2",
-    "vite": "^5.3.1"
+    "vite": "^5.3.1",
+    "vitest": "^2.1.8"
+  },
+  "build": {
+    "appId": "com.aiide.desktop",
+    "productName": "AI IDE",
+    "directories": {
+      "output": "dist",
+      "buildResources": "build"
+    },
+    "files": [
+      "out/**/*",
+      "package.json"
+    ],
+    "asar": true,
+    "win": {
+      "icon": "build/icon.ico",
+      "target": [
+        {
+          "target": "nsis",
+          "arch": [
+            "x64"
+          ]
+        }
+      ],
+      "artifactName": "${productName}-Setup-${version}.${ext}"
+    },
+    "nsis": {
+      "oneClick": true,
+      "perMachine": false,
+      "allowToChangeInstallationDirectory": false,
+      "deleteAppDataOnUninstall": false
+    }
   }
 }

@@ -1,0 +1,163 @@
+name: Windows Packaging & Release Verification
+
+on:
+  push:
+    tags:
+      - 'v*'
+  workflow_dispatch:
+    inputs:
+      release_tag:
+        description: 'Optional release tag to validate (e.g., v0.1.0). If omitted, packages current package.json version.'
+        required: false
+        default: ''
+        type: string
+      enable_signing:
+        description: 'Opt-in to Authenticode code signing using repository secrets (CSC_LINK / CSC_KEY_PASSWORD). Default: false (unsigned)'
+        required: false
+        default: false
+        type: boolean
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  package-and-verify:
+    name: Package Windows & Run Packaged E2E
+    runs-on: windows-latest
+    timeout-minutes: 30
+
+    steps:
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      - name: Setup Node.js LTS (v20)
+        uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: 'npm'
+
+      - name: Install dependencies (clean install)
+        run: npm ci
+
+      - name: Validate release tag and package version consistency
+        shell: pwsh
+        run: |
+          $tag = ""
+          if ("${{ github.event_name }}" -eq "push" -and "${{ github.ref_name }}".StartsWith("v")) {
+            $tag = "${{ github.ref_name }}"
+          } elseif ("${{ github.event_name }}" -eq "workflow_dispatch" -and "${{ inputs.release_tag }}".Trim() -ne "") {
+            $tag = "${{ inputs.release_tag }}".Trim()
+          }
+
+          if ($tag -ne "") {
+            Write-Host "Validating release tag '$tag' against package.json..."
+            node scripts/verifyReleaseVersion.cjs "$tag"
+          } else {
+            Write-Host "No release tag specified. Validating package.json version format..."
+            node scripts/verifyReleaseVersion.cjs
+          }
+
+      - name: Verify code signing environment readiness
+        shell: pwsh
+        env:
+          REQUIRE_SIGNING: ${{ (github.event_name == 'workflow_dispatch' && inputs.enable_signing == true) && 'true' || 'false' }}
+          CSC_LINK: ${{ secrets.CSC_LINK }}
+          CSC_KEY_PASSWORD: ${{ secrets.CSC_KEY_PASSWORD }}
+          WIN_CSC_LINK: ${{ secrets.WIN_CSC_LINK }}
+          WIN_CSC_KEY_PASSWORD: ${{ secrets.WIN_CSC_KEY_PASSWORD }}
+        run: |
+          node scripts/verifySigningEnvironment.cjs
+
+      - name: Package Windows desktop application
+        run: npm run dist:win
+        env:
+          NODE_ENV: production
+          GEMINI_API_KEY: ''
+          OPENROUTER_API_KEY: ''
+          NVIDIA_NIM_API_KEY: ''
+          OPENAI_API_KEY: ''
+          ANTHROPIC_API_KEY: ''
+          # Optional Authenticode signing secrets: only injected when explicitly enabled via workflow input
+          CSC_LINK: ${{ (github.event_name == 'workflow_dispatch' && inputs.enable_signing == true) && secrets.CSC_LINK || '' }}
+          CSC_KEY_PASSWORD: ${{ (github.event_name == 'workflow_dispatch' && inputs.enable_signing == true) && secrets.CSC_KEY_PASSWORD || '' }}
+          WIN_CSC_LINK: ${{ (github.event_name == 'workflow_dispatch' && inputs.enable_signing == true) && secrets.WIN_CSC_LINK || '' }}
+          WIN_CSC_KEY_PASSWORD: ${{ (github.event_name == 'workflow_dispatch' && inputs.enable_signing == true) && secrets.WIN_CSC_KEY_PASSWORD || '' }}
+
+      - name: Verify generated packaging artifacts
+        shell: pwsh
+        run: |
+          $unpackedExe = "dist/win-unpacked/AI IDE.exe"
+          if (-not (Test-Path $unpackedExe)) {
+            Write-Error "Missing unpacked executable at $unpackedExe"
+            exit 1
+          }
+
+          $installer = Get-ChildItem -Path dist -Filter "AI IDE-Setup-*.exe" | Select-Object -First 1
+          if (-not $installer) {
+            Write-Error "Missing NSIS installer artifact matching dist/AI IDE-Setup-*.exe"
+            exit 1
+          }
+
+          Write-Host "Packaging artifacts verified successfully:"
+          Write-Host " - Unpacked executable: $unpackedExe ($((Get-Item $unpackedExe).Length) bytes)"
+          Write-Host " - NSIS installer: $($installer.FullName) ($($installer.Length) bytes)"
+
+      - name: Generate SHA-256 checksums for release artifacts
+        shell: pwsh
+        run: |
+          $installer = Get-ChildItem -Path dist -Filter "AI IDE-Setup-*.exe" | Select-Object -First 1
+          if (-not $installer) {
+            Write-Error "Installer artifact not found in dist/ for checksum generation"
+            exit 1
+          }
+
+          $hash = (Get-FileHash -Path $installer.FullName -Algorithm SHA256).Hash.ToLowerInvariant()
+          $checksumLine = "$hash  $($installer.Name)"
+          Set-Content -Path "dist/SHA256SUMS.txt" -Value $checksumLine -Encoding utf8
+
+          Write-Host "Generated SHA-256 checksum:"
+          Write-Host "  $checksumLine"
+
+      - name: Run packaged Playwright E2E verification
+        run: npm run test:e2e:packaged
+        env:
+          CI: 'true'
+          NODE_ENV: test
+          GEMINI_API_KEY: ''
+          OPENROUTER_API_KEY: ''
+          NVIDIA_NIM_API_KEY: ''
+          OPENAI_API_KEY: ''
+          ANTHROPIC_API_KEY: ''
+
+      - name: Upload Windows installer artifact
+        uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: AI-IDE-Windows-Installer
+          path: |
+            dist/AI IDE-Setup-*.exe
+            dist/AI IDE-Setup-*.exe.blockmap
+            dist/SHA256SUMS.txt
+          if-no-files-found: error
+          retention-days: 14
+
+      - name: Upload Windows unpacked executable (portable)
+        uses: actions/upload-artifact@v4
+        if: success()
+        with:
+          name: AI-IDE-Windows-Unpacked
+          path: dist/win-unpacked/
+          if-no-files-found: warn
+          retention-days: 7
+
+      - name: Upload diagnostic logs and test results on failure
+        uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: packaging-failure-diagnostics
+          path: |
+            test-results/
+            dist/builder-debug.yml
+          if-no-files-found: ignore
+          retention-days: 7

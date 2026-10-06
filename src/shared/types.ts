@@ -58,6 +58,35 @@ export interface EditWorkspaceFileResult {
   error?: string
 }
 
+export interface CreateFileResult {
+  success: boolean
+  path?: string
+  error?: string
+}
+
+export interface CreateDirectoryResult {
+  success: boolean
+  path?: string
+  error?: string
+}
+
+export interface RenamePathResult {
+  success: boolean
+  oldPath?: string
+  newPath?: string
+  error?: string
+}
+
+export interface DeletePathOptions {
+  recursive?: boolean
+}
+
+export interface DeletePathResult {
+  success: boolean
+  path?: string
+  error?: string
+}
+
 export interface RunCommandResult {
   success: boolean
   stdout: string
@@ -65,6 +94,21 @@ export interface RunCommandResult {
   exitCode: number | null
   timedOut: boolean
   error?: string
+}
+
+export type GitFileChangeStatus =
+  | 'modified'
+  | 'added'
+  | 'deleted'
+  | 'untracked'
+  | 'conflicted'
+  | 'renamed'
+
+export interface GitFileStatus {
+  path: string
+  status: GitFileChangeStatus
+  staged: boolean
+  oldPath?: string
 }
 
 export interface GitStatusResult {
@@ -76,6 +120,78 @@ export interface GitStatusResult {
   untracked: string[]
   conflicted: string[]
   clean?: boolean
+  files?: GitFileStatus[]
+  error?: string
+}
+
+export interface GitStageResult {
+  success: boolean
+  path?: string
+  error?: string
+}
+
+export interface GitUnstageResult {
+  success: boolean
+  path?: string
+  error?: string
+}
+
+export interface GitStageAllResult {
+  success: boolean
+  error?: string
+}
+
+export interface GitUnstageAllResult {
+  success: boolean
+  error?: string
+}
+
+export interface GitCommitResult {
+  success: boolean
+  commitHash?: string
+  summary?: string
+  error?: string
+}
+
+export interface GitBranchInfo {
+  name: string
+  isCurrent: boolean
+}
+
+export interface GitBranchListResult {
+  success: boolean
+  isRepository: boolean
+  currentBranch: string | null
+  branches: string[]
+  error?: string
+}
+
+export interface GitBranchCreateResult {
+  success: boolean
+  branch?: string
+  error?: string
+}
+
+export interface GitBranchCheckoutResult {
+  success: boolean
+  branch?: string
+  error?: string
+}
+
+export interface GitFileDiffResult {
+  success: boolean
+  isRepository: boolean
+  path: string
+  unstagedDiff: string
+  stagedDiff: string
+  isBinary?: boolean
+  truncated?: boolean
+  error?: string
+}
+
+export interface GitDiscardFileResult {
+  success: boolean
+  path?: string
   error?: string
 }
 
@@ -290,6 +406,7 @@ export interface WorkspaceFileChangeEvent {
   workspaceRoot: string
   relativePath: string
   eventType: WorkspaceFileChangeType
+  isDirectory?: boolean
 }
 
 export interface IElectronAPI {
@@ -310,6 +427,25 @@ export interface IElectronAPI {
     expectedOldContent?: string
   ) => Promise<EditWorkspaceFileResult>
   writeFile: (filePath: string, content: string) => Promise<WriteFileResult>
+  createFile: (
+    workspaceRoot: string,
+    relativePath: string,
+    initialContent?: string
+  ) => Promise<CreateFileResult>
+  createDirectory: (
+    workspaceRoot: string,
+    relativePath: string
+  ) => Promise<CreateDirectoryResult>
+  renamePath: (
+    workspaceRoot: string,
+    oldRelativePath: string,
+    newRelativePath: string
+  ) => Promise<RenamePathResult>
+  deletePath: (
+    workspaceRoot: string,
+    relativePath: string,
+    options?: DeletePathOptions
+  ) => Promise<DeletePathResult>
   listFiles: (rootPath: string, options?: ListFilesOptions) => Promise<ListFilesResult>
   watchWorkspace: (rootPath: string) => Promise<{ success: boolean; error?: string }>
   unwatchWorkspace: () => Promise<{ success: boolean }>
@@ -319,10 +455,32 @@ export interface IElectronAPI {
     cwd?: string,
     timeoutMs?: number
   ) => Promise<RunCommandResult>
-  stopCommand: () => Promise<{ success: boolean }>
+  stopCommand: (sessionId?: string) => Promise<{ success: boolean; error?: string }>
+  terminalSpawn?: (options: TerminalSpawnOptions) => Promise<TerminalSpawnResult>
+  terminalWriteInput?: (sessionId: string, inputData: string) => Promise<TerminalWriteInputResult>
+  terminalResize?: (sessionId: string, cols: number, rows: number) => Promise<TerminalResizeResult>
+  terminalSendSignal?: (
+    sessionId: string,
+    signal?: 'SIGINT' | 'SIGTERM'
+  ) => Promise<{ success: boolean; error?: string }>
+  terminalKill?: (sessionId: string) => Promise<TerminalKillResult>
+  terminalKillAll?: () => Promise<TerminalKillAllResult>
+  terminalListSessions?: () => Promise<TerminalListSessionsResult>
+  onTerminalStreamData?: (callback: (event: TerminalStreamDataEvent) => void) => () => void
+  onTerminalSessionExit?: (callback: (event: TerminalSessionExitEvent) => void) => () => void
   gitStatus: (rootPath: string) => Promise<GitStatusResult>
   gitDiff: (rootPath: string) => Promise<GitDiffResult>
   gitLog: (rootPath: string, maxCount?: number) => Promise<GitLogResult>
+  gitStageFile: (workspaceRoot: string, relativePath: string) => Promise<GitStageResult>
+  gitUnstageFile: (workspaceRoot: string, relativePath: string) => Promise<GitUnstageResult>
+  gitStageAll: (workspaceRoot: string) => Promise<GitStageAllResult>
+  gitUnstageAll: (workspaceRoot: string) => Promise<GitUnstageAllResult>
+  gitCommit: (workspaceRoot: string, message: string) => Promise<GitCommitResult>
+  gitBranchList: (workspaceRoot: string) => Promise<GitBranchListResult>
+  gitBranchCreate: (workspaceRoot: string, branchName: string) => Promise<GitBranchCreateResult>
+  gitBranchCheckout: (workspaceRoot: string, branchName: string) => Promise<GitBranchCheckoutResult>
+  gitFileDiff: (workspaceRoot: string, relativePath: string) => Promise<GitFileDiffResult>
+  gitDiscardFile: (workspaceRoot: string, relativePath: string) => Promise<GitDiscardFileResult>
   getEnvApiKey: (provider?: string) => Promise<string | null>
   getSettings: () => Promise<AppSettings>
   saveSettings: (settings: Partial<AppSettings>) => Promise<{ success: boolean; error?: string }>
@@ -356,6 +514,125 @@ export interface IElectronAPI {
   ) => Promise<ClearWorkspaceIndexResult>
 }
 
+export type TerminalSessionSource = 'user' | 'ai' | 'transient'
+export type TerminalSessionStatus = 'running' | 'completed' | 'terminated' | 'timedOut' | 'failed'
+
+export interface TerminalSpawnOptions {
+  command?: string
+  shell?: string
+  shellArgs?: string[]
+  cols?: number
+  rows?: number
+  cwd?: string
+  workspaceRoot?: string
+  sessionId?: string
+  source?: TerminalSessionSource
+  timeoutMs?: number
+  maxBuffer?: number
+  interactive?: boolean
+  env?: Record<string, string>
+}
+
+export interface TerminalSpawnResult {
+  success: boolean
+  sessionId?: string
+  pid?: number
+  cols?: number
+  rows?: number
+  shell?: string
+  error?: string
+}
+
+export interface TerminalResizeResult {
+  success: boolean
+  cols?: number
+  rows?: number
+  error?: string
+}
+
+export interface TerminalWriteInputResult {
+  success: boolean
+  error?: string
+}
+
+export interface TerminalKillResult {
+  success: boolean
+  error?: string
+  message?: string
+}
+
+export interface TerminalKillAllResult {
+  success: boolean
+  killedCount: number
+  error?: string
+}
+
+export interface TerminalSessionInfo {
+  sessionId: string
+  command: string
+  cwd: string
+  source: TerminalSessionSource
+  status: TerminalSessionStatus
+  running: boolean
+  exitCode: number | null
+  timedOut: boolean
+  createdAt: number
+  pid?: number
+}
+
+export interface TerminalListSessionsResult {
+  success: boolean
+  sessions: TerminalSessionInfo[]
+  error?: string
+}
+
+export interface TerminalStreamDataEvent {
+  sessionId: string
+  type: 'stdout' | 'stderr'
+  data: string
+}
+
+export interface TerminalSessionExitEvent {
+  sessionId: string
+  exitCode: number | null
+  signal?: string | null
+  timedOut: boolean
+  error?: string
+  stdout?: string
+  stderr?: string
+}
+
+export type TerminalTabStatus = 'idle' | 'running' | 'completed' | 'failed' | 'stopped'
+
+export interface TerminalEntryData {
+  id: string
+  sessionId?: string
+  command: string
+  cwd: string
+  stdout: string
+  stderr: string
+  exitCode: number | null
+  running: boolean
+  timedOut?: boolean
+  error?: string
+  timestamp: number
+  source: 'user' | 'ai'
+}
+
+export interface TerminalTab {
+  id: string
+  title: string
+  cwd: string
+  entries: TerminalEntryData[]
+  commandHistory: string[]
+  inputBuffer: string
+  isRunning: boolean
+  activeProcessSessionId: string | null
+  lastExitCode: number | null
+  status: TerminalTabStatus
+  createdAt: number
+}
+
 export interface SaveWorkspaceIndexResult {
   success: boolean
   error?: string
@@ -381,6 +658,10 @@ export const IPC_CHANNELS = {
   CREATE_WORKSPACE_FILE: 'fs:createWorkspaceFile',
   EDIT_WORKSPACE_FILE: 'fs:editWorkspaceFile',
   WRITE_FILE: 'fs:writeFile',
+  FS_CREATE_FILE: 'fs:createFile',
+  FS_CREATE_DIRECTORY: 'fs:createDirectory',
+  FS_RENAME_PATH: 'fs:renamePath',
+  FS_DELETE_PATH: 'fs:deletePath',
   LIST_FILES: 'fs:listFiles',
   WATCH_WORKSPACE: 'fs:watchWorkspace',
   UNWATCH_WORKSPACE: 'fs:unwatchWorkspace',
@@ -390,9 +671,27 @@ export const IPC_CHANNELS = {
   CLEAR_WORKSPACE_INDEX: 'index:clear',
   RUN_COMMAND: 'command:run',
   STOP_COMMAND: 'command:stop',
+  TERMINAL_SPAWN: 'terminal:spawn',
+  TERMINAL_WRITE_INPUT: 'terminal:writeInput',
+  TERMINAL_RESIZE: 'terminal:resize',
+  TERMINAL_KILL: 'terminal:kill',
+  TERMINAL_KILL_ALL: 'terminal:killAll',
+  TERMINAL_LIST_SESSIONS: 'terminal:listSessions',
+  TERMINAL_STREAM_DATA: 'terminal:streamData',
+  TERMINAL_SESSION_EXIT: 'terminal:sessionExit',
   GIT_STATUS: 'git:status',
   GIT_DIFF: 'git:diff',
   GIT_LOG: 'git:log',
+  GIT_STAGE_FILE: 'git:stageFile',
+  GIT_UNSTAGE_FILE: 'git:unstageFile',
+  GIT_STAGE_ALL: 'git:stageAll',
+  GIT_UNSTAGE_ALL: 'git:unstageAll',
+  GIT_COMMIT: 'git:commit',
+  GIT_BRANCH_LIST: 'git:branchList',
+  GIT_BRANCH_CREATE: 'git:branchCreate',
+  GIT_BRANCH_CHECKOUT: 'git:branchCheckout',
+  GIT_FILE_DIFF: 'git:fileDiff',
+  GIT_DISCARD_FILE: 'git:discardFile',
   GET_ENV_API_KEY: 'env:getApiKey',
   GET_SETTINGS: 'settings:get',
   SAVE_SETTINGS: 'settings:save',

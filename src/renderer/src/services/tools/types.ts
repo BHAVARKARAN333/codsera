@@ -1,4 +1,5 @@
 import { FunctionDeclaration } from '../ai/types'
+import type { ShadowBuffer } from '../agent/shadowBuffer'
 
 export interface ToolApprovalRequest {
   toolName: string
@@ -20,6 +21,8 @@ export interface ToolContext {
     command: string,
     result: { stdout: string; stderr: string; exitCode: number | null }
   ) => void
+  shadowBuffer?: ShadowBuffer
+  onShadowUpdated?: (path: string, content: string, revision: number) => void
 }
 
 export interface ToolExecutionResult {

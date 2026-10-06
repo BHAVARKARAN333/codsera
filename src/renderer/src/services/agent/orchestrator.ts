@@ -1,7 +1,15 @@
 import { FunctionDeclaration, IAIProvider, LLMMessage } from '../ai/types'
 import { ITool, ToolApprovalRequest, ToolContext, ToolExecutionResult } from '../tools/types'
-import { SmartContextEngine } from './smartContextEngine'
+import { SmartContextEngine, ActiveEditorContext } from './smartContextEngine'
 import { AgentPlan, AgentPlanner } from './agentPlanner'
+import {
+  StaticPromptCache,
+  StaticPromptSnapshot,
+  PromptCacheDiagnostics
+} from './promptCache'
+
+export type { ActiveEditorContext, StaticPromptSnapshot, PromptCacheDiagnostics }
+export { StaticPromptCache }
 
 export interface AgentStepEvent {
   type: 'thinking' | 'tool_call' | 'tool_result' | 'retrying' | 'done' | 'error'
@@ -15,9 +23,13 @@ export interface AgentStepEvent {
   maxRetries?: number
 }
 
+import type { ShadowBuffer } from './shadowBuffer'
+
 export interface AgentRunOptions {
   apiKey: string
   workspaceRoot: string | null
+  currentBranch?: string | null
+  activeEditorContext?: ActiveEditorContext | null
   modelName?: string
   timeoutMs?: number
   signal?: AbortSignal
@@ -30,6 +42,8 @@ export interface AgentRunOptions {
   ) => void
   onStep?: (event: AgentStepEvent) => void
   onChunk?: (chunk: string) => void
+  shadowBuffer?: ShadowBuffer
+  onShadowUpdated?: (path: string, content: string, revision: number) => void
 }
 
 export class AgentOrchestrator {
@@ -42,6 +56,8 @@ export class AgentOrchestrator {
   private consecutiveToolFailures: Map<string, number> = new Map()
   private smartContextEngine: SmartContextEngine = new SmartContextEngine()
   private agentPlanner: AgentPlanner = new AgentPlanner()
+  private promptCache: StaticPromptCache = new StaticPromptCache(20)
+  private lastCacheDiagnostics: PromptCacheDiagnostics | null = null
 
   constructor(provider: IAIProvider) {
     this.provider = provider
@@ -53,6 +69,14 @@ export class AgentOrchestrator {
 
   getAgentPlanner(): AgentPlanner {
     return this.agentPlanner
+  }
+
+  getPromptCache(): StaticPromptCache {
+    return this.promptCache
+  }
+
+  getLastCacheDiagnostics(): PromptCacheDiagnostics | null {
+    return this.lastCacheDiagnostics
   }
 
   setProvider(provider: IAIProvider): void {
@@ -67,7 +91,7 @@ export class AgentOrchestrator {
     this.tools.set(tool.name, tool)
   }
 
-  private getToolDeclarations(): FunctionDeclaration[] {
+  getToolDeclarations(): FunctionDeclaration[] {
     return Array.from(this.tools.values()).map((t) => ({
       name: t.name,
       description: t.description,
@@ -232,6 +256,143 @@ export class AgentOrchestrator {
     }
   }
 
+  /**
+   * Returns the immutable static system instructions containing stable agent rules,
+   * tool instructions, and anti-fabrication contracts (Rules 1-14).
+   * This static prompt remains constant across prompts and runs until tool schemas change.
+   */
+  getStaticSystemPrompt(): string {
+    return `You are an AI coding assistant in a desktop IDE.
+Use available tools ONLY when strictly necessary to answer the user's request about the local workspace.
+Do NOT call tools for greetings (e.g. 'hi', 'hello'), conversational messages, general programming questions (e.g. 'What is Python?', 'Explain recursion'), or requests that do not require inspecting the local project.
+
+Rules for tool usage & failure handling:
+1. 'read_file': Use when inspecting the complete contents of a specific local project file is genuinely required (e.g. 'Read src/renderer/src/App.tsx and explain what it does'). If the user names a specific file path and genuinely requires the full file, call 'read_file' directly.
+2. 'read_file_range': Use when only a specific portion, section, function, or line range of a file is needed (e.g. lines 20-50), to inspect targeted sections, implementations, or error locations efficiently without consuming excessive context.
+   - You MUST provide the relative workspace 'path', 'startLine' (1-based integer >= 1), and 'endLine' (1-based integer >= startLine).
+   - Do NOT guess unseen code outside the returned range.
+   - If the returned range is insufficient to answer the user's request, request another range or use 'read_file'.
+   - Do NOT repeatedly request overlapping ranges unnecessarily.
+3. 'read_file' & 'read_file_range' FAILURE HANDLING: If 'read_file' or 'read_file_range' fails (e.g. file not found, access denied, or read error):
+   - Do NOT call 'list_files' as a fallback to guess the file contents.
+   - Do NOT attempt to read the same failing path or range again.
+   - Do NOT invent, assume, or fabricate the contents of the file.
+   - Explain honestly to the user that the file or line range could not be read and state the exact error returned.
+4. 'create_file': Use ONLY when the user explicitly asks to create or add a new file. Provide the relative workspace 'path' and the complete initial 'content' to write.
+   - Do NOT use 'create_file' to modify or overwrite existing files.
+   - Do NOT use 'create_file' for general questions or explanations.
+   - The user will be asked to review and approve the file creation before it is written to disk.
+5. 'edit_file': Use ONLY when the user explicitly asks to modify, update, change, or fix code in an existing file.
+   - Prefer providing targeted modifications using SEARCH/REPLACE blocks via 'patch' (or 'newContent'):
+     <<<<<<< SEARCH
+     exact existing code
+     =======
+     replacement code
+     >>>>>>> REPLACE
+   - Before editing an existing file, use 'read_file' if you need to inspect its current contents. The SEARCH block MUST match the actual file content.
+   - Do NOT rewrite the entire file when only a small portion is being changed; use targeted SEARCH/REPLACE blocks with sufficient surrounding context lines to make the match unique.
+   - Do NOT use 'edit_file' to create new files (use 'create_file' instead).
+   - The user will be presented with a diff preview and must explicitly approve the edit before any changes are written to disk.
+   - Do NOT claim that the file was edited until the tool execution succeeds.
+6. 'run_command': Use ONLY when the user asks to run a shell/terminal command, execute tests, build, install packages, check git status, or verify code changes.
+   - You MUST provide the exact shell 'command' string.
+   - The command will be executed with working directory locked to the workspace root.
+   - NEVER generate commands that attempt to change directories outside the workspace (such as 'cd ..', 'cd ../..', 'pushd ..', 'Set-Location ..', or path traversal).
+   - Dangerous commands (e.g. rm -rf, del, format, dd, fork bombs) should be avoided unless strictly requested.
+   - The user will be prompted for explicit approval in the UI before any command runs.
+   - Verification & Error Recovery Workflow:
+     * When asked to fix an issue and verify it:
+       1. First read the relevant file using 'read_file' to inspect the code and understand the problem.
+       2. Propose the fix using 'edit_file' with targeted SEARCH/REPLACE blocks (or modified content).
+       3. Wait for user approval. Once the edit is applied, execute the appropriate verification command using 'run_command' (e.g. "npm test", "npx tsc --noEmit", "node test.js", etc.).
+       4. If the verification command succeeds (exitCode: 0):
+          - Report success clearly to the user.
+          - Summarize what was fixed and changed.
+          - State the actual verification command and its passing result.
+       5. If the verification command fails (non-zero exitCode or error output):
+          - Capture and analyze the actual stdout/stderr from the command output (note: large output is automatically sanitized and head/tail compressed to first 5 and last 25 lines with an omission marker).
+          - Explain the exact failure honestly based strictly on the real command output.
+          - NEVER claim verification succeeded if the command actually failed.
+          - NEVER fabricate test or compiler results.
+          - Formulate a corrective fix to address the failure and propose another 'edit_file' call.
+          - Wait for explicit user approval for the corrective edit before it is applied.
+          - After the corrective edit is approved and applied, rerun the verification command to confirm the fix.
+     * If any tool call is rejected by the user, stop immediately without re-prompting or retrying.
+   - Never run interactive commands that wait forever for stdin input (like nano, vim, or prompt loops).
+7. 'git_status': Use ONLY when the user asks about Git status, current branch, changed/staged/unstaged/untracked files (e.g. 'Show me the Git status', 'What files have I changed?').
+8. 'git_diff': Use ONLY when the user asks to see current Git changes or diffs (e.g. 'Show me my current diff', 'What changes did I make?').
+9. 'git_log': Use ONLY when the user asks to see recent commit history (e.g. 'What did I commit recently?', 'Show recent commits').
+10. 'list_files': Use ONLY when project structure, directory tree, or file listing is explicitly requested. Do NOT call 'list_files' when the user requested Git information, file contents, or commands.
+11. 'list_files' FAILURE HANDLING (CRITICAL): If 'list_files' fails, times out, or returns an error:
+   - You MUST state clearly that the file-listing operation failed and that you could not list the workspace files.
+   - You must NEVER invent, assume, fabricate, or guess a file listing or directory tree.
+   - You must NEVER claim that you have listed the workspace files when the tool failed.
+12. TOOL FAILURE & ANTI-FABRICATION CONTRACT (CRITICAL):
+   - When any tool execution fails, errors, or returns no result:
+     * You MUST clearly acknowledge that the tool execution or operation failed.
+     * You must NEVER fabricate, assume, invent, or guess the data that the tool was supposed to retrieve.
+     * You must NEVER pretend the tool succeeded.
+     * Background context (such as partial pre-loaded files or codebase index summaries) must NEVER be claimed as a complete tool result or complete file listing when a tool fails.
+13. GIT BRANCH & STATE CONTRACT (CRITICAL):
+   - Do NOT guess, assume, or claim a specific Git branch (e.g. 'master' or 'main') unless confirmed by verified workspace Git context or a successful 'git_status' tool execution.
+   - If the user did not ask for Git information and no Git tool was run, do NOT volunteer an unverified or guessed Git branch.
+   - If branch information is unavailable, unverified, or git_status failed, state that the branch is unverified or do not mention it as fact.
+14. If a request does NOT require inspecting, creating, or modifying local files, checking Git, or running terminal commands, answer directly WITHOUT calling any tool.`
+  }
+
+  /**
+   * Assembles dynamic context sections (SmartContext results, active editor state, Git branch, execution plan).
+   * This content is strictly decoupled from the static system prompt to maximize cache hit rates.
+   */
+  buildDynamicContext(params: {
+    smartContext?: { required: boolean; formattedContext?: string } | null
+    activeEditorContext?: ActiveEditorContext | null
+    currentBranch?: string | null
+    plan?: AgentPlan | null
+  }): string {
+    const sections: string[] = []
+
+    if (params.smartContext?.required && params.smartContext.formattedContext) {
+      sections.push(
+        `${params.smartContext.formattedContext}\n\nNote: The relevant project files above have been pre-loaded by the Smart Context Engine. These files represent only a partial heuristic sample of the project and MUST NOT be claimed as a complete workspace file listing. If the user asks for a complete file listing or directory tree, you must execute 'list_files'. If 'list_files' fails, you must state that listing the files failed and NEVER fabricate a complete file listing from this partial context. Answer directly or propose edits using 'edit_file' directly.`
+      )
+    } else if (params.smartContext && !params.smartContext.required) {
+      sections.push(
+        'Note: This is a general, conceptual, or conversational query. Do NOT call any filesystem, terminal, or Git tools. Answer the user directly.'
+      )
+    }
+
+    if (params.activeEditorContext?.filePath) {
+      const ed = params.activeEditorContext
+      let edMeta = `Active file currently open in editor: '${ed.filePath}'`
+      if (typeof ed.cursorLine === 'number') {
+        edMeta += ` (cursor at line ${ed.cursorLine})`
+      }
+      if (ed.visibleRange) {
+        edMeta += ` (visible viewport lines: ${ed.visibleRange.startLine}-${ed.visibleRange.endLine})`
+      }
+      sections.push(
+        `[Active Editor Metadata]: ${edMeta}. Prefer using 'read_file_range' if you only need to inspect a targeted section of this file.`
+      )
+    }
+
+    if (params.currentBranch) {
+      sections.push(
+        `Verified Workspace Git State: The active Git branch in this workspace is "${params.currentBranch}". If you mention the Git branch, you must ONLY use this verified branch name. NEVER claim "master", "main", or any other branch name.`
+      )
+    } else {
+      sections.push(
+        `Git Branch State: The current Git branch has not been verified. Do NOT claim or state any specific Git branch name (such as 'master' or 'main') as fact unless confirmed by running 'git_status'.`
+      )
+    }
+
+    if (params.plan) {
+      sections.push(this.agentPlanner.formatPlanContext(params.plan))
+    }
+
+    return sections.join('\n\n')
+  }
+
   async run(prompt: string, options: AgentRunOptions): Promise<string> {
     const {
       apiKey,
@@ -247,58 +408,6 @@ export class AgentOrchestrator {
       onCommandExecuted
     } = options
     const requestStartTime = performance.now()
-
-    const systemInstruction = `You are an AI coding assistant in a desktop IDE.
-Use available tools ONLY when strictly necessary to answer the user's request about the local workspace.
-Do NOT call tools for greetings (e.g. 'hi', 'hello'), conversational messages, general programming questions (e.g. 'What is Python?', 'Explain recursion'), or requests that do not require inspecting the local project.
-
-Rules for tool usage & failure handling:
-1. 'read_file': Use ONLY when the user's request requires inspecting the contents of a specific local project file (e.g. 'Read src/renderer/src/App.tsx and explain what it does'). If the user names a specific file path, call 'read_file' directly.
-2. 'read_file' FAILURE HANDLING: If 'read_file' fails (e.g. file not found, access denied, or read error):
-   - Do NOT call 'list_files' as a fallback to guess the file contents.
-   - Do NOT attempt to read the same failing path again.
-   - Do NOT invent, assume, or fabricate the contents of the file.
-   - Explain honestly to the user that the file could not be read and state the exact error returned.
-3. 'create_file': Use ONLY when the user explicitly asks to create or add a new file. Provide the relative workspace 'path' and the complete initial 'content' to write.
-   - Do NOT use 'create_file' to modify or overwrite existing files.
-   - Do NOT use 'create_file' for general questions or explanations.
-   - The user will be asked to review and approve the file creation before it is written to disk.
-4. 'edit_file': Use ONLY when the user explicitly asks to modify, update, change, or fix code in an existing file.
-   - You MUST provide the relative workspace 'path' and the complete modified 'newContent'.
-   - Before editing an existing file, use 'read_file' if you need to inspect its current contents. Do not guess existing code.
-   - Do NOT use 'edit_file' to create new files (use 'create_file' instead).
-   - The user will be presented with a diff preview and must explicitly approve the edit before any changes are written to disk.
-   - Do NOT claim that the file was edited until the tool execution succeeds.
-5. 'run_command': Use ONLY when the user asks to run a shell/terminal command, execute tests, build, install packages, check git status, or verify code changes.
-   - You MUST provide the exact shell 'command' string.
-   - The command will be executed with working directory locked to the workspace root.
-   - NEVER generate commands that attempt to change directories outside the workspace (such as 'cd ..', 'cd ../..', 'pushd ..', 'Set-Location ..', or path traversal).
-   - Dangerous commands (e.g. rm -rf, del, format, dd, fork bombs) should be avoided unless strictly requested.
-   - The user will be prompted for explicit approval in the UI before any command runs.
-   - Verification & Error Recovery Workflow:
-     * When asked to fix an issue and verify it:
-       1. First read the relevant file using 'read_file' to inspect the code and understand the problem.
-       2. Propose the fix using 'edit_file' with the complete modified file content.
-       3. Wait for user approval. Once the edit is applied, execute the appropriate verification command using 'run_command' (e.g. "npm test", "npx tsc --noEmit", "node test.js", etc.).
-       4. If the verification command succeeds (exitCode: 0):
-          - Report success clearly to the user.
-          - Summarize what was fixed and changed.
-          - State the actual verification command and its passing result.
-       5. If the verification command fails (non-zero exitCode or error output):
-          - Capture and analyze the actual stdout/stderr from the command output.
-          - Explain the exact failure honestly based strictly on the real command output.
-          - NEVER claim verification succeeded if the command actually failed.
-          - NEVER fabricate test or compiler results.
-          - Formulate a corrective fix to address the failure and propose another 'edit_file' call.
-          - Wait for explicit user approval for the corrective edit before it is applied.
-          - After the corrective edit is approved and applied, rerun the verification command to confirm the fix.
-     * If any tool call is rejected by the user, stop immediately without re-prompting or retrying.
-   - Never run interactive commands that wait forever for stdin input (like nano, vim, or prompt loops).
-6. 'git_status': Use ONLY when the user asks about Git status, current branch, changed/staged/unstaged/untracked files (e.g. 'Show me the Git status', 'What files have I changed?').
-7. 'git_diff': Use ONLY when the user asks to see current Git changes or diffs (e.g. 'Show me my current diff', 'What changes did I make?').
-8. 'git_log': Use ONLY when the user asks to see recent commit history (e.g. 'What did I commit recently?', 'Show recent commits').
-9. 'list_files': Use ONLY when project structure, directory tree, or file listing is explicitly requested. Do NOT call 'list_files' when the user requested Git information, file contents, or commands.
-10. If a request does NOT require inspecting, creating, or modifying local files, checking Git, or running terminal commands, answer directly WITHOUT calling any tool.`
 
     const runId = ++this.activeRunId
     const runController = new AbortController()
@@ -325,7 +434,9 @@ Rules for tool usage & failure handling:
 
     try {
       // Resolve smart project context
-      const smartContext = await this.smartContextEngine.resolveContext(prompt, workspaceRoot)
+      const smartContext = await this.smartContextEngine.resolveContext(prompt, workspaceRoot, {
+        activeEditorContext: options.activeEditorContext
+      })
 
       if (runSignal.aborted) {
         throw new Error('Request was stopped by user.')
@@ -343,16 +454,30 @@ Rules for tool usage & failure handling:
         throw new Error('Request was stopped by user.')
       }
 
-      let dynamicSystemInstruction = systemInstruction
-      if (smartContext.required && smartContext.formattedContext) {
-        dynamicSystemInstruction += `\n\n${smartContext.formattedContext}\n\nNote: The relevant project files above have been pre-loaded by the Smart Context Engine. If these files provide all the information needed to answer the user's request, do NOT call 'read_file' or 'list_files' again for them. Answer directly or propose edits using 'edit_file' directly.`
-      } else if (!smartContext.required) {
-        dynamicSystemInstruction += `\n\nNote: This is a general, conceptual, or conversational query. Do NOT call any filesystem, terminal, or Git tools. Answer the user directly.`
+      const toolDeclarations = this.getToolDeclarations()
+      const { snapshot: staticSnapshot, cacheHit } = this.promptCache.getOrCreateSnapshot(
+        this.getStaticSystemPrompt(),
+        toolDeclarations
+      )
+
+      const dynamicContext = this.buildDynamicContext({
+        smartContext,
+        activeEditorContext: options.activeEditorContext,
+        currentBranch: options.currentBranch,
+        plan
+      })
+
+      this.lastCacheDiagnostics = {
+        cacheHit,
+        staticPromptKey: staticSnapshot.key,
+        staticPromptVersion: staticSnapshot.version,
+        dynamicContextChars: dynamicContext.length,
+        deduplicatedContextChars: this.smartContextEngine.getDeduplicator().getDeduplicatedCharsSaved()
       }
 
-      if (plan) {
-        dynamicSystemInstruction += `\n\n${this.agentPlanner.formatPlanContext(plan)}`
-      }
+      const dynamicSystemInstruction = dynamicContext
+        ? `${staticSnapshot.systemPrompt}\n\n${dynamicContext}`
+        : staticSnapshot.systemPrompt
 
     const safeOnChunk = onChunk
       ? (chunk: string) => {
@@ -439,9 +564,10 @@ Rules for tool usage & failure handling:
       requestApproval: wrappedRequestApproval,
       onFileCreated: wrappedOnFileCreated,
       onFileEdited: wrappedOnFileEdited,
-      onCommandExecuted
+      onCommandExecuted,
+      shadowBuffer: options.shadowBuffer,
+      onShadowUpdated: options.onShadowUpdated
     }
-    const toolDeclarations = this.getToolDeclarations()
 
     // Context budget ceiling enforcement for user prompt: cap if exceedingly large
     const maxBudget = this.smartContextEngine.getConfig().maxTotalContextChars
@@ -464,6 +590,8 @@ Rules for tool usage & failure handling:
     let iterations = 0
     let totalProviderTime = 0
     let totalToolTime = 0
+    const failedToolCalls: Array<{ name: string; error?: string }> = []
+    let verifiedBranch: string | null | undefined = options.currentBranch ?? null
 
     while (iterations < MAX_TOOL_ITERATIONS) {
         if (runSignal.aborted || this.activeRunId !== runId) {
@@ -486,7 +614,8 @@ Rules for tool usage & failure handling:
           const supportsTools = this.provider.capabilities?.supportsTools !== false
           const toolsToPass = supportsTools ? toolDeclarations : []
           const supportsStreaming = this.provider.capabilities?.supportsStreaming !== false
-          const chunkHandler = supportsStreaming ? safeOnChunk : undefined
+          const chunkHandler =
+            supportsStreaming && failedToolCalls.length === 0 ? safeOnChunk : undefined
 
           response = await this.provider.sendMessage(this.history, toolsToPass, {
             apiKey,
@@ -495,6 +624,9 @@ Rules for tool usage & failure handling:
             timeoutMs,
             signal: runSignal,
             onChunk: chunkHandler,
+            staticPromptKey: staticSnapshot.key,
+            staticPromptVersion: staticSnapshot.version,
+            cacheHit,
             onRetry: (attempt, maxRetries, _delayMs, reason) => {
               const retryText = reason
                 ? `Temporary provider issue: ${reason} — retrying (${attempt}/${maxRetries})...`
@@ -602,14 +734,18 @@ Rules for tool usage & failure handling:
               try {
                 execResult = await tool.execute(safeArgs, toolContext)
               } catch (toolErr: unknown) {
+                if (runSignal.aborted || this.activeRunId !== runId) {
+                  throw toolErr
+                }
                 const errorMsg = toolErr instanceof Error ? toolErr.message : String(toolErr)
                 if (activeStep && plan && plan === this.agentPlanner.getActivePlan() && this.activeRunId === runId) {
                   this.agentPlanner.failStep(activeStep.id, errorMsg)
                 }
-                if (plan && plan === this.agentPlanner.getActivePlan() && this.activeRunId === runId) {
-                  this.agentPlanner.abortPlan(`Tool execution error: ${errorMsg}`)
+                execResult = {
+                  success: false,
+                  output: '',
+                  error: `Tool execution failed with exception: ${errorMsg}`
                 }
-                throw toolErr
               } finally {
                 totalToolTime += performance.now() - toolStart
               }
@@ -688,9 +824,7 @@ Rules for tool usage & failure handling:
               }
 
               toolSuccess = execResult.success
-              toolResultOutput = execResult.output
-                ? execResult.output
-                : `Error executing ${call.name}: ${execResult.error} (State this failure clearly to the user. Do NOT invent file contents or call list_files as a fallback.)`
+              toolResultOutput = execResult.output || ''
 
               if (execResult.success && execResult.output) {
                 const successKey = `${call.name}:${JSON.stringify(call.args || {})}`
@@ -700,7 +834,9 @@ Rules for tool usage & failure handling:
                 const argsKey = JSON.stringify(call.args || {})
 
                 if (deduplicator.isToolResultDuplicate(call.name, argsKey, execResult.output)) {
-                  toolResultOutput = `[Notice: Output of ${call.name} with identical arguments was already provided earlier in the conversation and is omitted to conserve context.]`
+                  const notice = `[Notice: Output of ${call.name} with identical arguments was already provided earlier in the conversation and is omitted to conserve context.]`
+                  deduplicator.recordDeduplicatedChars(Math.max(0, execResult.output.length - notice.length))
+                  toolResultOutput = notice
                 } else {
                   deduplicator.markToolResult(call.name, argsKey, execResult.output)
 
@@ -710,6 +846,38 @@ Rules for tool usage & failure handling:
                       if (parsed && typeof parsed.path === 'string' && typeof parsed.content === 'string') {
                         this.smartContextEngine.getCache().set(parsed.path, parsed.content)
                         this.smartContextEngine.getDeduplicator().markFileInContext(parsed.path, parsed.content)
+                      }
+                    } catch {
+                      // Plain string output
+                    }
+                  } else if (call.name === 'read_file_range') {
+                    try {
+                      const parsed = JSON.parse(execResult.output)
+                      if (
+                        parsed &&
+                        typeof parsed.path === 'string' &&
+                        typeof parsed.content === 'string' &&
+                        parsed.returnedRange &&
+                        typeof parsed.returnedRange.startLine === 'number' &&
+                        typeof parsed.returnedRange.endLine === 'number'
+                      ) {
+                        this.smartContextEngine
+                          .getDeduplicator()
+                          .markFileSliceInContext(
+                            parsed.path,
+                            parsed.returnedRange.startLine,
+                            parsed.returnedRange.endLine,
+                            parsed.content
+                          )
+                      }
+                    } catch {
+                      // Plain string output
+                    }
+                  } else if (call.name === 'git_status') {
+                    try {
+                      const parsed = JSON.parse(execResult.output)
+                      if (parsed && typeof parsed.branch === 'string' && parsed.branch) {
+                        verifiedBranch = parsed.branch
                       }
                     } catch {
                       // Plain string output
@@ -738,6 +906,20 @@ Rules for tool usage & failure handling:
                 const failKey = `${call.name}:${JSON.stringify(call.args || {})}`
                 const failCount = (this.consecutiveToolFailures.get(failKey) || 0) + 1
                 this.consecutiveToolFailures.set(failKey, failCount)
+
+                failedToolCalls.push({ name: call.name, error: execResult.error })
+
+                const failureDetail = execResult.error || 'Execution failed.'
+                if (call.name === 'list_files') {
+                  toolResultOutput = `Error: 'list_files' failed: ${failureDetail}. You were unable to list workspace files. State clearly to the user that the file-listing operation failed. Do NOT invent, assume, or fabricate any file listing or directory tree, and do NOT claim any Git branch name.`
+                } else if (call.name === 'read_file' || call.name === 'read_file_range') {
+                  toolResultOutput = `Error executing ${call.name}: ${failureDetail}. (State this failure clearly to the user. Do NOT invent file contents or call list_files as a fallback.)`
+                } else if (call.name === 'git_status') {
+                  toolResultOutput = `Error executing git_status: ${failureDetail}. (State this failure clearly to the user. Do NOT guess or state any Git branch name as fact.)`
+                } else {
+                  toolResultOutput = `Error executing ${call.name}: ${failureDetail}. (State this failure clearly to the user. Do NOT pretend the tool succeeded or invent tool results.)`
+                }
+
                 if (failCount > 1) {
                   toolResultOutput += `\n[Notice: Tool '${call.name}' with identical arguments has failed ${failCount} times. Do NOT call '${call.name}' with these identical failing arguments again. Please diagnose the failure or report it to the user.]`
                 }
@@ -799,6 +981,8 @@ Rules for tool usage & failure handling:
         // Final response produced by model
         let finalText = response.text || 'Completed.'
 
+        finalText = this.sanitizeFinalResponse(finalText, failedToolCalls, verifiedBranch)
+
         if (plan && plan.status === 'executing') {
           const allDone = plan.steps.every((s) => s.status === 'completed' || s.status === 'skipped')
           if (allDone) {
@@ -828,7 +1012,8 @@ Rules for tool usage & failure handling:
         this.agentPlanner.abortPlan('Maximum tool execution iterations reached')
       }
 
-      const maxReachedText = 'Maximum tool execution iterations reached.'
+      let maxReachedText = 'Maximum tool execution iterations reached.'
+      maxReachedText = this.sanitizeFinalResponse(maxReachedText, failedToolCalls, verifiedBranch)
       safeOnStep?.({ type: 'done', text: maxReachedText })
       return maxReachedText
     } catch (err: unknown) {
@@ -855,5 +1040,147 @@ Rules for tool usage & failure handling:
         this.abortController = null
       }
     }
+  }
+
+  /**
+   * Enforces the Tool Failure & Anti-Fabrication Contract on the model's final response:
+   * 1. If list_files failed: ensures response acknowledges the failure and does not fabricate files.
+   * 2. If read_file or git_status failed: ensures failure is stated rather than pretended success.
+   * 3. Git branch claims: if verified branch is known (e.g. qa-test), prevents false claims of master/main;
+   *    if branch is unverified, prevents presenting an unverified branch as current fact.
+   */
+  sanitizeFinalResponse(
+    text: string,
+    failedTools: Array<{ name: string; error?: string }>,
+    verifiedBranch: string | null | undefined
+  ): string {
+    let result = text
+
+    // 1. Process failed list_files tool calls
+    const listFilesFailure = failedTools.find((t) => t.name === 'list_files')
+    if (listFilesFailure) {
+      const failureNotice = `I couldn't list the workspace files because the file-listing operation failed${
+        listFilesFailure.error ? `: ${listFilesFailure.error}` : '.'
+      } Please retry or check the workspace/tool connection.`
+
+      const acknowledgesFailure =
+        /(could not|couldn't|unable to|failed to)\s+(list|retrieve|get|read)\s+(the\s+)?(workspace\s+)?files/i.test(
+          result
+        ) ||
+        /(file[\s-]listing|list_files)\s+(operation\s+)?(failed|error)/i.test(result) ||
+        /(error|failure)\s+(listing|retrieving)\s+(the\s+)?files/i.test(result)
+
+      const hasFabricatedListing =
+        /here (is|are) the (complete |project )?(files|file listing|directory structure)/i.test(result) ||
+        /(complete|workspace) (file listing|files in your workspace|project structure:)/i.test(result) ||
+        /```[\s\S]*?(?:├──|└──|\|\s*--)[\s\S]*?```/i.test(result) ||
+        /(?:^|\n)\s*[-*]\s+`?[a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]+`?\s*(?:\n\s*[-*]\s+`?[a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]+`?){2,}/.test(
+          result
+        )
+
+      if (!acknowledgesFailure || hasFabricatedListing) {
+        // Strip out fabricated tree / file listing blocks if present
+        let cleaned = result
+          .replace(
+            /(?:Here (?:is|are) (?:the )?(?:complete |project )?(?:files|file listing|directory structure)[\s\S]*?)(?=(?:\n\n[A-Z]|\n\n#|$))/i,
+            ''
+          )
+          .replace(/```[\s\S]*?(?:├──|└──|\|\s*--)[\s\S]*?```/g, '')
+          .replace(
+            /(?:^|\n)\s*[-*]\s+`?[a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]+`?\s*(?:\n\s*[-*]\s+`?[a-zA-Z0-9_\-./]+\.[a-zA-Z0-9]+`?){2,}/g,
+            ''
+          )
+          .trim()
+
+        if (!cleaned || !acknowledgesFailure) {
+          result = cleaned ? `${failureNotice}\n\n${cleaned}` : failureNotice
+        } else {
+          result = `${failureNotice}\n\n${cleaned}`
+        }
+      }
+    }
+
+    // 2. Process failed read_file / read_file_range tool calls
+    const readFileFailure = failedTools.find((t) => t.name === 'read_file' || t.name === 'read_file_range')
+    if (readFileFailure) {
+      const acknowledgesReadFailure =
+        /(could not|couldn't|unable to|failed to)\s+(read|open|access|inspect)\s+(the\s+)?(file|range|lines)/i.test(
+          result
+        ) || /(read_file|read_file_range|reading file)\s+(operation\s+)?(failed|error)/i.test(result)
+
+      if (!acknowledgesReadFailure) {
+        const failureNotice = `I couldn't read the requested file because the read operation failed${
+          readFileFailure.error ? `: ${readFileFailure.error}` : '.'
+        }`
+        result = `${failureNotice}\n\n${result}`
+      }
+    }
+
+    // 3. Process failed git_status tool calls
+    const gitStatusFailure = failedTools.find((t) => t.name === 'git_status')
+    if (gitStatusFailure) {
+      const acknowledgesGitFailure =
+        /(could not|couldn't|unable to|failed to)\s+(check|get|retrieve)\s+(the\s+)?git/i.test(result) ||
+        /(git_status|git status)\s+(operation\s+)?(failed|error)/i.test(result)
+
+      if (!acknowledgesGitFailure) {
+        const failureNotice = `I couldn't retrieve the Git status because the operation failed${
+          gitStatusFailure.error ? `: ${gitStatusFailure.error}` : '.'
+        }`
+        result = `${failureNotice}\n\n${result}`
+      }
+    }
+
+    // 4. Git branch claim verification
+    if (verifiedBranch && verifiedBranch.trim().length > 0) {
+      const cleanBranch = verifiedBranch.trim()
+      // If verified branch is not master, replace any false claims of master
+      if (cleanBranch.toLowerCase() !== 'master') {
+        result = result.replace(
+          /(\b(?:on|current|active|git)?\s*branch\s*(?::|\s+is|\s+name)?\s*[`'"]?)master([`'"]?\b)/gi,
+          `$1${cleanBranch}$2`
+        )
+        result = result.replace(
+          /(\b(?:on the|the)\s+)master(\s+branch\b)/gi,
+          `$1${cleanBranch}$2`
+        )
+        result = result.replace(
+          /(\bbranch\s+[`'"])master([`'"])/gi,
+          `$1${cleanBranch}$2`
+        )
+      }
+      // If verified branch is not main, replace any false claims of main
+      if (cleanBranch.toLowerCase() !== 'main') {
+        result = result.replace(
+          /(\b(?:on|current|active|git)?\s*branch\s*(?::|\s+is|\s+name)?\s*[`'"]?)main([`'"]?\b)/gi,
+          `$1${cleanBranch}$2`
+        )
+        result = result.replace(
+          /(\b(?:on the|the)\s+)main(\s+branch\b)/gi,
+          `$1${cleanBranch}$2`
+        )
+        result = result.replace(
+          /(\bbranch\s+[`'"])main([`'"])/gi,
+          `$1${cleanBranch}$2`
+        )
+      }
+    } else {
+      // Branch information is unavailable or unverified
+      // Do not allow claiming a specific branch (like master or main) as verified fact
+      result = result.replace(
+        /(?:\*|\-)?\s*(?:Git )?Branch:\s*[`'"]?(?:master|main)[`'"]?/gi,
+        '- Git Branch: (unverified)'
+      )
+      result = result.replace(
+        /\b(?:currently )?on (?:the )?(?:master|main) branch\b/gi,
+        'on an unverified branch'
+      )
+      result = result.replace(
+        /\b(?:in|on) (?:the )?['"`]?(?:master|main)['"`]? branch\b/gi,
+        'on an unverified branch'
+      )
+    }
+
+    return result.trim()
   }
 }

@@ -1,5 +1,6 @@
 import { ITool, ToolContext, ToolExecutionResult } from './types'
 import { validateCommandSafety } from '../../../../shared/commandValidator'
+import { processTerminalOutputForAI } from '../../../../shared/terminalSanitizer'
 
 const DANGEROUS_PATTERNS = [
   /\brm\s+-[rf]+/i,
@@ -121,31 +122,40 @@ export class RunCommandTool implements ITool {
 
       const result = await window.electronAPI.runCommand(command, context.workspaceRoot)
 
-      // Notify any active terminal panels
+      // Step 4: Notify active terminal panels with RAW unmodified stdout/stderr
       context.onCommandExecuted?.(command, {
         stdout: result.stdout,
         stderr: result.stderr,
         exitCode: result.exitCode
       })
 
-      // Limit output size returned to AI model to prevent token exhaustion (max 20,000 chars)
-      let formattedStdout = result.stdout || ''
-      if (formattedStdout.length > 20000) {
-        formattedStdout = formattedStdout.slice(0, 20000) + '\n\n[...stdout truncated at 20,000 characters]'
-      }
-
-      let formattedStderr = result.stderr || ''
-      if (formattedStderr.length > 10000) {
-        formattedStderr = formattedStderr.slice(0, 10000) + '\n\n[...stderr truncated at 10,000 characters]'
-      }
+      // Step 5: Sanitize ANSI/control sequences and apply deterministic head/tail compression for AI context
+      const processedStdout = processTerminalOutputForAI(result.stdout || '')
+      const processedStderr = processTerminalOutputForAI(result.stderr || '')
 
       const structuredResult = {
         success: result.success,
         exitCode: result.exitCode,
         timedOut: result.timedOut,
-        stdout: formattedStdout,
-        stderr: formattedStderr,
-        error: result.error
+        stdout: processedStdout.text,
+        stderr: processedStderr.text,
+        error: result.error,
+        compression: {
+          stdout: {
+            originalLines: processedStdout.originalLineCount,
+            returnedLines: processedStdout.returnedLineCount,
+            isCompressed: processedStdout.isCompressed,
+            omittedLines: processedStdout.omittedLineCount,
+            isCharacterTruncated: processedStdout.isCharacterTruncated
+          },
+          stderr: {
+            originalLines: processedStderr.originalLineCount,
+            returnedLines: processedStderr.returnedLineCount,
+            isCompressed: processedStderr.isCompressed,
+            omittedLines: processedStderr.omittedLineCount,
+            isCharacterTruncated: processedStderr.isCharacterTruncated
+          }
+        }
       }
 
       if (result.success) {
@@ -154,12 +164,15 @@ export class RunCommandTool implements ITool {
           output: JSON.stringify(structuredResult, null, 2)
         }
       } else {
+        const stderrSnippet = processedStderr.text
+          ? ` Stderr: ${processedStderr.text.slice(0, 300)}`
+          : ''
         return {
           success: false,
           output: JSON.stringify(structuredResult, null, 2),
           error:
             result.error ||
-            `Command exited with code ${result.exitCode ?? 'unknown'}.${result.stderr ? ` Stderr: ${result.stderr.slice(0, 300)}` : ''}`
+            `Command exited with code ${result.exitCode ?? 'unknown'}.${stderrSnippet}`
         }
       }
     } catch (err: unknown) {

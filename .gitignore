@@ -8,10 +8,23 @@ node_modules/
 .env.*
 !.env.example
 
+# Certificates & Code Signing Keys
+*.pfx
+*.p12
+*.cer
+*.crt
+*.pem
+*.key
+*.snk
+*.keystore
+*.jks
+
 # Build and distribution outputs
 dist/
 out/
-build/
+build/*
+!build/icon.ico
+!build/icon.png
 
 # Logs
 npm-debug.log*
@@ -29,3 +42,12 @@ Thumbs.db
 
 # TypeScript build cache
 *.tsbuildinfo
+
+# Test and Coverage Outputs
+test-results/
+playwright-report/
+coverage/
+
+# Temporary scratch files
+scratch/
+
